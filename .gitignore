@@ -1,0 +1,28 @@
+# Environment & secrets — NEVER push these
+.env
+*.env
+
+# Output data — contains athlete videos and CSVs
+output/
+input/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Video files
+*.mp4
+*.avi
+*.mov
+
+# Data files
+*.csv
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
