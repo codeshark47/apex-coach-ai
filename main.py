@@ -6,8 +6,8 @@ import urllib.request
 
 def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     """
-    Headless Perception Layer using MediaPipe Tasks API. 
-    Extracts pose landmarks and guarantees data continuity with NaN values for undetected frames.
+    Headless Perception Layer matching local PC execution exactly.
+    Processes every frame sequentially without destructive cropping to ensure zero data loss.
     """
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
@@ -34,9 +34,9 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         output_segmentation_masks=False,
-        min_pose_detection_confidence=0.6,
-        min_pose_presence_confidence=0.6,
-        min_tracking_confidence=0.6
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5
     )
     
     landmarker = vision.PoseLandmarker.create_from_options(options)
@@ -64,27 +64,18 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         if not success:
             break
 
-        h, w, _ = frame.shape
-
-        left = int(w * 0.2)
-        right = int(w * 0.8)
-        cropped = frame[:, left:right]
-        cropped_w = right - left
-
-        frame_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-        
-        # Exact API binding format
+        # PC Mirror Fix: Process the FULL frame frame-by-frame. 
+        # No arbitrary crops that break under different cloud aspect ratios.
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         
         detection_result = landmarker.detect(mp_image_frame)
-
         row = [frame_number]
 
-        if detection_result.pose_landmarks:
+        if detection_result.pose_landmarks and len(detection_result.pose_landmarks) > 0:
             first_person_landmarks = detection_result.pose_landmarks[0]
             for landmark in first_person_landmarks:
-                global_x = (landmark.x * cropped_w + left) / w
-                row.extend([global_x, landmark.y, landmark.z])
+                row.extend([landmark.x, landmark.y, landmark.z])
         else:
             row.extend([np.nan] * (33 * 3))
 
