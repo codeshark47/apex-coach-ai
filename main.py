@@ -12,17 +12,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Absolute baseline import pattern bypasses wrapper structures entirely
-    import logging
-    logging.getLogger('mediapipe').setLevel(logging.ERROR)
-    
-    try:
-        from mediapipe.framework.formats import landmark_pb2
-        mp_pose = mp.solutions.pose
-    except AttributeError:
-        # Fallback handling for weird linux wheel lookups
-        import mediapipe.solutions.pose as mp_pose
-
+    mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
 
     cap = cv2.VideoCapture(video_path)
