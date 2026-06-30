@@ -1,8 +1,8 @@
 import cv2
-import mediapipe as mp
 import pandas as pd
 import numpy as np
 import os
+import importlib
 
 def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     """
@@ -12,7 +12,16 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    mp_pose = mp.solutions.pose
+    # Dynamically locate the absolute module paths to bypass top-level wrapper attribute bugs
+    try:
+        mp_pose = importlib.import_module('mediapipe.python.solutions.pose')
+    except ModuleNotFoundError:
+        try:
+            mp_pose = importlib.import_module('mediapipe.solutions.pose')
+        except ModuleNotFoundError:
+            import mediapipe as mp
+            mp_pose = mp.solutions.pose
+
     pose = mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
 
     cap = cv2.VideoCapture(video_path)
