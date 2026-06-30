@@ -27,8 +27,6 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         import mediapipe as mp
         from mediapipe.tasks import python
         from mediapipe.tasks.python import vision
-        # Universal backend import bypasses top-level namespace attributes completely
-        from mediapipe.python._framework_bindings import image as mp_image_binding
     except ImportError:
         return {"status": "error", "error_message": "MediaPipe Tasks API framework binding is missing."}
 
@@ -75,13 +73,8 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
 
         frame_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
         
-        # Expert Fix: Initialize directly from the absolute underlying C++ framework binding layer
-        try:
-            mp_image_frame = mp_image_binding.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        except AttributeError:
-            # Fallback for alternative binary distributions
-            from mediapipe.tasks.python.components.containers import image as container_image
-            mp_image_frame = container_image.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        # Exact API binding format
+        mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         
         detection_result = landmarker.detect(mp_image_frame)
 
