@@ -2,7 +2,6 @@ import cv2
 import pandas as pd
 import numpy as np
 import os
-import importlib
 
 def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     """
@@ -12,13 +11,15 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Dynamically locate the absolute module paths to bypass top-level wrapper attribute bugs
+    # Absolute baseline backend entry point bypasses wrapper files entirely
     try:
-        mp_pose = importlib.import_module('mediapipe.python.solutions.pose')
-    except ModuleNotFoundError:
+        import mediapipe.python.solutions.pose as mp_pose
+    except (ModuleNotFoundError, AttributeError):
         try:
-            mp_pose = importlib.import_module('mediapipe.solutions.pose')
-        except ModuleNotFoundError:
+            import mediapipe.solutions.pose as mp_pose
+        except (ModuleNotFoundError, AttributeError):
+            # Universal direct injection fallback for stubborn Debian environments
+            from mediapipe.tasks.python.vision import pose_landmarker
             import mediapipe as mp
             mp_pose = mp.solutions.pose
 
