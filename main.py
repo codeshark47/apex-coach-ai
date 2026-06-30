@@ -12,12 +12,10 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Define paths for the official pose landmarker asset
     model_dir = "models"
     model_path = os.path.join(model_dir, "pose_landmarker_full.task")
     os.makedirs(model_dir, exist_ok=True)
 
-    # Automatically download the required tracking model file if it isn't local
     if not os.path.exists(model_path):
         model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
         try:
@@ -26,12 +24,12 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
             return {"status": "error", "error_message": f"Failed to download model file: {str(e)}"}
 
     try:
+        import mediapipe as mp
         from mediapipe.tasks import python
         from mediapipe.tasks.python import vision
     except ImportError:
         return {"status": "error", "error_message": "MediaPipe Tasks API is missing from the environment."}
 
-    # Build the configuration pipeline
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
@@ -46,7 +44,6 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
 
-    # Explicit mapping of the 33 standard human skeletal joints matching legacy columns exactly
     landmark_names = [
         "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER", "RIGHT_EYE_INNER", "RIGHT_EYE", "RIGHT_EYE_OUTER",
         "LEFT_EAR", "RIGHT_EAR", "LEFT_MOUTH_OUTER", "RIGHT_MOUTH_OUTER", "LEFT_SHOULDER", "RIGHT_SHOULDER",
@@ -75,15 +72,15 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         cropped_w = right - left
 
         frame_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-        mp_image_frame = python.Image(image_format=python.ImageFormat.SRGB, data=frame_rgb)
         
-        # Extract features through the updated model architecture
+        # Expert Fix: Correct top-level MediaPipe Image binding class lookup
+        mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        
         detection_result = landmarker.detect(mp_image_frame)
 
         row = [frame_number]
 
         if detection_result.pose_landmarks:
-            # Grab the dominant person detected in the cricket frame bounding box
             first_person_landmarks = detection_result.pose_landmarks[0]
             for landmark in first_person_landmarks:
                 global_x = (landmark.x * cropped_w + left) / w
