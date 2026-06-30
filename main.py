@@ -11,28 +11,35 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Expert Fix: Use modern, direct backend bindings to completely bypass broken top-level wrappers
+    # Expert Backend Fix: Direct constructor binding bypassing top-level solutions structures
     try:
-        from mediapipe.python._framework_bindings import image as mp_image
-        import mediapipe.solutions.pose as mp_pose
+        from mediapipe.python.solutions.pose import Pose
+        from mediapipe.python.solutions.pose import PoseLandmark
     except (ModuleNotFoundError, AttributeError, ImportError):
-        # Fallback to standard namespace bindings if pre-compiled files are in different subdirectories
-        import mediapipe as mp
         try:
-            mp_pose = mp.solutions.pose
-        except AttributeError:
-            return {
-                "status": "error", 
-                "error_message": "Streamlit Cloud wheel initialization failed. Deep server cache purge required."
-            }
+            from mediapipe.solutions.pose import Pose
+            from mediapipe.solutions.pose import PoseLandmark
+        except (ModuleNotFoundError, AttributeError, ImportError):
+            # Universal native fallback directly through the raw platform wheel module
+            try:
+                import importlib
+                mp_w_pose = importlib.import_module('mediapipe.python._framework_bindings.pose')
+                Pose = mp_w_pose.Pose
+                PoseLandmark = mp_w_pose.PoseLandmark
+            except (ModuleNotFoundError, AttributeError, ImportError):
+                return {
+                    "status": "error", 
+                    "error_message": "Streamlit Cloud wheel initialization failed. Deep server cache purge required."
+                }
 
-    pose = mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
+    # Initialize directly using the isolated class references
+    pose = Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
 
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
 
     columns = ["frame"]
-    for landmark in mp_pose.PoseLandmark:
+    for landmark in PoseLandmark:
         columns.extend([f"{landmark.name}_x", f"{landmark.name}_y", f"{landmark.name}_z"])
 
     dataset_rows = []
