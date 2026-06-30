@@ -11,17 +11,19 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Clean, non-cascading architectural import path lookup
+    # Expert Fix: Use modern, direct backend bindings to completely bypass broken top-level wrappers
     try:
+        from mediapipe.python._framework_bindings import image as mp_image
         import mediapipe.solutions.pose as mp_pose
-    except (ModuleNotFoundError, AttributeError):
+    except (ModuleNotFoundError, AttributeError, ImportError):
+        # Fallback to standard namespace bindings if pre-compiled files are in different subdirectories
         import mediapipe as mp
-        if hasattr(mp, 'solutions'):
+        try:
             mp_pose = mp.solutions.pose
-        else:
+        except AttributeError:
             return {
                 "status": "error", 
-                "error_message": "Streamlit Cloud Environment is missing valid MediaPipe Binary Bindings. A deep cache purge is required."
+                "error_message": "Streamlit Cloud wheel initialization failed. Deep server cache purge required."
             }
 
     pose = mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
