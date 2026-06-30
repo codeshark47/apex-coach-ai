@@ -2,45 +2,62 @@ import cv2
 import pandas as pd
 import numpy as np
 import os
+import urllib.request
 
 def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     """
-    Headless Perception Layer. Extracts MediaPipe pose landmarks from video frames.
-    Guarantees structural data continuity by filling undetected frames with NaN values.
+    Headless Perception Layer using MediaPipe Tasks API. 
+    Extracts pose landmarks and guarantees data continuity with NaN values for undetected frames.
     """
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Expert Backend Fix: Direct constructor binding bypassing top-level solutions structures
-    try:
-        from mediapipe.python.solutions.pose import Pose
-        from mediapipe.python.solutions.pose import PoseLandmark
-    except (ModuleNotFoundError, AttributeError, ImportError):
-        try:
-            from mediapipe.solutions.pose import Pose
-            from mediapipe.solutions.pose import PoseLandmark
-        except (ModuleNotFoundError, AttributeError, ImportError):
-            # Universal native fallback directly through the raw platform wheel module
-            try:
-                import importlib
-                mp_w_pose = importlib.import_module('mediapipe.python._framework_bindings.pose')
-                Pose = mp_w_pose.Pose
-                PoseLandmark = mp_w_pose.PoseLandmark
-            except (ModuleNotFoundError, AttributeError, ImportError):
-                return {
-                    "status": "error", 
-                    "error_message": "Streamlit Cloud wheel initialization failed. Deep server cache purge required."
-                }
+    # Define paths for the official pose landmarker asset
+    model_dir = "models"
+    model_path = os.path.join(model_dir, "pose_landmarker_full.task")
+    os.makedirs(model_dir, exist_ok=True)
 
-    # Initialize directly using the isolated class references
-    pose = Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
+    # Automatically download the required tracking model file if it isn't local
+    if not os.path.exists(model_path):
+        model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+        try:
+            urllib.request.urlretrieve(model_url, model_path)
+        except Exception as e:
+            return {"status": "error", "error_message": f"Failed to download model file: {str(e)}"}
+
+    try:
+        from mediapipe.tasks import python
+        from mediapipe.tasks.python import vision
+    except ImportError:
+        return {"status": "error", "error_message": "MediaPipe Tasks API is missing from the environment."}
+
+    # Build the configuration pipeline
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        output_segmentation_masks=False,
+        min_pose_detection_confidence=0.6,
+        min_pose_presence_confidence=0.6,
+        min_tracking_confidence=0.6
+    )
+    
+    landmarker = vision.PoseLandmarker.create_from_options(options)
 
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
 
+    # Explicit mapping of the 33 standard human skeletal joints matching legacy columns exactly
+    landmark_names = [
+        "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER", "RIGHT_EYE_INNER", "RIGHT_EYE", "RIGHT_EYE_OUTER",
+        "LEFT_EAR", "RIGHT_EAR", "LEFT_MOUTH_OUTER", "RIGHT_MOUTH_OUTER", "LEFT_SHOULDER", "RIGHT_SHOULDER",
+        "LEFT_ELBOW", "RIGHT_ELBOW", "LEFT_WRIST", "RIGHT_WRIST", "LEFT_PINKY", "RIGHT_PINKY", "LEFT_INDEX",
+        "RIGHT_INDEX", "LEFT_THUMB", "RIGHT_THUMB", "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "RIGHT_KNEE",
+        "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL", "RIGHT_HEEL", "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX"
+    ]
+
     columns = ["frame"]
-    for landmark in PoseLandmark:
-        columns.extend([f"{landmark.name}_x", f"{landmark.name}_y", f"{landmark.name}_z"])
+    for name in landmark_names:
+        columns.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
 
     dataset_rows = []
     frame_number = 0
@@ -58,12 +75,17 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         cropped_w = right - left
 
         frame_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-        results = pose.process(frame_rgb)
+        mp_image_frame = python.Image(image_format=python.ImageFormat.SRGB, data=frame_rgb)
+        
+        # Extract features through the updated model architecture
+        detection_result = landmarker.detect(mp_image_frame)
 
         row = [frame_number]
 
-        if results.pose_landmarks:
-            for landmark in results.pose_landmarks.landmark:
+        if detection_result.pose_landmarks:
+            # Grab the dominant person detected in the cricket frame bounding box
+            first_person_landmarks = detection_result.pose_landmarks[0]
+            for landmark in first_person_landmarks:
                 global_x = (landmark.x * cropped_w + left) / w
                 row.extend([global_x, landmark.y, landmark.z])
         else:
@@ -73,7 +95,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         frame_number += 1
 
     cap.release()
-    pose.close()
+    landmarker.close()
 
     output_df = pd.DataFrame(dataset_rows, columns=columns)
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
