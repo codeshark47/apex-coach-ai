@@ -604,3 +604,22 @@ with st.sidebar.expander("📐 Camera Positioning Guide", expanded=False):
     - **Frame rate:** 30 or 60 FPS only
     - **Dual camera:** Both phones start recording before the bowler begins run-up
     """)
+# --- RESILIENT PRODUCTION VIDEO STREAMING ---
+import os
+import streamlit as st
+
+final_output_video = "output/annotated_delivery.mp4"
+
+if os.path.exists(final_output_video):
+    with open(final_output_video, 'rb') as video_file:
+        video_bytes = video_file.read()
+    
+    st.video(video_bytes)
+    st.write("---")
+    st.subheader("📥 Export Performance Assets")
+    st.download_button(
+        label="🎬 Download Annotated Video",
+        data=video_bytes,
+        file_name="apex_coach_delivery_analysis.mp4",
+        mime="video/mp4"
+    )
