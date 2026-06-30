@@ -11,17 +11,18 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
-    # Absolute baseline backend entry point bypasses wrapper files entirely
+    # Clean, non-cascading architectural import path lookup
     try:
-        import mediapipe.python.solutions.pose as mp_pose
+        import mediapipe.solutions.pose as mp_pose
     except (ModuleNotFoundError, AttributeError):
-        try:
-            import mediapipe.solutions.pose as mp_pose
-        except (ModuleNotFoundError, AttributeError):
-            # Universal direct injection fallback for stubborn Debian environments
-            from mediapipe.tasks.python.vision import pose_landmarker
-            import mediapipe as mp
+        import mediapipe as mp
+        if hasattr(mp, 'solutions'):
             mp_pose = mp.solutions.pose
+        else:
+            return {
+                "status": "error", 
+                "error_message": "Streamlit Cloud Environment is missing valid MediaPipe Binary Bindings. A deep cache purge is required."
+            }
 
     pose = mp_pose.Pose(min_detection_confidence=0.6, min_tracking_confidence=0.6)
 
