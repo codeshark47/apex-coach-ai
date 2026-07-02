@@ -244,7 +244,7 @@ def transcode_to_h264(input_path: str) -> str:
             pass
 
     cmd = [
-        r"C:\ffmpeg\bin\ffmpeg.exe", "-y", "-i", input_path,
+        (r"C:\ffmpeg\bin\ffmpeg.exe" if os.name == "nt" else "ffmpeg"), "-y", "-i", input_path,
         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
         "-profile:v", "baseline", "-level", "3.0",
         "-an", web_safe_path
