@@ -19,6 +19,29 @@ from datetime import datetime
 # ====================================================================
 st.set_page_config(page_title="Apex Coach AI", page_icon="⚡", layout="wide")
 
+# ====================================================================
+# BETA ACCESS GATE
+# ====================================================================
+if "COACH_PASSWORD" in st.secrets:
+    correct_password = st.secrets["COACH_PASSWORD"]
+
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        st.title("⚡ Apex Coach AI")
+        st.subheader("Authorized Beta Access Only")
+        st.write("This platform is currently in private beta. Contact Shoaib Nazar for access.")
+        user_input = st.text_input("Enter Beta Access Password:", type="password")
+
+        if st.button("Unlock Dashboard"):
+            if user_input == correct_password:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password. Please contact the administrator.")
+        st.stop()
+
 st.markdown("""
 <style>
     /* Dark background */
