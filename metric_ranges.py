@@ -1,0 +1,138 @@
+"""
+metric_ranges.py
+
+Single canonical source of truth for biomechanical reference ranges.
+
+Phase 1 had this defined TWICE with slightly different values:
+  - inline `ranges` dict in streamlit_app.py (UI display)
+  - hardcoded "Optimal Range" column in generate_pdf_report() (PDF display)
+
+Both the sidebar UI and the PDF report should import from HERE ONLY.
+Do not redefine ranges anywhere else.
+
+Tier logic:
+  - "higher_better": green is the top band, red is below amber (e.g. knee bracing)
+  - "lower_better":  green is the bottom band, red is above amber (e.g. head stability)
+  - "band":          green is a middle band, red is outside amber on either side
+                      (used only where the underlying metric can meaningfully be
+                      too high AND too low — currently unused, reserved)
+
+Each entry gives explicit numeric boundaries. No metric is scored without an
+explicit boundary defined here — if a metric key isn't in RANGES, classify()
+raises, on purpose, rather than silently guessing a tier.
+"""
+
+from dataclasses import dataclass
+
+TIER_COLORS = {
+    "green": "#00C853",
+    "amber": "#FFB300",
+    "red": "#FF3D3D",
+    "unknown": "#94A3B8",
+}
+
+TIER_COLORS_PDF = {
+    # softer background fills for reportlab table cells (hex, no alpha)
+    "green": "#D9F7E4",
+    "amber": "#FFF3D6",
+    "red": "#FDE0E0",
+    "unknown": "#EDF2F7",
+}
+
+
+@dataclass(frozen=True)
+class MetricRange:
+    label: str
+    unit: str
+    kind: str          # "higher_better" | "lower_better"
+    green: tuple        # (low, high) inclusive band classified as green
+    amber: tuple         # (low, high) inclusive band classified as amber
+    display_optimal: str  # human string for the "optimal range" column
+
+
+RANGES = {
+    "front_knee_bracing": MetricRange(
+        label="Lead Knee Bracing",
+        unit="°",
+        kind="higher_better",
+        green=(160.0, 180.0),
+        amber=(145.0, 160.0),
+        display_optimal="160–180°",
+    ),
+    "hip_shoulder_separation": MetricRange(
+        label="Hip-Shoulder Separation",
+        unit="°",
+        kind="higher_better",
+        green=(25.0, 50.0),
+        amber=(15.0, 25.0),
+        display_optimal="25–50°",
+    ),
+    "trunk_lean": MetricRange(
+        label="Trunk Lean",
+        unit="°",
+        kind="lower_better",
+        green=(0.0, 20.0),
+        amber=(20.0, 35.0),
+        display_optimal="0–20°",
+    ),
+    "release_height": MetricRange(
+        label="Release Height",
+        unit="%",
+        kind="higher_better",
+        green=(0.85, 1.05),
+        amber=(0.75, 0.85),
+        display_optimal="85–105%",
+    ),
+    "head_stability": MetricRange(
+        label="Head Stability",
+        unit="",
+        kind="lower_better",
+        green=(0.0, 0.02),
+        amber=(0.02, 0.05),
+        display_optimal="0.00–0.02",
+    ),
+}
+
+
+def classify(metric_key: str, value) -> str:
+    """
+    Returns one of "green", "amber", "red", "unknown".
+    "unknown" only fires when value is None/NaN — never fabricated.
+    """
+    if metric_key not in RANGES:
+        raise KeyError(
+            f"No reference range defined for metric '{metric_key}'. "
+            f"Add it to RANGES in metric_ranges.py before scoring it."
+        )
+    if value is None:
+        return "unknown"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if v != v:  # NaN check without importing math/numpy
+        return "unknown"
+
+    r = RANGES[metric_key]
+    g_lo, g_hi = r.green
+    a_lo, a_hi = r.amber
+
+    if g_lo <= v <= g_hi:
+        return "green"
+
+    if r.kind == "higher_better":
+        # amber sits below green; red is below amber
+        if a_lo <= v < g_lo:
+            return "amber"
+        return "red" if v < a_lo else "green"  # values above g_hi still fine
+    elif r.kind == "lower_better":
+        # amber sits above green; red is above amber
+        if g_hi < v <= a_hi:
+            return "amber"
+        return "red" if v > a_hi else "green"  # values below g_lo still fine
+    else:
+        raise ValueError(f"Unsupported range kind '{r.kind}' for '{metric_key}'")
+
+
+def all_metric_keys():
+    return list(RANGES.keys())
