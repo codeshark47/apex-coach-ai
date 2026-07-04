@@ -22,6 +22,7 @@ import pdf_color_ranges as pcr
 import speed_estimation as se
 import calibration as cal
 import profile_store as store
+import data_quality as dq
 
 # ====================================================================
 # PAGE CONFIG & ELITE DARK UI  (unchanged from Phase 1)
@@ -99,7 +100,7 @@ os.makedirs("input", exist_ok=True)
 # ====================================================================
 def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete",
                          camera_mode="Single Camera", phase_durations=None,
-                         speed_result=None):
+                         speed_result=None, quality=None):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter,
                              rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
@@ -125,6 +126,20 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
         body_style
     ))
     story.append(Spacer(1, 15))
+
+    if quality and quality.get("confidence") == "low":
+        warn_style = ParagraphStyle('Warn', parent=body_style,
+                                     textColor=colors.HexColor('#C53030'),
+                                     fontName='Helvetica-Bold')
+        missing_labels = [mr.RANGES[k].label for k in quality["missing_metrics"]]
+        story.append(Paragraph(
+            f"⚠ LOW TRACKING CONFIDENCE: {quality['missing_count']} of 5 metrics "
+            f"failed to compute ({', '.join(missing_labels)}). Remaining values in "
+            f"this report came from the same degraded tracking and should not be "
+            f"treated as reliable. Re-shoot this delivery before acting on these results.",
+            warn_style
+        ))
+        story.append(Spacer(1, 12))
 
     # KINEMATIC MILESTONES + PHASE TIMING
     story.append(Paragraph("Kinematic Sequence Milestones", h2_style))
@@ -386,6 +401,20 @@ if single_ready or dual_ready:
                 "BR": frames["ball_release_frame"],
             }
 
+            # --- TRACKING QUALITY GUARD ---
+            quality = dq.assess_quality(metrics)
+            if quality["confidence"] == "low":
+                missing_labels = [mr.RANGES[k].label for k in quality["missing_metrics"]]
+                st.error(
+                    f"⚠️ Low tracking confidence on this clip — "
+                    f"{quality['missing_count']} of 5 metrics failed to compute "
+                    f"({', '.join(missing_labels)}). This usually means motion blur, "
+                    f"occlusion, or the bowler leaving frame during this delivery. "
+                    f"Any remaining numeric values below came from the same degraded "
+                    f"tracking and should not be trusted — **we recommend re-shooting "
+                    f"this delivery** rather than acting on these results."
+                )
+
             # --- PHASE TIMING (always available) ---
             phase_durations = None
             try:
@@ -456,12 +485,11 @@ if single_ready or dual_ready:
                 st.divider()
                 st.header("📈 Biomechanical Measurements")
 
-                knee_deg = metrics.get('front_knee_bracing', {}).get('degrees')
-                hip_deg = metrics.get('hip_shoulder_separation', {}).get('degrees')
-                trunk_deg = metrics.get('trunk_lean', {}).get('degrees')
-                rel_ratio = metrics.get('release_height', {}).get('ratio')
-                head_val = (metrics.get('head_stability', {}).get('value')
-                            or metrics.get('head_stability', {}).get('deviation_index'))
+                knee_deg = mr.extract_metric_value(metrics, "front_knee_bracing")
+                hip_deg = mr.extract_metric_value(metrics, "hip_shoulder_separation")
+                trunk_deg = mr.extract_metric_value(metrics, "trunk_lean")
+                rel_ratio = mr.extract_metric_value(metrics, "release_height")
+                head_val = mr.extract_metric_value(metrics, "head_stability")
 
                 def ui_deg(val):
                     return f"{round(float(val), 1)}°" if val is not None else "N/A"
@@ -510,8 +538,23 @@ if single_ready or dual_ready:
 
             with col_insights:
                 st.header("🧠 Autonomous AI Coach Assessment")
-                with st.spinner("Generating expert coaching analysis..."):
-                    ai_insights = generate_biomechanical_coaching_report(result_payload)
+                if quality["confidence"] == "low":
+                    st.warning(
+                        "AI coaching analysis withheld for this delivery — tracking "
+                        "confidence was too low to generate reliable coaching advice. "
+                        "Re-shoot this delivery and re-run analysis."
+                    )
+                    ai_insights = {
+                        "narrative_analysis": (
+                            "Not generated: this delivery had insufficient tracking "
+                            "quality (see warning above). Re-shoot and re-analyze "
+                            "before drawing coaching conclusions."
+                        ),
+                        "prescribed_drills": [],
+                    }
+                else:
+                    with st.spinner("Generating expert coaching analysis..."):
+                        ai_insights = generate_biomechanical_coaching_report(result_payload)
 
                 clean_slug = player_name.replace(" ", "_")
                 pdf_data = generate_pdf_report(
@@ -520,6 +563,7 @@ if single_ready or dual_ready:
                     camera_mode=active_camera_mode,
                     phase_durations=phase_durations,
                     speed_result=speed_result,
+                    quality=quality,
                 )
                 st.download_button(
                     label="📄 Download Official PDF Report",
@@ -555,12 +599,13 @@ if single_ready or dual_ready:
             if history_enabled:
                 try:
                     athlete_id = store.get_or_create_athlete(player_name)
+                    metrics_with_quality = {**metrics, "_data_quality": quality}
                     store.save_session(
                         athlete_id=athlete_id,
                         video_filename=os.path.basename(video_path),
                         camera_mode=active_camera_mode,
                         fps=fps,
-                        metrics=metrics,
+                        metrics=metrics_with_quality,
                         phase_durations=phase_durations,
                         release_arm_speed_kmh=(speed_result.get("kmh") if speed_result and speed_result.get("status") == "success" else None),
                         speed_status=(speed_result.get("status") if speed_result else "unavailable"),

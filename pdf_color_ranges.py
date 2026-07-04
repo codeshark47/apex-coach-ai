@@ -14,17 +14,7 @@ import metric_ranges as mr
 
 
 def _metric_value_map(metrics: dict) -> dict:
-    """Maps metric_ranges keys to the numeric value the app already computed."""
-    return {
-        "front_knee_bracing": metrics.get("front_knee_bracing", {}).get("degrees"),
-        "hip_shoulder_separation": metrics.get("hip_shoulder_separation", {}).get("degrees"),
-        "trunk_lean": metrics.get("trunk_lean", {}).get("degrees"),
-        "release_height": metrics.get("release_height", {}).get("ratio"),
-        "head_stability": (
-            metrics.get("head_stability", {}).get("value")
-            or metrics.get("head_stability", {}).get("deviation_index")
-        ),
-    }
+    return {key: mr.extract_metric_value(metrics, key) for key in mr.all_metric_keys()}
 
 
 def _format_value(metric_key: str, value) -> str:

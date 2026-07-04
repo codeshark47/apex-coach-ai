@@ -155,3 +155,24 @@ def classify(metric_key: str, value) -> str:
 
 def all_metric_keys():
     return list(RANGES.keys())
+
+
+def extract_metric_value(metrics: dict, metric_key: str):
+    """
+    Single shared lookup: maps a metric_ranges key to the numeric value
+    orchestrator's metrics dict actually stores it under. Both the PDF
+    table and the data-quality check use this — do not duplicate this
+    mapping anywhere else.
+    """
+    head_value = metrics.get("head_stability", {}).get("value")
+    if head_value is None:
+        head_value = metrics.get("head_stability", {}).get("deviation_index")
+
+    lookup = {
+        "front_knee_bracing": metrics.get("front_knee_bracing", {}).get("degrees"),
+        "hip_shoulder_separation": metrics.get("hip_shoulder_separation", {}).get("degrees"),
+        "trunk_lean": metrics.get("trunk_lean", {}).get("degrees"),
+        "release_height": metrics.get("release_height", {}).get("ratio"),
+        "head_stability": head_value,
+    }
+    return lookup.get(metric_key)

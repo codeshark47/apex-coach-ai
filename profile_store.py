@@ -21,9 +21,28 @@ Setup (one-time):
 """
 
 import os
+import math
 from typing import Optional
 
 _client = None
+
+
+def _sanitize_for_json(obj):
+    """
+    Recursively replaces NaN/Infinity with None. These are valid Python floats
+    but NOT valid JSON — Supabase's client will reject them outright. This is
+    not "faking" the data: None/null honestly represents "no valid value,"
+    which is exactly what NaN meant here (a failed/undefined computation).
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 
 def _get_credentials():
@@ -92,9 +111,9 @@ def save_session(athlete_id: str, video_filename: str, camera_mode: str,
         "video_filename": video_filename,
         "camera_mode": camera_mode,
         "fps": fps,
-        "metrics": metrics,
-        "phase_durations": phase_durations,
-        "release_arm_speed_kmh": release_arm_speed_kmh,
+        "metrics": _sanitize_for_json(metrics),
+        "phase_durations": _sanitize_for_json(phase_durations),
+        "release_arm_speed_kmh": release_arm_speed_kmh if release_arm_speed_kmh and math.isfinite(release_arm_speed_kmh) else None,
         "speed_status": speed_status,
     }
     result = client.table("sessions").insert(row).execute()
