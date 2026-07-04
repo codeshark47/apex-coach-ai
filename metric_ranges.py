@@ -44,10 +44,11 @@ TIER_COLORS_PDF = {
 class MetricRange:
     label: str
     unit: str
-    kind: str          # "higher_better" | "lower_better"
+    kind: str          # "higher_better" | "lower_better" | "band"
     green: tuple        # (low, high) inclusive band classified as green
-    amber: tuple         # (low, high) inclusive band classified as amber
+    amber: tuple         # (low, high) — lower amber band for all kinds
     display_optimal: str  # human string for the "optimal range" column
+    amber_high: tuple = None  # (low, high) upper amber band — only used by "band" kind
 
 
 RANGES = {
@@ -78,9 +79,14 @@ RANGES = {
     "release_height": MetricRange(
         label="Release Height",
         unit="%",
-        kind="higher_better",
+        kind="band",
         green=(0.85, 1.05),
-        amber=(0.75, 0.85),
+        amber=(0.75, 0.85),          # lower bound: under-extension
+        amber_high=(1.05, 1.15),     # upper bound: over-extension/lunge
+        # NOTE: the 1.05-1.15 amber / >1.15 red upper thresholds are an
+        # engineering default (symmetric margin to the lower bound), not a
+        # cited clinical/biomechanics source. Replace with a real reference
+        # if one becomes available. Do not describe this as validated.
         display_optimal="85–105%",
     ),
     "head_stability": MetricRange(
@@ -130,6 +136,19 @@ def classify(metric_key: str, value) -> str:
         if g_hi < v <= a_hi:
             return "amber"
         return "red" if v > a_hi else "green"  # values below g_lo still fine
+    elif r.kind == "band":
+        # green is a middle band; amber/red exist on BOTH sides
+        if v < g_lo:
+            if a_lo <= v < g_lo:
+                return "amber"
+            return "red"
+        # v > g_hi (since v == green range already returned above)
+        if r.amber_high is None:
+            raise ValueError(f"'{metric_key}' is kind='band' but has no amber_high defined.")
+        ah_lo, ah_hi = r.amber_high
+        if ah_lo < v <= ah_hi:
+            return "amber"
+        return "red"
     else:
         raise ValueError(f"Unsupported range kind '{r.kind}' for '{metric_key}'")
 
