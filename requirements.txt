@@ -9,3 +9,4 @@ reportlab
 python-dotenv==1.0.1
 mediapipe==0.10.30
 supabase
+streamlit-image-coordinates
