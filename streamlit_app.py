@@ -23,6 +23,7 @@ import speed_estimation as se
 import calibration as cal
 import profile_store as store
 import data_quality as dq
+import run_up_analysis as rua
 
 # ====================================================================
 # PAGE CONFIG & ELITE DARK UI  (unchanged from Phase 1)
@@ -289,35 +290,98 @@ if "calibration" not in st.session_state:
 
 with st.sidebar.expander("Calibrate camera for speed (once per setup)", expanded=False):
     st.caption(
-        "Click two points of a KNOWN real-world distance in the reference frame "
-        "(e.g. stump width = 0.2286m, or crease-to-crease = 20.12m), enter that "
-        "distance, and calibration will apply to every video from this camera position."
+        "This is a ONE-TIME setup per fixed camera position — not per delivery. "
+        "Upload any clip from that camera spot (can be a dedicated short clip of "
+        "just the stumps, doesn't need to be an actual delivery), scrub to a frame "
+        "where two points of known distance are visible (e.g. the two stumps, "
+        "0.2286m apart), then click both points directly on the image below."
     )
     calib_video = st.file_uploader("Reference video/frame source (.mp4)", type=["mp4"], key="calib_video")
+
+    if "calib_points" not in st.session_state:
+        st.session_state.calib_points = []
+
     if calib_video is not None:
         temp_path = os.path.join("input", "calibration_ref.mp4")
         with open(temp_path, "wb") as f:
             f.write(calib_video.getbuffer())
-        frame = cal.extract_reference_frame(temp_path, frame_index=0)
+
+        total_frames = cal.get_frame_count(temp_path)
+        if total_frames > 1:
+            frame_idx = st.slider(
+                "Scrub to a frame where your reference points (e.g. stumps) are clearly visible",
+                min_value=0, max_value=max(total_frames - 1, 0),
+                value=min(total_frames - 1, total_frames // 2),
+                key="calib_frame_idx"
+            )
+        else:
+            frame_idx = 0
+
+        frame = cal.extract_reference_frame(temp_path, frame_index=frame_idx)
+
+        if st.session_state.get("_calib_last_frame_idx") != frame_idx:
+            st.session_state.calib_points = []
+            st.session_state["_calib_last_frame_idx"] = frame_idx
+
         if frame is not None:
-            st.image(frame, caption="Reference frame — note two pixel coordinates below")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                ax = st.number_input("Point A — x (px)", min_value=0, value=0, key="cal_ax")
-                ay = st.number_input("Point A — y (px)", min_value=0, value=0, key="cal_ay")
-            with col_b:
-                bx = st.number_input("Point B — x (px)", min_value=0, value=0, key="cal_bx")
-                by = st.number_input("Point B — y (px)", min_value=0, value=0, key="cal_by")
-            real_dist = st.number_input("Real-world distance between points (meters)",
-                                         min_value=0.0, value=0.0, step=0.01, key="cal_dist")
-            ref_label = st.text_input("Reference label (e.g. 'stump width')", value="", key="cal_label")
-            if st.button("Compute calibration"):
-                try:
-                    calibration = cal.compute_scale((ax, ay), (bx, by), real_dist, ref_label or "custom")
-                    st.session_state.calibration = calibration
-                    st.success(f"Calibrated: {calibration.meters_per_pixel:.6f} m/px")
-                except ValueError as e:
-                    st.error(str(e))
+            from PIL import Image, ImageDraw
+            from streamlit_image_coordinates import streamlit_image_coordinates
+
+            pil_img = Image.fromarray(frame)
+            orig_w, orig_h = pil_img.size
+
+            display_img = pil_img.copy()
+            draw = ImageDraw.Draw(display_img)
+            for i, (px, py) in enumerate(st.session_state.calib_points):
+                r = max(4, orig_w // 150)
+                draw.ellipse((px - r, py - r, px + r, py + r), outline="red", width=3)
+                draw.text((px + r + 4, py - r - 4), str(i + 1), fill="red")
+
+            if len(st.session_state.calib_points) < 2:
+                st.caption(f"📍 Click point {len(st.session_state.calib_points) + 1} of 2 on the image below.")
+            else:
+                st.caption("✅ Both points selected — see below.")
+
+            click = streamlit_image_coordinates(display_img, key="calib_click_widget")
+
+            if click is not None and len(st.session_state.calib_points) < 2:
+                # The component may report coords relative to its rendered size,
+                # which can differ from the source image's native resolution —
+                # rescale back to the original frame's pixel space to stay accurate.
+                rendered_w = click.get("width") or orig_w
+                rendered_h = click.get("height") or orig_h
+                scale_x = orig_w / rendered_w
+                scale_y = orig_h / rendered_h
+                new_point = (round(click["x"] * scale_x), round(click["y"] * scale_y))
+
+                if not st.session_state.calib_points or st.session_state.calib_points[-1] != new_point:
+                    st.session_state.calib_points.append(new_point)
+                    st.rerun()
+
+            if st.button("↺ Reset points", key="reset_calib_points"):
+                st.session_state.calib_points = []
+                st.rerun()
+
+            if len(st.session_state.calib_points) == 2:
+                real_dist = st.number_input(
+                    "Real-world distance between the two points you clicked (meters)",
+                    min_value=0.0, value=0.2286, step=0.01, key="cal_dist",
+                    help="Stump width = 0.2286m is the easiest reference if stumps are visible."
+                )
+                ref_label = st.text_input("Reference label (e.g. 'stump width')",
+                                           value="stump width", key="cal_label")
+                if st.button("Compute calibration"):
+                    try:
+                        calibration = cal.compute_scale(
+                            st.session_state.calib_points[0],
+                            st.session_state.calib_points[1],
+                            real_dist, ref_label or "custom"
+                        )
+                        st.session_state.calibration = calibration
+                        st.session_state.calib_points = []
+                        st.success(f"Calibrated: {calibration.meters_per_pixel:.6f} m/px")
+                    except ValueError as e:
+                        st.error(str(e))
         else:
             st.error("Could not read a frame from that video.")
 
@@ -442,6 +506,20 @@ if single_ready or dual_ready:
                     landmarks_df, events, fps, cap_w, cap_h, meters_per_pixel=mpp
                 )
 
+            # --- RUN-UP ANALYSIS (stride detection + rhythm + strike pattern) ---
+            run_up_result = None
+            strike_summary = None
+            if os.path.exists(landmarks_csv):
+                run_up_result = rua.detect_run_up_strides(
+                    landmarks_df, bfc_frame_idx=events["BFC"], fps=fps,
+                    frame_width=cap_w, frame_height=cap_h
+                )
+                if run_up_result["status"] == "success":
+                    annotated_contacts = rua.classify_strike_patterns(
+                        landmarks_df, run_up_result["contacts"], frame_width=cap_w, frame_height=cap_h
+                    )
+                    strike_summary = rua.summarize_strike_patterns(annotated_contacts)
+
             # TIMELINE
             st.header("⏱️ Kinematic Sequence Timeline")
             t1, t2, t3 = st.columns(3)
@@ -461,6 +539,39 @@ if single_ready or dual_ready:
                     st.info("📏 " + speed_result["message"])
                 else:
                     st.warning(f"Speed estimate unavailable: {speed_result['message']}")
+
+            st.divider()
+            st.header("🏃 Run-Up Analysis")
+            if run_up_result is None:
+                st.info("Run-up data unavailable — landmark file not found.")
+            elif run_up_result["status"] != "success":
+                st.info(run_up_result.get("message", "Run-up analysis unavailable for this clip."))
+            else:
+                ru1, ru2, ru3 = st.columns(3)
+                ru1.metric("Run-Up Duration", f"{run_up_result['run_up_duration_seconds']}s")
+                ru2.metric("Detected Foot Contacts", run_up_result["stride_count"])
+                cv = run_up_result["rhythm_consistency_cv"]
+                ru3.metric("Rhythm Consistency (CV)", f"{cv}" if cv is not None else "N/A",
+                           help="Coefficient of variation of time between foot contacts. "
+                                "Lower = more consistent pacing. There's no universal "
+                                "'good' cutoff — compare this bowler's own value across "
+                                "sessions over time rather than against a fixed target.")
+
+                if strike_summary:
+                    st.markdown("**Foot Strike Pattern (run-up)**")
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric("Heel-Strike", strike_summary["heel"])
+                    sc2.metric("Midfoot", strike_summary["midfoot"])
+                    sc3.metric("Forefoot", strike_summary["forefoot"])
+                    total_known = strike_summary["heel"] + strike_summary["midfoot"] + strike_summary["forefoot"]
+                    if total_known > 0 and strike_summary["heel"] / total_known > 0.6:
+                        st.caption(
+                            "ℹ️ This run-up shows a heel-strike-dominant pattern. Heel-striking "
+                            "during a sprint approach is generally considered less efficient than "
+                            "midfoot/forefoot contact — worth discussing with the bowler, though "
+                            "this is a general running-mechanics observation, not a cricket-specific "
+                            "validated threshold."
+                        )
 
             st.divider()
 
@@ -599,7 +710,11 @@ if single_ready or dual_ready:
             if history_enabled:
                 try:
                     athlete_id = store.get_or_create_athlete(player_name)
-                    metrics_with_quality = {**metrics, "_data_quality": quality}
+                    metrics_with_quality = {
+                        **metrics,
+                        "_data_quality": quality,
+                        "_run_up": {"analysis": run_up_result, "strike_summary": strike_summary},
+                    }
                     store.save_session(
                         athlete_id=athlete_id,
                         video_filename=os.path.basename(video_path),

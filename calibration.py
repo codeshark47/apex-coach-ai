@@ -55,6 +55,15 @@ class Calibration:
         )
 
 
+def get_frame_count(video_path: str) -> int:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return 0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return total
+
+
 def extract_reference_frame(video_path: str, frame_index: int = 0):
     """
     Pulls a single frame from the video for the coach to click on.
