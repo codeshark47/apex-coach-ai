@@ -157,6 +157,35 @@ def all_metric_keys():
     return list(RANGES.keys())
 
 
+def describe_range(metric_key: str) -> str:
+    """
+    Human-readable description of a metric's zones, generated from RANGES —
+    used by the Gemini coaching prompt so it can never hardcode a second,
+    driftable copy of these numbers.
+    """
+    r = RANGES[metric_key]
+
+    def fv(v):
+        return f"{v * 100:.0f}%" if r.unit == "%" else f"{v}{r.unit}"
+
+    if r.kind == "higher_better":
+        return (f"- {r.label}: Optimal {fv(r.green[0])}-{fv(r.green[1])} | "
+                f"Acceptable {fv(r.amber[0])}-{fv(r.amber[1])} | "
+                f"Critical below {fv(r.amber[0])}")
+    elif r.kind == "lower_better":
+        return (f"- {r.label}: Optimal {fv(r.green[0])}-{fv(r.green[1])} | "
+                f"Acceptable {fv(r.green[1])}-{fv(r.amber[1])} | "
+                f"Critical above {fv(r.amber[1])}")
+    elif r.kind == "band":
+        ah = r.amber_high
+        return (f"- {r.label}: Optimal {fv(r.green[0])}-{fv(r.green[1])} | "
+                f"Acceptable {fv(r.amber[0])}-{fv(r.amber[1])} (low) or "
+                f"{fv(ah[0])}-{fv(ah[1])} (high) | "
+                f"Critical below {fv(r.amber[0])} or above {fv(ah[1])}")
+    else:
+        raise ValueError(f"Unsupported kind '{r.kind}' for '{metric_key}'")
+
+
 def extract_metric_value(metrics: dict, metric_key: str):
     """
     Single shared lookup: maps a metric_ranges key to the numeric value
