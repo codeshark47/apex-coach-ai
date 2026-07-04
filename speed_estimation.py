@@ -90,6 +90,15 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
       {"status": "not_calibrated"}   -- if meters_per_pixel is None
       {"status": "success", "kmh": ..., "mps": ..., "bowling_arm": ...}
       {"status": "error", "message": ...}
+
+    IMPORTANT: uses PEAK frame-to-frame instantaneous velocity near release,
+    not net displacement across the whole window. A bowling arm swings
+    through a curved arc — over a wide time window, the straight-line
+    distance between the start and end point (the "chord") is much
+    shorter than the actual path length traveled, which would silently
+    underestimate speed by several-fold. Peak instantaneous velocity
+    between consecutive frames is the physically correct quantity for
+    "how fast was the hand moving at release."
     """
     if meters_per_pixel is None:
         return {
@@ -108,18 +117,20 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
         bowling_arm = _select_bowling_arm(df, br_idx, fps, frame_width, frame_height)
         x, y = _wrist_pixel_series(df, bowling_arm, frame_width, frame_height)
 
-        window = max(2, int(fps * 0.08))  # ~80ms either side of release
+        window = max(3, int(fps * 0.08))  # ~80ms either side of release
         lo = max(0, br_idx - window)
         hi = min(len(df) - 1, br_idx + window)
-        if hi <= lo:
+        if hi - lo < 2:
             return {"status": "error", "message": "Insufficient frames around BR for a velocity estimate."}
 
-        dx_px = x[hi] - x[lo]
-        dy_px = y[hi] - y[lo]
-        dt = (hi - lo) / fps
-        px_per_s = math.hypot(dx_px, dy_px) / dt
+        dt_frame = 1.0 / fps
+        frame_speeds_px_s = []
+        for i in range(lo, hi):
+            d = math.hypot(x[i + 1] - x[i], y[i + 1] - y[i])
+            frame_speeds_px_s.append(d / dt_frame)
 
-        mps = px_per_s * meters_per_pixel
+        peak_px_per_s = max(frame_speeds_px_s)
+        mps = peak_px_per_s * meters_per_pixel
         kmh = mps * 3.6
 
         if kmh <= 0 or kmh > 200:
@@ -139,7 +150,7 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
             "kmh": round(kmh, 1),
             "mps": round(mps, 2),
             "bowling_arm": bowling_arm,
-            "window_seconds": round(dt, 4),
+            "window_seconds": round((hi - lo) * dt_frame, 4),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
