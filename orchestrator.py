@@ -3,6 +3,7 @@ import subprocess
 import pandas as pd
 import numpy as np
 import cv2
+
 from main import extract_video_landmarks
 from kinematics import (
     calculate_knee_bracing,
@@ -14,21 +15,24 @@ from kinematics import (
 def detect_delivery_events(df: pd.DataFrame, fps: int) -> dict:
     """Robust physical milestone detection using velocity windows."""
     total_frames = len(df)
+
     if total_frames < 10:
         return {
             "BFC": 0,
             "FFC": int(total_frames * 0.4),
-            "BR":  int(total_frames * 0.8)
+            "BR": int(total_frames * 0.8)
         }
 
     r_wrist_y = df["RIGHT_WRIST_y"].interpolate(method="linear").bfill().ffill().values
     br_idx = int(np.argmin(r_wrist_y))
+
     if br_idx <= 5 or br_idx >= total_frames - 2:
         br_idx = int(total_frames * 0.75)
 
     l_ankle_y = df["LEFT_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
     lookback_start = max(0, br_idx - int(fps * 0.6))
     ffc_window = l_ankle_y[lookback_start:br_idx]
+
     if len(ffc_window) > 0:
         ffc_idx = lookback_start + int(np.argmax(ffc_window))
     else:
@@ -37,6 +41,7 @@ def detect_delivery_events(df: pd.DataFrame, fps: int) -> dict:
     r_ankle_y = df["RIGHT_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
     bfc_lookback = max(0, ffc_idx - int(fps * 0.5))
     bfc_window = r_ankle_y[bfc_lookback:ffc_idx]
+
     if len(bfc_window) > 0:
         bfc_idx = bfc_lookback + int(np.argmax(bfc_window))
     else:
@@ -50,7 +55,7 @@ def detect_delivery_events(df: pd.DataFrame, fps: int) -> dict:
     return {
         "BFC": int(max(1, bfc_idx)),
         "FFC": int(max(2, ffc_idx)),
-        "BR":  int(min(br_idx, total_frames - 1))
+        "BR": int(min(br_idx, total_frames - 1))
     }
 
 
@@ -58,6 +63,19 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
     """
     Measures rotational separation between hip and shoulder planes at FFC.
     Uses arctan2 method — correct for rear-view and side-view footage.
+
+    BUG FIX (was): the old code took abs(shoulder_angle - hip_angle) directly.
+    Since each angle individually is in (-180, 180], their raw difference can
+    range up to 360 degrees. The old "if >90: separation = 180-separation"
+    fold assumed its input was already safely in [0, 180] — whenever the two
+    angles straddled the +/-180 boundary (e.g. shoulder_angle=178,
+    hip_angle=-178.74, raw abs diff=356.74), that fold produced a NEGATIVE
+    nonsense value (180-356.74 = -176.74) instead of the small real
+    separation the wraparound actually represented (3.26 degrees here).
+    Fix: wrap the angle difference into (-180, 180] BEFORE folding.
+    Verified against known non-wraparound cases to produce identical
+    results to the old formula, and against the exact failing case to now
+    produce a physically plausible value.
     """
     try:
         row = df[df["frame"] == ffc_frame].iloc[0]
@@ -71,9 +89,16 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
             row["LEFT_HIP_x"] - row["RIGHT_HIP_x"]
         ))
 
-        separation = abs(shoulder_angle - hip_angle)
+        raw_diff = shoulder_angle - hip_angle
+        wrapped_diff = (raw_diff + 180) % 360 - 180  # safely in (-180, 180]
+        separation = abs(wrapped_diff)                # safely in [0, 180]
+
+        # Hip/shoulder lines are undirected axes, not directed vectors, so a
+        # separation beyond 90 degrees represents the same physical twist as
+        # its complement — fold into [0, 90].
         if separation > 90:
             separation = 180 - separation
+
         separation = round(separation, 2)
 
         if separation >= 25.0:
@@ -101,7 +126,7 @@ def calculate_release_height_ratio_safe(br_row: pd.Series) -> dict:
     """
     try:
         y_wrist = br_row.get("RIGHT_WRIST_y")
-        y_head  = br_row.get("NOSE_y")
+        y_head = br_row.get("NOSE_y")
         y_ankle = br_row.get("LEFT_ANKLE_y") or br_row.get("RIGHT_ANKLE_y")
 
         if any(v is None or pd.isna(v) for v in [y_wrist, y_head, y_ankle]):
@@ -152,10 +177,10 @@ def calculate_release_height_ratio_safe(br_row: pd.Series) -> dict:
 def generate_fail_safe_video(video_path: str, output_path: str,
                               df: pd.DataFrame, events: dict):
     """Generates annotated skeleton overlay video using mp4v codec."""
-    cap    = cv2.VideoCapture(video_path)
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps    = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
 
     out = cv2.VideoWriter(
         output_path,
@@ -164,18 +189,18 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     )
 
     connections = [
-        ("LEFT_SHOULDER",  "RIGHT_SHOULDER"),
-        ("LEFT_SHOULDER",  "LEFT_HIP"),
+        ("LEFT_SHOULDER", "RIGHT_SHOULDER"),
+        ("LEFT_SHOULDER", "LEFT_HIP"),
         ("RIGHT_SHOULDER", "RIGHT_HIP"),
-        ("LEFT_HIP",       "RIGHT_HIP"),
-        ("LEFT_SHOULDER",  "LEFT_ELBOW"),
-        ("LEFT_ELBOW",     "LEFT_WRIST"),
+        ("LEFT_HIP", "RIGHT_HIP"),
+        ("LEFT_SHOULDER", "LEFT_ELBOW"),
+        ("LEFT_ELBOW", "LEFT_WRIST"),
         ("RIGHT_SHOULDER", "RIGHT_ELBOW"),
-        ("RIGHT_ELBOW",    "RIGHT_WRIST"),
-        ("LEFT_HIP",       "LEFT_KNEE"),
-        ("LEFT_KNEE",      "LEFT_ANKLE"),
-        ("RIGHT_HIP",      "RIGHT_KNEE"),
-        ("RIGHT_KNEE",     "RIGHT_ANKLE"),
+        ("RIGHT_ELBOW", "RIGHT_WRIST"),
+        ("LEFT_HIP", "LEFT_KNEE"),
+        ("LEFT_KNEE", "LEFT_ANKLE"),
+        ("RIGHT_HIP", "RIGHT_KNEE"),
+        ("RIGHT_KNEE", "RIGHT_ANKLE"),
     ]
 
     f_idx = 0
@@ -225,6 +250,7 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         cv2.putText(frame, status_text, (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                     (255, 255, 255), 2, cv2.LINE_AA)
+
         out.write(frame)
         f_idx += 1
 
@@ -233,7 +259,23 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
 
 def transcode_to_h264(input_path: str) -> str:
-    """Transcodes mp4v video to H264 for browser playback using local ffmpeg."""
+    """
+    Transcodes mp4v video to H264 for browser playback using ffmpeg.
+
+    FIX (was): the old code hardcoded a Windows-only path
+    (r"C:\\ffmpeg\\bin\\ffmpeg.exe") for os.name == "nt", and just the bare
+    "ffmpeg" command otherwise — with no check that either actually exists.
+    If ffmpeg wasn't at that exact path (or not on PATH on Linux), the
+    subprocess call would fail, the exception was silently swallowed, and
+    the function returned the original untranscoded mp4v video with NO
+    warning anywhere — which may not play back correctly in a browser.
+
+    Fix: use shutil.which() to actually locate ffmpeg on PATH, on any OS.
+    If it's genuinely not installed/found, that's surfaced with a clear
+    log line instead of failing silently.
+    """
+    import shutil
+
     base, ext = os.path.splitext(input_path)
     web_safe_path = f"{base}_h264{ext}"
 
@@ -243,8 +285,17 @@ def transcode_to_h264(input_path: str) -> str:
         except OSError:
             pass
 
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        print(
+            "WARNING: ffmpeg not found on PATH. Video will be served in its "
+            "original codec, which may not play back correctly in all browsers. "
+            "Install ffmpeg and ensure it's on PATH to fix this."
+        )
+        return input_path
+
     cmd = [
-        (r"C:\ffmpeg\bin\ffmpeg.exe" if os.name == "nt" else "ffmpeg"), "-y", "-i", input_path,
+        ffmpeg_bin, "-y", "-i", input_path,
         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
         "-profile:v", "baseline", "-level", "3.0",
         "-an", web_safe_path
@@ -265,9 +316,13 @@ def transcode_to_h264(input_path: str) -> str:
 
         if result.returncode == 0 and os.path.exists(web_safe_path):
             return web_safe_path
-
-    except Exception:
-        pass
+        else:
+            print(
+                f"WARNING: ffmpeg transcode failed (exit code {result.returncode}): "
+                f"{result.stderr.decode(errors='ignore')[:300]}"
+            )
+    except Exception as e:
+        print(f"WARNING: ffmpeg transcode raised an exception: {e}")
 
     return input_path
 
@@ -284,6 +339,7 @@ def run_complete_bowling_analysis(video_path: str,
 
     # STAGE 1 — LANDMARK EXTRACTION
     extraction = extract_video_landmarks(video_path, csv_path)
+
     if extraction["status"] == "error":
         return {
             "status": "failed",
@@ -291,7 +347,7 @@ def run_complete_bowling_analysis(video_path: str,
             "message": extraction["error_message"]
         }
 
-    df  = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path)
     fps = extraction["fps"]
 
     # STAGE 2 — EVENT DETECTION
@@ -320,8 +376,8 @@ def run_complete_bowling_analysis(video_path: str,
     br_row = br_rows.iloc[0]
 
     # STAGE 4 — METRIC CALCULATIONS
-    knee_analysis  = calculate_knee_bracing(ffc_row)
-    lean_analysis  = calculate_trunk_lean(br_row)
+    knee_analysis = calculate_knee_bracing(ffc_row)
+    lean_analysis = calculate_trunk_lean(br_row)
     head_stability = calculate_head_stability(df, events["BFC"], events["BR"])
     hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
     release_height = calculate_release_height_ratio_safe(br_row)
@@ -332,55 +388,56 @@ def run_complete_bowling_analysis(video_path: str,
     web_safe_video_file = transcode_to_h264(raw_output_video)
 
     # STAGE 6 — SAFE KEY EXTRACTION
-    trunk_lean_val   = (lean_analysis.get("trunk_lean_degrees") or
-                        lean_analysis.get("degrees") or
-                        lean_analysis.get("angle"))
+    trunk_lean_val = (lean_analysis.get("trunk_lean_degrees") or
+                       lean_analysis.get("degrees") or
+                       lean_analysis.get("angle"))
+
     knee_bracing_val = (knee_analysis.get("front_knee_angle") or
-                        knee_analysis.get("degrees") or
-                        knee_analysis.get("angle"))
+                         knee_analysis.get("degrees") or
+                         knee_analysis.get("angle"))
 
     # STAGE 7 — RETURN UNIFIED PAYLOAD
     return {
         "status": "success",
         "video_metadata": {
-            "source_file":            os.path.basename(video_path),
-            "fps":                    fps,
-            "total_frames":           len(df)
+            "source_file": os.path.basename(video_path),
+            "fps": fps,
+            "total_frames": len(df)
         },
         "time_indices": {
-            "back_foot_contact_frame":  events["BFC"],
+            "back_foot_contact_frame": events["BFC"],
             "front_foot_contact_frame": events["FFC"],
-            "ball_release_frame":       events["BR"]
+            "ball_release_frame": events["BR"]
         },
         "biomechanical_metrics": {
             "trunk_lean": {
                 "degrees": trunk_lean_val,
-                "tier":    (lean_analysis.get("classification") or
-                            lean_analysis.get("tier") or "Unknown"),
-                "status":  lean_analysis.get("status", "error"),
+                "tier": (lean_analysis.get("classification") or
+                         lean_analysis.get("tier") or "Unknown"),
+                "status": lean_analysis.get("status", "error"),
                 "critique": lean_analysis.get("critique", "N/A")
             },
             "front_knee_bracing": {
                 "degrees": knee_bracing_val,
-                "tier":    (knee_analysis.get("classification") or
-                            knee_analysis.get("tier") or "Unknown"),
-                "status":  knee_analysis.get("status", "error"),
+                "tier": (knee_analysis.get("classification") or
+                         knee_analysis.get("tier") or "Unknown"),
+                "status": knee_analysis.get("status", "error"),
                 "critique": knee_analysis.get("critique", "N/A")
             },
             "hip_shoulder_separation": hip_separation,
             "release_height": {
-                "ratio":          release_height.get("ratio"),
+                "ratio": release_height.get("ratio"),
                 "classification": (release_height.get("classification") or
-                                   release_height.get("tier") or "Unknown"),
-                "status":         release_height.get("status", "error")
+                                    release_height.get("tier") or "Unknown"),
+                "status": release_height.get("status", "error")
             },
             "head_stability": {
-                "value":          (head_stability.get("deviation_index") or
-                                   head_stability.get("value")),
+                "value": (head_stability.get("deviation_index") or
+                          head_stability.get("value")),
                 "classification": (head_stability.get("tier") or
-                                   head_stability.get("classification") or
-                                   "Unknown"),
-                "status":         head_stability.get("status", "error")
+                                    head_stability.get("classification") or
+                                    "Unknown"),
+                "status": head_stability.get("status", "error")
             }
         },
         "annotated_video_output": web_safe_video_file.replace("\\", "/")
