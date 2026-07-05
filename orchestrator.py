@@ -388,13 +388,22 @@ def run_complete_bowling_analysis(video_path: str,
     web_safe_video_file = transcode_to_h264(raw_output_video)
 
     # STAGE 6 — SAFE KEY EXTRACTION
-    trunk_lean_val = (lean_analysis.get("trunk_lean_degrees") or
-                       lean_analysis.get("degrees") or
-                       lean_analysis.get("angle"))
+    # FIX: the old `.get(a) or .get(b) or .get(c)` pattern has a falsy-zero
+    # bug — if a metric's real value is exactly 0.0 (e.g. a perfectly
+    # upright 0.0-degree trunk lean, a genuinely ideal result), Python
+    # treats 0.0 as falsy and the `or` chain incorrectly keeps searching,
+    # silently turning a great result into None/N/A. Explicit None-checks
+    # fix this — verified this is the actual key kinematics.py returns
+    # ("degrees" for both trunk_lean and knee_bracing).
+    def _first_non_none(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
 
-    knee_bracing_val = (knee_analysis.get("front_knee_angle") or
-                         knee_analysis.get("degrees") or
-                         knee_analysis.get("angle"))
+    trunk_lean_val = _first_non_none(lean_analysis, "trunk_lean_degrees", "degrees", "angle")
+    knee_bracing_val = _first_non_none(knee_analysis, "front_knee_angle", "degrees", "angle")
 
     # STAGE 7 — RETURN UNIFIED PAYLOAD
     return {
