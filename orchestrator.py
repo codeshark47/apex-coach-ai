@@ -175,18 +175,40 @@ def calculate_release_height_ratio_safe(br_row: pd.Series) -> dict:
 
 
 def generate_fail_safe_video(video_path: str, output_path: str,
-                              df: pd.DataFrame, events: dict):
-    """Generates annotated skeleton overlay video using mp4v codec."""
+                              df: pd.DataFrame, events: dict,
+                              slow_motion_factor: float = 4.0):
+    """
+    Generates annotated skeleton overlay video using mp4v codec.
+
+    Skeleton style: cyan connective lines and magenta joint markers with a
+    soft glow (drawn as a darker, thicker under-stroke plus a brighter,
+    thinner over-stroke), closer to the reference look requested, instead
+    of flat single-pixel green/red.
+
+    slow_motion_factor: the output video is written with its FPS divided by
+    this factor. All frames are kept (nothing skipped or duplicated) — the
+    same frame count now plays back over a longer real-world duration,
+    which is the correct way to get true slow motion without needing frame
+    interpolation. Default 4.0 = 4x slower than real time.
+    """
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    source_fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+
+    output_fps = max(1, int(round(source_fps / slow_motion_factor)))
 
     out = cv2.VideoWriter(
         output_path,
         cv2.VideoWriter_fourcc(*'mp4v'),
-        fps, (width, height)
+        output_fps, (width, height)
     )
+
+    # Cyan/magenta palette (BGR order for OpenCV)
+    LINE_GLOW = (140, 90, 0)     # dim cyan under-stroke
+    LINE_CORE = (255, 230, 0)    # bright cyan over-stroke
+    JOINT_GLOW = (140, 0, 140)   # dim magenta under-stroke
+    JOINT_CORE = (255, 80, 255)  # bright magenta over-stroke
 
     connections = [
         ("LEFT_SHOULDER", "RIGHT_SHOULDER"),
@@ -201,7 +223,21 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         ("LEFT_KNEE", "LEFT_ANKLE"),
         ("RIGHT_HIP", "RIGHT_KNEE"),
         ("RIGHT_KNEE", "RIGHT_ANKLE"),
+        # Newly added — feet and head/neck, now that we've confirmed these
+        # landmarks are captured (LEFT/RIGHT_HEEL, LEFT/RIGHT_FOOT_INDEX).
+        ("LEFT_ANKLE", "LEFT_HEEL"),
+        ("LEFT_HEEL", "LEFT_FOOT_INDEX"),
+        ("LEFT_ANKLE", "LEFT_FOOT_INDEX"),
+        ("RIGHT_ANKLE", "RIGHT_HEEL"),
+        ("RIGHT_HEEL", "RIGHT_FOOT_INDEX"),
+        ("RIGHT_ANKLE", "RIGHT_FOOT_INDEX"),
+        ("NOSE", "LEFT_SHOULDER"),
+        ("NOSE", "RIGHT_SHOULDER"),
     ]
+
+    joint_nodes = ["LEFT_KNEE", "RIGHT_KNEE", "LEFT_HIP", "RIGHT_HIP",
+                   "LEFT_WRIST", "RIGHT_WRIST", "LEFT_ANKLE", "RIGHT_ANKLE",
+                   "LEFT_SHOULDER", "RIGHT_SHOULDER", "NOSE"]
 
     f_idx = 0
     while cap.isOpened():
@@ -223,19 +259,20 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     yB = int(float(row[f"{partB}_y"]) * height)
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), (0, 255, 0), 2)
+                        cv2.line(frame, (xA, yA), (xB, yB), LINE_GLOW, 5, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), LINE_CORE, 2, cv2.LINE_AA)
                 except Exception:
                     continue
 
-            for node in ["LEFT_KNEE", "LEFT_HIP", "RIGHT_WRIST",
-                         "LEFT_ANKLE", "NOSE"]:
+            for node in joint_nodes:
                 try:
                     if pd.isna(row[f"{node}_x"]):
                         continue
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 6, (0, 0, 255), -1)
+                        cv2.circle(frame, (nx, ny), 9, JOINT_GLOW, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 5, JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -388,13 +425,22 @@ def run_complete_bowling_analysis(video_path: str,
     web_safe_video_file = transcode_to_h264(raw_output_video)
 
     # STAGE 6 — SAFE KEY EXTRACTION
-    trunk_lean_val = (lean_analysis.get("trunk_lean_degrees") or
-                       lean_analysis.get("degrees") or
-                       lean_analysis.get("angle"))
+    # FIX: the old `.get(a) or .get(b) or .get(c)` pattern has a falsy-zero
+    # bug — if a metric's real value is exactly 0.0 (e.g. a perfectly
+    # upright 0.0-degree trunk lean, a genuinely ideal result), Python
+    # treats 0.0 as falsy and the `or` chain incorrectly keeps searching,
+    # silently turning a great result into None/N/A. Explicit None-checks
+    # fix this — verified this is the actual key kinematics.py returns
+    # ("degrees" for both trunk_lean and knee_bracing).
+    def _first_non_none(d: dict, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
 
-    knee_bracing_val = (knee_analysis.get("front_knee_angle") or
-                         knee_analysis.get("degrees") or
-                         knee_analysis.get("angle"))
+    trunk_lean_val = _first_non_none(lean_analysis, "trunk_lean_degrees", "degrees", "angle")
+    knee_bracing_val = _first_non_none(knee_analysis, "front_knee_angle", "degrees", "angle")
 
     # STAGE 7 — RETURN UNIFIED PAYLOAD
     return {
