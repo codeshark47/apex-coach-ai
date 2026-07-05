@@ -110,6 +110,30 @@ def _detect_contacts_for_foot(y_series: np.ndarray, fps: float,
     return contacts
 
 
+def _smooth(y_series: np.ndarray, window: int = 3) -> np.ndarray:
+    """
+    Light moving-average smoothing before peak detection. My synthetic
+    tests used noise-free signals; real MediaPipe landmark output has
+    frame-to-frame jitter that can suppress genuine peaks under the
+    prominence threshold or create spurious ones. A small centered
+    moving average reduces that without meaningfully shifting real
+    contact timing (window=3 frames is ~25ms at 120fps).
+
+    Uses edge-value padding (not implicit zero-padding) before
+    convolving — zero-padding would artificially drag values near the
+    array boundaries toward zero, corrupting the GLOBAL min/max range
+    used elsewhere for the prominence threshold, and silently making
+    peak detection too strict everywhere, not just near the edges.
+    """
+    if len(y_series) < window:
+        return y_series
+    pad = window // 2
+    padded = np.pad(y_series, (pad, pad), mode="edge")
+    kernel = np.ones(window) / window
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    return smoothed[:len(y_series)]
+
+
 def detect_run_up_strides(df: pd.DataFrame, bfc_frame_idx: int, fps: float,
                            frame_width: int, frame_height: int) -> dict:
     """
@@ -128,21 +152,43 @@ def detect_run_up_strides(df: pd.DataFrame, bfc_frame_idx: int, fps: float,
 
     run_up_df = df.iloc[:bfc_frame_idx].reset_index(drop=True)
 
+    columns_found = []
     all_contacts = []
     for foot in ("LEFT", "RIGHT"):
         y = _get_series(run_up_df, f"{foot}_HEEL_y", frame_width, frame_height, is_x=False)
+        source = f"{foot}_HEEL_y"
         if y is None:
             y = _get_series(run_up_df, f"{foot}_ANKLE_y", frame_width, frame_height, is_x=False)
+            source = f"{foot}_ANKLE_y"
         if y is None:
             continue
-        contacts = _detect_contacts_for_foot(y, fps)
+        columns_found.append(source)
+        y_smoothed = _smooth(y)
+        contacts = _detect_contacts_for_foot(y_smoothed, fps)
         for c in contacts:
             all_contacts.append({"frame": c, "foot": foot})
+
+    if not columns_found:
+        return {
+            "status": "error",
+            "message": (
+                "No heel/ankle landmark columns found for either foot in "
+                "landmark data — check that main.py's extraction includes "
+                "LEFT_HEEL/RIGHT_HEEL or LEFT_ANKLE/RIGHT_ANKLE."
+            ),
+        }
 
     if not all_contacts:
         return {
             "status": "error",
-            "message": "No heel/ankle landmark columns found for either foot in landmark data.",
+            "message": (
+                f"Landmark columns were found ({', '.join(columns_found)}), but no "
+                f"clear foot-contact peaks were detected in {bfc_frame_idx} run-up "
+                f"frames. This can happen with a very short/subtle run-up, heavy "
+                f"landmark jitter, or the bowler barely moving before BFC in this "
+                f"clip — it is not necessarily a bug, but if this keeps happening "
+                f"on clips with an obvious run-up, flag it for review."
+            ),
         }
 
     all_contacts.sort(key=lambda c: c["frame"])
