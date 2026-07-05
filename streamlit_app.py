@@ -24,6 +24,7 @@ import calibration as cal
 import profile_store as store
 import data_quality as dq
 import run_up_analysis as rua
+import camera_angle_detection as cad
 
 # ====================================================================
 # PAGE CONFIG & ELITE DARK UI  (unchanged from Phase 1)
@@ -520,6 +521,38 @@ if single_ready or dual_ready:
                     )
                     strike_summary = rua.summarize_strike_patterns(annotated_contacts)
 
+            # --- CAMERA ANGLE DETECTION (auto side-on vs not, ask only when ambiguous) ---
+            angle_estimate = None
+            if os.path.exists(landmarks_csv):
+                angle_estimate = cad.estimate_camera_angle(
+                    landmarks_df, reference_frame_idx=events["BFC"],
+                    frame_width=cap_w, frame_height=cap_h
+                )
+
+            resolved_angle = "side_on"  # default assumption if detection unavailable
+            if angle_estimate is not None:
+                if angle_estimate.angle == "side_on":
+                    resolved_angle = "side_on"
+                elif angle_estimate.angle in ("front_or_rear", "uncertain"):
+                    st.warning(
+                        f"📐 Camera angle check: {angle_estimate.confidence_note} "
+                        f"(shoulder-width ratio: {angle_estimate.ratio})"
+                    )
+                    angle_choice = st.radio(
+                        "Which angle was this filmed from? This changes what Trunk Lean "
+                        "and Head Stability actually measure.",
+                        ["Side-on", "Rear-view (behind bowler)", "Front-on (facing bowler)", "Not sure"],
+                        key="angle_confirm_radio", horizontal=True
+                    )
+                    resolved_angle = {
+                        "Side-on": "side_on",
+                        "Rear-view (behind bowler)": "rear",
+                        "Front-on (facing bowler)": "front",
+                        "Not sure": "unknown",
+                    }[angle_choice]
+                else:
+                    resolved_angle = "unknown"
+
             # TIMELINE
             st.header("⏱️ Kinematic Sequence Timeline")
             t1, t2, t3 = st.columns(3)
@@ -627,6 +660,29 @@ if single_ready or dual_ready:
                 m5.metric("Head Stability Variance", ui_val(head_val),
                            (metrics.get('head_stability', {}).get('classification')
                             or metrics.get('head_stability', {}).get('tier', 'N/A')))
+
+                if resolved_angle in ("rear", "front", "unknown"):
+                    if resolved_angle == "rear":
+                        st.caption(
+                            "📐 Filmed rear-view: Trunk Lean and Head Stability above reflect "
+                            "**lateral sway**, not forward lean/gaze drift — the formula measures "
+                            "left-right frame movement, which means something different from this "
+                            "angle than from side-on. Knee Bracing may also be foreshortened. "
+                            "Hip-Shoulder Separation is likely the most reliable metric from this angle."
+                        )
+                    elif resolved_angle == "front":
+                        st.caption(
+                            "📐 Filmed front-on: this angle isn't validated for any of these 5 "
+                            "metrics — the bowling arm crossing in front of the torso can also "
+                            "confuse pose tracking during the swing. Treat all values here with "
+                            "reduced confidence."
+                        )
+                    else:
+                        st.caption(
+                            "📐 Filming angle unconfirmed — Trunk Lean, Head Stability, and Knee "
+                            "Bracing assume a side-on view. If this wasn't filmed side-on, treat "
+                            "those three with reduced confidence."
+                        )
 
                 # CBC REFERENCE RANGES — now sourced from metric_ranges.py, colored dots reflect real classification
                 st.divider()
