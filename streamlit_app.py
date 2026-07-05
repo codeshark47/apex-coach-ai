@@ -450,6 +450,32 @@ if single_ready or dual_ready:
                 result_payload = run_complete_bowling_analysis(video_path)
                 active_camera_mode = "Single Camera"
 
+        # Persist across reruns: Streamlit reruns the ENTIRE script on every
+        # widget interaction (including the angle-confirmation radio button
+        # further below). Without this, clicking that radio button would
+        # make this "if button:" block report False again, wiping out the
+        # whole results section and forcing a full re-analysis — which is
+        # exactly the bug where confirming the camera angle appeared to
+        # "reset and ask again."
+        st.session_state.pending_result_payload = result_payload
+        st.session_state.pending_video_path = video_path
+        st.session_state.pending_active_camera_mode = active_camera_mode
+        st.session_state.pending_player_name = player_name
+        st.session_state.ai_insights_cache = None       # force regeneration for this NEW result
+        st.session_state.history_saved_for_run = False  # allow exactly one history save for this NEW result
+        st.session_state.pop("angle_confirm_radio", None)  # don't inherit the previous video's angle answer
+
+# Render results from session_state (not directly gated on this rerun's
+# button click) so any later widget interaction on this page — like the
+# angle-confirmation radio — doesn't discard everything computed above.
+if st.session_state.get("pending_result_payload") is not None:
+    result_payload = st.session_state.pending_result_payload
+    video_path = st.session_state.pending_video_path
+    active_camera_mode = st.session_state.pending_active_camera_mode
+    player_name = st.session_state.pending_player_name
+
+    if True:  # preserves original indentation/structure below unchanged
+
         # ================================================================
         # RESULTS DISPLAY
         # ================================================================
@@ -705,7 +731,12 @@ if single_ready or dual_ready:
 
             with col_insights:
                 st.header("🧠 Autonomous AI Coach Assessment")
-                if quality["confidence"] == "low":
+                if st.session_state.get("ai_insights_cache") is not None:
+                    # Already generated for this result on an earlier rerun
+                    # (e.g. before the angle-confirmation radio was clicked) —
+                    # reuse it instead of calling Gemini again for no reason.
+                    ai_insights = st.session_state.ai_insights_cache
+                elif quality["confidence"] == "low":
                     st.warning(
                         "AI coaching analysis withheld for this delivery — tracking "
                         "confidence was too low to generate reliable coaching advice. "
@@ -719,9 +750,11 @@ if single_ready or dual_ready:
                         ),
                         "prescribed_drills": [],
                     }
+                    st.session_state.ai_insights_cache = ai_insights
                 else:
                     with st.spinner("Generating expert coaching analysis..."):
                         ai_insights = generate_biomechanical_coaching_report(result_payload)
+                    st.session_state.ai_insights_cache = ai_insights
 
                 clean_slug = player_name.replace(" ", "_")
                 pdf_data = generate_pdf_report(
@@ -763,7 +796,10 @@ if single_ready or dual_ready:
                     st.info("All metrics within acceptable range. No critical interventions required.")
 
             # --- SAVE TO ATHLETE HISTORY (Supabase) ---
-            if history_enabled:
+            # Guarded to fire exactly ONCE per analysis result — without this,
+            # every later rerun (e.g. clicking the angle-confirmation radio)
+            # would re-save a duplicate row to Supabase.
+            if history_enabled and not st.session_state.get("history_saved_for_run", False):
                 try:
                     athlete_id = store.get_or_create_athlete(player_name)
                     metrics_with_quality = {
@@ -781,6 +817,7 @@ if single_ready or dual_ready:
                         release_arm_speed_kmh=(speed_result.get("kmh") if speed_result and speed_result.get("status") == "success" else None),
                         speed_status=(speed_result.get("status") if speed_result else "unavailable"),
                     )
+                    st.session_state.history_saved_for_run = True
                     st.toast(f"Session saved to {player_name}'s history.")
                 except Exception as e:
                     st.warning(f"Could not save this session to history: {e}")
@@ -791,10 +828,11 @@ if single_ready or dual_ready:
                 f"[{result_payload.get('stage', 'unknown')}]: "
                 f"{result_payload.get('message', 'Unknown error')}"
             )
-elif camera_mode == "Single Camera":
-    st.info("Upload a bowling video in the sidebar to begin analysis.")
-else:
-    st.info("Upload both Side-On and Rear-View videos in the sidebar to begin dual-camera analysis.")
+if st.session_state.get("pending_result_payload") is None:
+    if camera_mode == "Single Camera":
+        st.info("Upload a bowling video in the sidebar to begin analysis.")
+    else:
+        st.info("Upload both Side-On and Rear-View videos in the sidebar to begin dual-camera analysis.")
 
 # ====================================================================
 # CAMERA INSTRUCTIONS
