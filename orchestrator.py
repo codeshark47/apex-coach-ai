@@ -204,6 +204,23 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         output_fps, (width, height)
     )
 
+    # FIX for skeleton "flickering on/off": the old code drew directly from
+    # raw landmark data and skipped a connection/joint entirely for any
+    # frame where tracking briefly dropped out (even a single missing
+    # frame). Real tracking has brief gaps frame-to-frame, so the skeleton
+    # visibly blinked in and out following those gaps.
+    #
+    # Fix: linearly interpolate across SHORT gaps only (limit=3 frames,
+    # ~50-100ms depending on fps) before drawing, so brief dropouts bridge
+    # smoothly. Gaps longer than that are NOT filled — we don't want to
+    # fabricate an extended fake position for a genuinely-lost subject,
+    # only smooth over momentary tracking noise.
+    df = df.copy()
+    landmark_cols = [c for c in df.columns if c.endswith(("_x", "_y", "_z"))]
+    df[landmark_cols] = df[landmark_cols].interpolate(
+        method="linear", limit=3, limit_direction="both"
+    )
+
     # Cyan/magenta palette (BGR order for OpenCV)
     LINE_GLOW = (140, 90, 0)     # dim cyan under-stroke
     LINE_CORE = (255, 230, 0)    # bright cyan over-stroke
