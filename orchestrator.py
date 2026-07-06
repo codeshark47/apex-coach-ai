@@ -442,6 +442,27 @@ def run_complete_bowling_analysis(video_path: str,
     trunk_lean_val = _first_non_none(lean_analysis, "trunk_lean_degrees", "degrees", "angle")
     knee_bracing_val = _first_non_none(knee_analysis, "front_knee_angle", "degrees", "angle")
 
+    # ANATOMICAL PLAUSIBILITY GUARD (knee bracing only):
+    # A human knee cannot physically be at ~0 degrees mid-delivery — that
+    # would mean the joint folded completely in on itself. A near-zero
+    # reading here almost always means the hip/knee/ankle landmarks
+    # collapsed onto nearly the same point due to tracking failure (e.g.
+    # on a very short/low-quality clip), and arccos(~1) returned ~0 as a
+    # pure math artifact of that degeneracy, not a real measurement.
+    # Confirmed against a real clip: this exact scenario produced "0.0°"
+    # after the falsy-zero fix above started correctly passing through
+    # real zero values — this guard distinguishes a genuine 0-degree
+    # result (which never happens for THIS metric) from degenerate math.
+    # NOTE: this threshold (5 degrees) is an engineering choice based on
+    # basic human anatomy, not a cited biomechanics constant.
+    # IMPORTANT: this guard is intentionally NOT applied to trunk_lean —
+    # 0 degrees of trunk lean is a real, genuinely ideal result (a
+    # perfectly upright bowler), so the same "near-zero is implausible"
+    # logic would be wrong there.
+    KNEE_ANGLE_IMPLAUSIBLE_THRESHOLD = 5.0  # degrees
+    if knee_bracing_val is not None and knee_bracing_val < KNEE_ANGLE_IMPLAUSIBLE_THRESHOLD:
+        knee_bracing_val = None
+
     # STAGE 7 — RETURN UNIFIED PAYLOAD
     return {
         "status": "success",
