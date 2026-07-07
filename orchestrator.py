@@ -276,8 +276,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     yB = int(float(row[f"{partB}_y"]) * height)
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), LINE_GLOW, 5, cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), LINE_CORE, 2, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), LINE_GLOW, 3, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), LINE_CORE, 1, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -288,8 +288,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 9, JOINT_GLOW, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), 5, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 5, JOINT_GLOW, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 3, JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -351,6 +351,7 @@ def transcode_to_h264(input_path: str) -> str:
     cmd = [
         ffmpeg_bin, "-y", "-i", input_path,
         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+        "-crf", "18", "-preset", "medium",
         "-profile:v", "baseline", "-level", "3.0",
         "-an", web_safe_path
     ]
