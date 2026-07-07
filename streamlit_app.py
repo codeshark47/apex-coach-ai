@@ -94,6 +94,64 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.divider()
+
+# ====================================================================
+# AUTHENTICATION GATE (real per-user sign-in via Supabase Auth)
+# Replaces the earlier single shared beta password with real accounts.
+# ====================================================================
+import auth as auth_module
+
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+
+if st.session_state.auth_user is None:
+    st.markdown(
+        "<h2 style='text-align:center;color:#00B4D8;'>🔐 Sign In</h2>",
+        unsafe_allow_html=True
+    )
+    auth_tab_signin, auth_tab_signup = st.tabs(["Sign In", "Create Account"])
+
+    with auth_tab_signin:
+        with st.form("signin_form"):
+            signin_email = st.text_input("Email", key="signin_email")
+            signin_password = st.text_input("Password", type="password", key="signin_password")
+            signin_submitted = st.form_submit_button("Sign In", use_container_width=True)
+        if signin_submitted:
+            try:
+                result = auth_module.sign_in(signin_email, signin_password)
+                if result["status"] == "success":
+                    st.session_state.auth_user = result["user"]
+                    st.rerun()
+                else:
+                    st.error(result["message"])
+            except RuntimeError as e:
+                st.error(str(e))
+
+    with auth_tab_signup:
+        with st.form("signup_form"):
+            signup_email = st.text_input("Email", key="signup_email")
+            signup_password = st.text_input("Password (min 6 characters)", type="password", key="signup_password")
+            signup_submitted = st.form_submit_button("Create Account", use_container_width=True)
+        if signup_submitted:
+            try:
+                result = auth_module.sign_up(signup_email, signup_password)
+                if result["status"] == "success":
+                    st.success(result["message"])
+                else:
+                    st.error(result["message"])
+            except RuntimeError as e:
+                st.error(str(e))
+
+    st.stop()  # nothing below this renders until signed in
+
+else:
+    top_l, top_r = st.columns([4, 1])
+    with top_r:
+        st.caption(f"Signed in: {st.session_state.auth_user['email']}")
+        if st.button("Sign Out", use_container_width=True):
+            auth_module.sign_out()
+            st.session_state.auth_user = None
+            st.rerun()
 os.makedirs("input", exist_ok=True)
 
 
