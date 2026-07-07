@@ -1,67 +1,117 @@
-import streamlit as st
-from supabase import create_client, Client
+"""
+auth.py
 
-def init_supabase() -> Client:
-    """Initializes the connection client by reading credentials safely from secrets."""
+Real user sign-up/sign-in using Supabase Auth — reuses the Supabase
+project already set up for athlete history, rather than inventing a
+separate password system or rolling custom password hashing (which would
+be a real security risk to build by hand).
+
+IMPORTANT KEY DISTINCTION:
+  - profile_store.py uses SUPABASE_KEY (the "secret" key) to read/write
+    athlete/session data, deliberately bypassing Row Level Security for
+    server-side history operations.
+  - Auth operations (sign up / sign in / sign out) should use the
+    "anon"/"publishable" key instead — that's what it's designed for, and
+    Supabase's Auth endpoints have their own protections independent of
+    table-level RLS. Do NOT reuse the secret key for this.
+
+Setup required (one-time):
+  Add a SECOND secret to .streamlit/secrets.toml / Streamlit Cloud secrets:
+    SUPABASE_ANON_KEY = "sb_publishable_xxxxxxxxxxxxxxxxxxxx"
+  (the same "Publishable key" from Supabase's API settings page you
+  already saw earlier — NOT the secret key, which stays as SUPABASE_KEY).
+
+No new database schema needed — Supabase Auth manages its own internal
+user table automatically.
+"""
+
+import os
+
+_auth_client = None
+
+
+def _get_anon_credentials():
+    url = None
+    anon_key = None
     try:
-        # Check raw TOML structure parsing integrity
-        _ = st.secrets.keys()
-    except Exception as toml_err:
-        st.error("🚨 **CRITICAL: Your .streamlit/secrets.toml file has a broken syntax typo!**")
-        st.code(str(toml_err), language="python")
-        st.stop()
+        import streamlit as st
+        url = st.secrets.get("SUPABASE_URL")
+        anon_key = st.secrets.get("SUPABASE_ANON_KEY")
+    except Exception:
+        pass
+    url = url or os.environ.get("SUPABASE_URL")
+    anon_key = anon_key or os.environ.get("SUPABASE_ANON_KEY")
+    return url, anon_key
 
-    url = st.secrets.get("SUPABASE_URL")
-    anon_key = st.secrets.get("SUPABASE_ANON_KEY")
 
+def get_auth_client():
+    global _auth_client
+    if _auth_client is not None:
+        return _auth_client
+
+    url, anon_key = _get_anon_credentials()
     if not url or not anon_key:
-        missing = []
-        if not url: missing.append("SUPABASE_URL")
-        if not anon_key: missing.append("SUPABASE_ANON_KEY")
-        st.error(f"🚨 **MISSING KEYS:** Missing fields: {', '.join(missing)}")
-        st.stop()
+        raise RuntimeError(
+            "Sign-in is not configured. Add SUPABASE_URL and SUPABASE_ANON_KEY "
+            "(the publishable key, NOT the secret key) to secrets."
+        )
+
+    from supabase import create_client
+    _auth_client = create_client(url, anon_key)
+    return _auth_client
+
+
+def sign_up(email: str, password: str) -> dict:
+    """
+    Returns {"status": "success", "message": ...} or {"status": "error", "message": ...}.
+    Supabase sends a confirmation email by default — the account isn't
+    fully active until the user clicks that link (this is Supabase's
+    standard behavior, not something this app fabricates or bypasses).
+    """
+    email = email.strip()
+    if not email or "@" not in email:
+        return {"status": "error", "message": "Enter a valid email address."}
+    if not password or len(password) < 6:
+        return {"status": "error", "message": "Password must be at least 6 characters."}
 
     try:
-        return create_client(url, anon_key)
-    except Exception as connection_err:
-        st.error("🚨 **SUPABASE ARCHITECTURE CONNECTION FAILURE:** Connection rejected.")
-        st.code(str(connection_err), language="python")
-        st.stop()
+        client = get_auth_client()
+        client.auth.sign_up({"email": email, "password": password})
+        return {
+            "status": "success",
+            "message": "Account created. Check your email to confirm your address before signing in.",
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-def sign_in_user(email, password):
-    """Attempts user login and catches explicit auth errors without masking them."""
-    supabase = init_supabase()
-    try:
-        response = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        if response.user:
-            st.session_state["user"] = response.user
-            st.session_state["session"] = response.session
-            st.success("🎉 Login successful! Redirecting...")
-            st.rerun()
-    except Exception as auth_error:
-        error_msg = str(auth_error).lower()
-        
-        st.error("❌ **Authentication Failed: Invalid Login Credentials**")
-        
-        # Diagnostics Checklist Box
-        with st.expander("🛠️ Debugger Checklist — Why am I seeing this?"):
-            st.markdown("""
-            1. **Email Confirmation Pending:** Did you click the confirmation link sent to your email inbox? Supabase blocks sign-ins until verified.
-            2. **Key Assignment Mixup:** double-check your `.streamlit/secrets.toml`. 
-               * `SUPABASE_ANON_KEY` **must** be your **ANON / PUBLIC** key.
-               * `SUPABASE_KEY` **must** be your **SERVICE ROLE / SECRET** key.
-               If these are flipped, password matching fails.
-            """)
-            st.warning(f"Raw system return string: {str(auth_error)}")
 
-def sign_up_user(email, password):
-    """Handles new user creation inside the database."""
-    supabase = init_supabase()
+def sign_in(email: str, password: str) -> dict:
+    """
+    Returns {"status": "success", "user": {...}} or {"status": "error", "message": ...}.
+    """
+    email = email.strip()
+    if not email or not password:
+        return {"status": "error", "message": "Enter both email and password."}
+
     try:
-        response = supabase.auth.sign_up({"email": email, "password": password})
-        if response.user:
-            st.info("📩 **Registration initialized successfully!**")
-            st.success("Please check your email inbox and click the Supabase verification link before logging in.")
-    except Exception as sign_up_err:
-        st.error("❌ Registration Pipeline Blocked")
-        st.code(str(sign_up_err), language="python")
+        client = get_auth_client()
+        result = client.auth.sign_in_with_password({"email": email, "password": password})
+        if result and result.user:
+            return {
+                "status": "success",
+                "user": {"id": result.user.id, "email": result.user.email},
+            }
+        return {"status": "error", "message": "Sign-in failed — no user returned."}
+    except Exception as e:
+        # Supabase raises a generic error for wrong credentials AND for an
+        # unconfirmed email — surface the real message rather than guessing
+        # which one it was.
+        return {"status": "error", "message": str(e)}
+
+
+def sign_out():
+    try:
+        client = get_auth_client()
+        client.auth.sign_out()
+    except Exception:
+        pass  # sign-out failing silently is acceptable -- session state is cleared regardless
