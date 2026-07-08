@@ -58,7 +58,9 @@ def get_auth_client():
         return _auth_client
 
     url, anon_key = _get_anon_credentials()
-    if not url or not anon_key:
+  if not url or not anon_key:
+        if secrets_error:
+            raise RuntimeError(f"Could not read Streamlit secrets: {secrets_error}")
         raise RuntimeError(
             "Sign-in is not configured. Add SUPABASE_URL and SUPABASE_ANON_KEY "
             "(the publishable key, NOT the secret key) to secrets."
