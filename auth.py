@@ -39,13 +39,6 @@ def _get_anon_credentials():
         url = st.secrets.get("SUPABASE_URL")
         anon_key = st.secrets.get("SUPABASE_ANON_KEY")
     except Exception as e:
-        # FIX: this used to be a bare `except Exception: pass`, which
-        # silently hid the REAL reason st.secrets couldn't be read (e.g. a
-        # TOML syntax error elsewhere in the file) and made every failure
-        # look identical to "key just isn't set" — exactly the kind of
-        # opaque error that caused confusion earlier in this project with
-        # the secrets.toml parsing crash. Now the real exception is kept
-        # and surfaced below instead of masked.
         secrets_error = str(e)
     url = url or os.environ.get("SUPABASE_URL")
     anon_key = anon_key or os.environ.get("SUPABASE_ANON_KEY")
@@ -57,8 +50,8 @@ def get_auth_client():
     if _auth_client is not None:
         return _auth_client
 
-    url, anon_key = _get_anon_credentials()
-  if not url or not anon_key:
+    url, anon_key, secrets_error = _get_anon_credentials()
+    if not url or not anon_key:
         if secrets_error:
             raise RuntimeError(f"Could not read Streamlit secrets: {secrets_error}")
         raise RuntimeError(
@@ -72,12 +65,6 @@ def get_auth_client():
 
 
 def sign_up(email: str, password: str) -> dict:
-    """
-    Returns {"status": "success", "message": ...} or {"status": "error", "message": ...}.
-    Supabase sends a confirmation email by default — the account isn't
-    fully active until the user clicks that link (this is Supabase's
-    standard behavior, not something this app fabricates or bypasses).
-    """
     email = email.strip()
     if not email or "@" not in email:
         return {"status": "error", "message": "Enter a valid email address."}
@@ -96,9 +83,6 @@ def sign_up(email: str, password: str) -> dict:
 
 
 def sign_in(email: str, password: str) -> dict:
-    """
-    Returns {"status": "success", "user": {...}} or {"status": "error", "message": ...}.
-    """
     email = email.strip()
     if not email or not password:
         return {"status": "error", "message": "Enter both email and password."}
@@ -113,9 +97,6 @@ def sign_in(email: str, password: str) -> dict:
             }
         return {"status": "error", "message": "Sign-in failed — no user returned."}
     except Exception as e:
-        # Supabase raises a generic error for wrong credentials AND for an
-        # unconfirmed email — surface the real message rather than guessing
-        # which one it was.
         return {"status": "error", "message": str(e)}
 
 
@@ -124,4 +105,4 @@ def sign_out():
         client = get_auth_client()
         client.auth.sign_out()
     except Exception:
-        pass  # sign-out failing silently is acceptable -- session state is cleared regardless
+        pass
