@@ -33,15 +33,23 @@ _auth_client = None
 def _get_anon_credentials():
     url = None
     anon_key = None
+    secrets_error = None
     try:
         import streamlit as st
         url = st.secrets.get("SUPABASE_URL")
         anon_key = st.secrets.get("SUPABASE_ANON_KEY")
-    except Exception:
-        pass
+    except Exception as e:
+        # FIX: this used to be a bare `except Exception: pass`, which
+        # silently hid the REAL reason st.secrets couldn't be read (e.g. a
+        # TOML syntax error elsewhere in the file) and made every failure
+        # look identical to "key just isn't set" — exactly the kind of
+        # opaque error that caused confusion earlier in this project with
+        # the secrets.toml parsing crash. Now the real exception is kept
+        # and surfaced below instead of masked.
+        secrets_error = str(e)
     url = url or os.environ.get("SUPABASE_URL")
     anon_key = anon_key or os.environ.get("SUPABASE_ANON_KEY")
-    return url, anon_key
+    return url, anon_key, secrets_error
 
 
 def get_auth_client():

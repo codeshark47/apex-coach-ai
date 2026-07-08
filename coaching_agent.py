@@ -1,9 +1,27 @@
 import os
+import re
 from typing import Dict, Any
 
 import metric_ranges as mr
 
 ZONE_LABELS = {"green": "OPTIMAL", "amber": "ACCEPTABLE", "red": "CRITICAL", "unknown": "NO DATA"}
+
+
+def _strip_section_header(text: str) -> str:
+    """
+    Removes Gemini's restated section headers regardless of exact
+    punctuation/prefix — LLMs don't reliably reproduce an exact requested
+    heading string every call, so exact string-replace was brittle (it
+    previously let a leftover "PRESCRIBED DRILLS:" line survive into the
+    drills list as a fake fourth "drill").
+    """
+    text = re.sub(r'^\s*SECTION\s*1\s*[-—:]*\s*BIOMECHANICAL NARRATIVE ASSESSMENT:?\s*',
+                  '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^\s*SECTION\s*2\s*[-—:]*\s*PRESCRIBED DRILLS:?\s*',
+                  '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^\s*(SECTION\s*2\s*[-—:]*\s*)?PRESCRIBED DRILLS:?\s*$',
+                  '', text, flags=re.IGNORECASE | re.MULTILINE)
+    return text.strip()
 
 
 def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> dict:
@@ -177,19 +195,24 @@ DRILL NAME: explaining what it corrects and how to perform it.
         # 7. PARSE RESPONSE INTO STRUCTURED DICT
         if "---" in raw_text:
             parts = raw_text.split("---", maxsplit=1)
-            narrative = parts[0].strip()
-            drills_block = parts[1].strip()
+            narrative = _strip_section_header(parts[0].strip())
+            drills_block = _strip_section_header(parts[1].strip())
 
-            narrative = narrative.replace("SECTION 1 — BIOMECHANICAL NARRATIVE ASSESSMENT:", "").strip()
-            drills_block = drills_block.replace("SECTION 2 — PRESCRIBED DRILLS:", "").strip()
-
-            drills = [
-                line.lstrip("-•*0123456789. ").strip()
-                for line in drills_block.split("\n")
-                if len(line.strip()) > 10
-            ]
+            drills = []
+            for line in drills_block.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Skip any leftover restated header line, case/punctuation-insensitive
+                if re.match(r'^(section\s*2\s*[-—:]*\s*)?prescribed\s+drills:?$',
+                            line, re.IGNORECASE):
+                    continue
+                line = line.lstrip("-•*0123456789. ").strip()
+                if len(line) > 10:
+                    drills.append(line)
+            drills = drills[:3]  # never surface more than the 3 the prompt asked for
         else:
-            narrative = raw_text.replace("SECTION 1 — BIOMECHANICAL NARRATIVE ASSESSMENT:", "").strip()
+            narrative = _strip_section_header(raw_text)
             drills = []
 
         return {
