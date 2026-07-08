@@ -127,7 +127,9 @@ def calculate_release_height_ratio_safe(br_row: pd.Series) -> dict:
     try:
         y_wrist = br_row.get("RIGHT_WRIST_y")
         y_head = br_row.get("NOSE_y")
-        y_ankle = br_row.get("LEFT_ANKLE_y") or br_row.get("RIGHT_ANKLE_y")
+        y_ankle = br_row.get("LEFT_ANKLE_y")
+        if y_ankle is None or pd.isna(y_ankle):
+            y_ankle = br_row.get("RIGHT_ANKLE_y")
 
         if any(v is None or pd.isna(v) for v in [y_wrist, y_head, y_ankle]):
             return {
@@ -517,8 +519,7 @@ def run_complete_bowling_analysis(video_path: str,
                 "status": release_height.get("status", "error")
             },
             "head_stability": {
-                "value": (head_stability.get("deviation_index") or
-                          head_stability.get("value")),
+                "value": _first_non_none(head_stability, "deviation_index", "value"),
                 "classification": (head_stability.get("tier") or
                                     head_stability.get("classification") or
                                     "Unknown"),
