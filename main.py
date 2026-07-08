@@ -3,11 +3,128 @@ import pandas as pd
 import numpy as np
 import os
 import urllib.request
+from typing import Optional
+
+
+LANDMARK_NAMES = [
+    "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER", "RIGHT_EYE_INNER", "RIGHT_EYE", "RIGHT_EYE_OUTER",
+    "LEFT_EAR", "RIGHT_EAR", "LEFT_MOUTH_OUTER", "RIGHT_MOUTH_OUTER", "LEFT_SHOULDER", "RIGHT_SHOULDER",
+    "LEFT_ELBOW", "RIGHT_ELBOW", "LEFT_WRIST", "RIGHT_WRIST", "LEFT_PINKY", "RIGHT_PINKY", "LEFT_INDEX",
+    "RIGHT_INDEX", "LEFT_THUMB", "RIGHT_THUMB", "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "RIGHT_KNEE",
+    "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL", "RIGHT_HEEL", "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX"
+]
+
+_LEFT_HIP_IDX = 23
+_RIGHT_HIP_IDX = 24
+
+# ============================================================
+# MULTI-PERSON IDENTITY DISAMBIGUATION
+# ============================================================
+# PROBLEM (confirmed against real footage, documented in Phase 3 handoff):
+# MediaPipe's multi-pose detection returns a list of detected people per
+# FRAME, in whatever order/confidence it finds them THAT FRAME, with zero
+# identity continuity across frames. If other people are visible (fielders,
+# keeper, non-striker), naively taking pose_landmarks[0] every frame can
+# silently jump between different real people frame to frame.
+#
+# This is a HEURISTIC disambiguation strategy, not a solved general
+# multi-person tracker:
+#   1. WARM-UP WINDOW (first ~1.5s of frames): track all detected people
+#      frame-to-frame via simple nearest-centroid matching (hip midpoint).
+#      Whoever accumulates the most total movement is assumed to be the
+#      bowler (sprinting in), since everyone else in frame during a run-up
+#      is comparatively static (fielders standing, keeper waiting, etc.)
+#   2. LOCK & FOLLOW: after the warm-up window, the target identity is
+#      "locked" and followed for the rest of the clip by picking whichever
+#      detected person is closest to the previously-known position each
+#      frame.
+#
+# KNOWN LIMITATIONS (not fixed by this, and not claimed to be):
+#   - Assumes the bowler is genuinely the most-moving person during warm-up.
+#     A fielder jogging into position at the same time could confuse this.
+#   - "Nearest to last position" can still misidentify if the bowler is
+#     briefly occluded by, or crosses paths with, another player.
+#   - UNTESTED against real multi-person footage — the matching/selection
+#     LOGIC is unit-tested against synthetic trajectory data, but
+#     MediaPipe's real behavior with actual people in frame can only be
+#     confirmed by running this against real footage.
+#   - If only ONE person is ever detected (the common case for existing
+#     single-bowler footage), this reduces to exactly the old
+#     pose_landmarks[0] behavior — backward compatible by construction,
+#     not by special-casing.
+#
+# CONFIGURATION (engineering choices, not validated against real footage):
+NUM_POSES = 5
+WARMUP_SECONDS = 1.5
+MAX_MATCH_DIST = 0.3
+
+
+def _hip_centroid(landmarks) -> Optional[tuple]:
+    """Midpoint of left/right hip landmarks — a stable, central body point
+    that moves smoothly with the person, less noisy than a limb extremity."""
+    try:
+        lh, rh = landmarks[_LEFT_HIP_IDX], landmarks[_RIGHT_HIP_IDX]
+        return ((lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0)
+    except (IndexError, AttributeError):
+        return None
+
+
+def _dist(a: tuple, b: tuple) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def _greedy_match(track_positions: dict, detections: list, max_dist: float) -> dict:
+    """
+    Pure function, no MediaPipe dependency — unit-testable directly.
+    track_positions: {track_id: (x, y)} — each existing track's last known position.
+    detections: [(x, y), ...] — this frame's detected centroids.
+    Returns {track_id: detection_index} for the best greedy assignment
+    within max_dist, each track and each detection used at most once.
+    """
+    pairs = []
+    for tid, tpos in track_positions.items():
+        for di, dpos in enumerate(detections):
+            d = _dist(tpos, dpos)
+            if d <= max_dist:
+                pairs.append((d, tid, di))
+    pairs.sort(key=lambda p: p[0])
+
+    assigned = {}
+    used_tracks, used_dets = set(), set()
+    for d, tid, di in pairs:
+        if tid in used_tracks or di in used_dets:
+            continue
+        assigned[tid] = di
+        used_tracks.add(tid)
+        used_dets.add(di)
+    return assigned
+
+
+def _nearest_detection_idx(target_pos: tuple, detections: list) -> Optional[int]:
+    """Pure function — index of the closest detection to target_pos, or
+    None if detections is empty. No distance cap here: post-warmup, we
+    prefer to always follow the closest candidate (a big frame-to-frame
+    jump is more likely fast sprinting motion than a different person
+    appearing from nowhere) — a real limitation, documented above."""
+    if not detections:
+        return None
+    best_idx, best_dist = None, None
+    for i, dpos in enumerate(detections):
+        d = _dist(target_pos, dpos)
+        if best_dist is None or d < best_dist:
+            best_dist, best_idx = d, i
+    return best_idx
+
 
 def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     """
-    Headless Perception Layer matching local PC execution exactly.
-    Processes every frame sequentially without destructive cropping to ensure zero data loss.
+    Headless Perception Layer. Processes every frame sequentially without
+    destructive cropping to ensure zero data loss.
+
+    Now detects up to NUM_POSES people per frame (not just 1) and uses a
+    warm-up-then-follow heuristic (see module docstring above) to keep
+    tracking the SAME real person across frames, instead of naively taking
+    whichever detection MediaPipe returns first each frame.
     """
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
@@ -34,47 +151,107 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         output_segmentation_masks=False,
+        num_poses=NUM_POSES,
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5
     )
-    
+
     landmarker = vision.PoseLandmarker.create_from_options(options)
 
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
 
-    landmark_names = [
-        "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER", "RIGHT_EYE_INNER", "RIGHT_EYE", "RIGHT_EYE_OUTER",
-        "LEFT_EAR", "RIGHT_EAR", "LEFT_MOUTH_OUTER", "RIGHT_MOUTH_OUTER", "LEFT_SHOULDER", "RIGHT_SHOULDER",
-        "LEFT_ELBOW", "RIGHT_ELBOW", "LEFT_WRIST", "RIGHT_WRIST", "LEFT_PINKY", "RIGHT_PINKY", "LEFT_INDEX",
-        "RIGHT_INDEX", "LEFT_THUMB", "RIGHT_THUMB", "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "RIGHT_KNEE",
-        "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL", "RIGHT_HEEL", "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX"
-    ]
-
     columns = ["frame"]
-    for name in landmark_names:
+    for name in LANDMARK_NAMES:
         columns.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
+
+    warmup_frame_count = max(10, int(fps * WARMUP_SECONDS))
 
     dataset_rows = []
     frame_number = 0
+
+    identity_locked = False
+    warmup_buffer = []
+    tracks = {}
+    next_track_id = 0
+    last_known_pos = None
+
+    def _lock_identity():
+        nonlocal last_known_pos
+        if tracks:
+            target_tid = max(tracks, key=lambda k: tracks[k]["movement"])
+            target_history = tracks[target_tid]["history"]
+            last_known_pos = tracks[target_tid]["pos"]
+        else:
+            target_history = {}
+            last_known_pos = None
+
+        for buf_frame_number, buf_poses in warmup_buffer:
+            pose_idx = target_history.get(buf_frame_number)
+            row = [buf_frame_number]
+            if pose_idx is not None and pose_idx < len(buf_poses):
+                for landmark in buf_poses[pose_idx]:
+                    row.extend([landmark.x, landmark.y, landmark.z])
+            else:
+                row.extend([np.nan] * (33 * 3))
+            dataset_rows.append(row)
 
     while True:
         success, frame = cap.read()
         if not success:
             break
 
-        # PC Mirror Fix: Process the FULL frame frame-by-frame. 
-        # No arbitrary crops that break under different cloud aspect ratios.
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        
         detection_result = landmarker.detect(mp_image_frame)
-        row = [frame_number]
+        poses = detection_result.pose_landmarks or []
 
-        if detection_result.pose_landmarks and len(detection_result.pose_landmarks) > 0:
-            first_person_landmarks = detection_result.pose_landmarks[0]
-            for landmark in first_person_landmarks:
+        if not identity_locked and frame_number < warmup_frame_count:
+            warmup_buffer.append((frame_number, poses))
+            centroids = [_hip_centroid(p) for p in poses]
+            valid = [(i, c) for i, c in enumerate(centroids) if c is not None]
+
+            track_positions = {tid: t["pos"] for tid, t in tracks.items()}
+            assigned = _greedy_match(track_positions, [c for _, c in valid], MAX_MATCH_DIST)
+            used_valid_idx = set(assigned.values())
+            for tid, vi in assigned.items():
+                pose_i, c = valid[vi]
+                moved = _dist(tracks[tid]["pos"], c)
+                tracks[tid]["movement"] += moved
+                tracks[tid]["pos"] = c
+                tracks[tid]["history"][frame_number] = pose_i
+            for vi, (pose_i, c) in enumerate(valid):
+                if vi not in used_valid_idx:
+                    tracks[next_track_id] = {"pos": c, "movement": 0.0,
+                                              "history": {frame_number: pose_i}}
+                    next_track_id += 1
+
+            frame_number += 1
+            if frame_number >= warmup_frame_count:
+                identity_locked = True
+                _lock_identity()
+            continue
+
+        if not identity_locked:
+            identity_locked = True
+            _lock_identity()
+
+        row = [frame_number]
+        if poses:
+            centroids = [_hip_centroid(p) for p in poses]
+            valid = [(i, c) for i, c in enumerate(centroids) if c is not None]
+            if last_known_pos is not None and valid:
+                nearest_vi = _nearest_detection_idx(last_known_pos, [c for _, c in valid])
+                pose_i, c = valid[nearest_vi]
+                chosen_landmarks = poses[pose_i]
+                last_known_pos = c
+            else:
+                chosen_landmarks = poses[0]
+                c = _hip_centroid(chosen_landmarks)
+                if c is not None:
+                    last_known_pos = c
+            for landmark in chosen_landmarks:
                 row.extend([landmark.x, landmark.y, landmark.z])
         else:
             row.extend([np.nan] * (33 * 3))
@@ -86,6 +263,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     landmarker.close()
 
     output_df = pd.DataFrame(dataset_rows, columns=columns)
+    output_df = output_df.sort_values("frame").reset_index(drop=True)
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
     output_df.to_csv(output_csv_path, index=False)
 
@@ -95,6 +273,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         "fps": fps,
         "output_file": output_csv_path
     }
+
 
 if __name__ == "__main__":
     print("=== STARTING KINEMATIC EXTRACTION STATE ===")
