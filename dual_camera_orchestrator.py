@@ -1,4 +1,3 @@
-cat > dual_camera_orchestrator.py << 'EOF'
 import os
 import pandas as pd
 from orchestrator import (
@@ -20,7 +19,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. PROCESS SIDE-ON STREAM (Knee, Lean, Release Height)
     print("[DUAL-CAM CORE] Extracting side-on tracking vectors...")
     side_csv = os.path.join(output_dir, "landmarks_side.csv")
     side_extraction = extract_video_landmarks(side_on_path, side_csv)
@@ -41,7 +39,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     lean_analysis  = calculate_trunk_lean(side_br_rows.iloc[0])
     release_height = calculate_release_height_ratio_safe(side_br_rows.iloc[0])
 
-    # 2. PROCESS REAR-VIEW STREAM (Rotation Twist, Head Plane Stability)
     print("[DUAL-CAM CORE] Extracting rear-view tracking vectors...")
     rear_csv = os.path.join(output_dir, "landmarks_rear.csv")
     rear_extraction = extract_video_landmarks(rear_view_path, rear_csv)
@@ -55,12 +52,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
     head_stability = calculate_head_stability(rear_df, rear_events["BFC"], rear_events["BR"])
 
-    # 3. ANNOTATE SIDE-ON PATH FOR UI GRAPHICS
     raw_video = os.path.join(output_dir, "annotated_raw.mp4")
     generate_fail_safe_video(side_on_path, raw_video, side_df, side_events)
     web_safe_video = transcode_to_h264(raw_video)
 
-    # 4. DATA SERIALIZATION MAP (Guards type safety for JSON serialization)
     def clean_numeric(val):
         import numpy as np
         if val is None or pd.isna(val): return None
@@ -112,4 +107,3 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         },
         "annotated_video_output": web_safe_video
     }
-EOF
