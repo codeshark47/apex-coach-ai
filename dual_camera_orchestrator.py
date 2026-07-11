@@ -1,3 +1,4 @@
+cat > dual_camera_orchestrator.py << 'EOF'
 import os
 import pandas as pd
 from orchestrator import (
@@ -28,9 +29,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     side_df  = pd.read_csv(side_csv)
     side_fps = side_extraction["fps"]
-    # FIX: was passing side_csv (a file path string) instead of side_df (the
-    # loaded DataFrame) — embedded_detect_events/detect_delivery_events does
-    # len(df) and df["RIGHT_WRIST_y"], which crashes on a plain string.
     side_events = embedded_detect_events(side_df, fps=side_fps)
 
     side_ffc_rows = side_df[side_df["frame"] == side_events["FFC"]]
@@ -39,7 +37,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     if side_ffc_rows.empty or side_br_rows.empty:
         return {"status": "failed", "stage": "side_frame_extraction", "message": "Kinematic frames missing from side-on stream."}
 
-    # Extract metrics from the mathematically correct plane
     knee_analysis  = calculate_knee_bracing(side_ffc_rows.iloc[0])
     lean_analysis  = calculate_trunk_lean(side_br_rows.iloc[0])
     release_height = calculate_release_height_ratio_safe(side_br_rows.iloc[0])
@@ -53,7 +50,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     rear_df  = pd.read_csv(rear_csv)
     rear_fps = rear_extraction["fps"]
-    # FIX: same bug as above, mirrored for the rear-view stream.
     rear_events = embedded_detect_events(rear_df, fps=rear_fps)
 
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
@@ -62,9 +58,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     # 3. ANNOTATE SIDE-ON PATH FOR UI GRAPHICS
     raw_video = os.path.join(output_dir, "annotated_raw.mp4")
     generate_fail_safe_video(side_on_path, raw_video, side_df, side_events)
-    # FIX: single-camera mode always transcodes to H264 for browser playback
-    # (mp4v isn't reliably browser-compatible) — this file was returning the
-    # raw, untranscoded video, skipping that step entirely.
     web_safe_video = transcode_to_h264(raw_video)
 
     # 4. DATA SERIALIZATION MAP (Guards type safety for JSON serialization)
@@ -94,11 +87,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             "trunk_lean": {
                 "degrees": trunk_lean_val,
                 "tier": lean_analysis.get("tier", "Unknown"),
-                # FIX: "if trunk_lean_val else" treated a genuinely valid
-                # 0.0-degree result (a perfectly upright bowler) as falsy,
-                # mislabeling an ideal measurement as "error". Same bug class
-                # already fixed elsewhere in this project (metric_ranges.py,
-                # orchestrator.py) — checking `is not None` instead.
                 "status": "success" if trunk_lean_val is not None else "error"
             },
             "front_knee_bracing": {
@@ -123,3 +111,5 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             }
         },
         "annotated_video_output": web_safe_video
+    }
+EOF
