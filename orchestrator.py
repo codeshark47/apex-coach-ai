@@ -230,11 +230,26 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         method="linear", limit=3, limit_direction="both"
     )
 
-    # Cyan/magenta palette (BGR order for OpenCV)
-    LINE_GLOW = (140, 90, 0)     # dim cyan under-stroke
-    LINE_CORE = (255, 230, 0)    # bright cyan over-stroke
-    JOINT_GLOW = (140, 0, 140)   # dim magenta under-stroke
-    JOINT_CORE = (255, 80, 255)  # bright magenta over-stroke
+    # Per-region palette (BGR order for OpenCV): legs in green, everything
+    # else (arms/torso/head) in white/cream, joints in a warm amber-yellow
+    # glow — matching the reference coaching-app look instead of one flat
+    # cyan color for the whole skeleton.
+    LEG_LINE_GLOW   = (20, 100, 20)
+    LEG_LINE_CORE   = (60, 225, 90)
+    UPPER_LINE_GLOW = (70, 70, 70)
+    UPPER_LINE_CORE = (235, 235, 235)
+    JOINT_GLOW = (10, 140, 210)
+    JOINT_CORE = (0, 210, 255)
+
+    LEG_CONNECTIONS = {
+        ("LEFT_HIP", "LEFT_KNEE"), ("LEFT_KNEE", "LEFT_ANKLE"),
+        ("RIGHT_HIP", "RIGHT_KNEE"), ("RIGHT_KNEE", "RIGHT_ANKLE"),
+        ("LEFT_ANKLE", "LEFT_HEEL"), ("LEFT_HEEL", "LEFT_FOOT_INDEX"),
+        ("LEFT_ANKLE", "LEFT_FOOT_INDEX"),
+        ("RIGHT_ANKLE", "RIGHT_HEEL"), ("RIGHT_HEEL", "RIGHT_FOOT_INDEX"),
+        ("RIGHT_ANKLE", "RIGHT_FOOT_INDEX"),
+        ("LEFT_HIP", "RIGHT_HIP"),
+    }
 
     connections = [
         ("LEFT_SHOULDER", "RIGHT_SHOULDER"),
@@ -283,10 +298,13 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     yA = int(float(row[f"{partA}_y"]) * height)
                     xB = int(float(row[f"{partB}_x"]) * width)
                     yB = int(float(row[f"{partB}_y"]) * height)
+                    is_leg = (partA, partB) in LEG_CONNECTIONS or (partB, partA) in LEG_CONNECTIONS
+                    glow = LEG_LINE_GLOW if is_leg else UPPER_LINE_GLOW
+                    core = LEG_LINE_CORE if is_leg else UPPER_LINE_CORE
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), LINE_GLOW, 3, cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), LINE_CORE, 1, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), glow, 5, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), core, 2, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -297,8 +315,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 5, JOINT_GLOW, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), 3, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 7, JOINT_GLOW, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 4, JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
