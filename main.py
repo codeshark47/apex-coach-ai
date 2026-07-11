@@ -47,10 +47,21 @@ _RIGHT_HIP_IDX = 24
 # frame width/height) and may need retuning if footage framing changes
 # drastically (e.g. a much tighter or wider crop on the bowler).
 NUM_POSES = 1
-MAX_PLAUSIBLE_JUMP = 0.15
 MIN_DETECTION_CONFIDENCE = 0.6
 MIN_PRESENCE_CONFIDENCE = 0.6
 MIN_TRACKING_CONFIDENCE = 0.6
+
+# Continuity/outlier rejection is now ADAPTIVE rather than a fixed
+# distance cap. A fixed cap (e.g. "reject any jump > 0.15") turned out to
+# wrongly reject genuine fast motion during the bowler's explosive
+# delivery leap, since real hip displacement during a jump can legitimately
+# exceed a small fixed threshold in a single frame. Instead: track the
+# recent frame-to-frame displacement history, and only reject a frame if
+# its jump is a large outlier relative to what the bowler was ALREADY
+# doing (i.e. a true unexplained teleport), not just "moving fast."
+JUMP_HISTORY_LEN = 5
+ADAPTIVE_MULTIPLIER = 3.0
+HARD_CAP_JUMP = 0.45  # absolute safety ceiling regardless of recent motion
 
 
 def _hip_centroid(landmarks) -> Optional[tuple]:
@@ -116,9 +127,11 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     for name in LANDMARK_NAMES:
         columns.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
 
+    import collections
     dataset_rows = []
     frame_number = 0
     last_known_pos = None
+    jump_history = collections.deque(maxlen=JUMP_HISTORY_LEN)
 
     while True:
         success, frame = cap.read()
@@ -134,17 +147,25 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         if poses:
             chosen_landmarks = poses[0]
             c = _hip_centroid(chosen_landmarks)
-            jumped_too_far = (
-                c is not None and last_known_pos is not None
-                and _dist(c, last_known_pos) > MAX_PLAUSIBLE_JUMP
-            )
-            if c is not None and not jumped_too_far:
+            accept = c is not None
+            if accept and last_known_pos is not None:
+                jump = _dist(c, last_known_pos)
+                if jump > HARD_CAP_JUMP:
+                    # Always reject an extreme teleport regardless of
+                    # recent motion — this is the true "ghost detection"
+                    # guard (e.g. jumping to background clutter).
+                    accept = False
+                elif len(jump_history) >= 2:
+                    baseline = sorted(jump_history)[len(jump_history) // 2]  # median
+                    if jump > max(baseline * ADAPTIVE_MULTIPLIER, 0.08):
+                        accept = False
+                if accept:
+                    jump_history.append(jump)
+            if accept:
                 for landmark in chosen_landmarks:
                     row.extend([landmark.x, landmark.y, landmark.z])
                 last_known_pos = c
             else:
-                # Either no valid centroid, or an implausible teleport —
-                # treat as a missed detection rather than trusting it.
                 row.extend([np.nan] * (33 * 3))
         else:
             row.extend([np.nan] * (33 * 3))
