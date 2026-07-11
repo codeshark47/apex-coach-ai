@@ -696,16 +696,44 @@ if st.session_state.get("pending_result_payload") is not None:
 
             with col_graph:
                 st.header("🎞️ Visual Verification")
+                clean_slug = player_name.replace(" ", "_")
                 video_output = result_payload.get("annotated_video_output")
-                if video_output and os.path.exists(video_output):
+                rear_video_output = result_payload.get("rear_annotated_video_output")
+
+                if rear_video_output and os.path.exists(rear_video_output):
+                    tab_side, tab_rear = st.tabs(["📹 Side-On", "📹 Rear-View"])
+                    with tab_side:
+                        if video_output and os.path.exists(video_output):
+                            st.video(video_output)
+                            st.download_button(
+                                label="📥 Download Side-On Video",
+                                data=open(video_output, "rb").read(),
+                                file_name=f"Annotated_SideOn_{clean_slug}.mp4",
+                                mime="video/mp4",
+                                use_container_width=True,
+                                key="dl_side_video"
+                            )
+                        else:
+                            st.info("Side-on annotated video rendering in progress...")
+                    with tab_rear:
+                        st.video(rear_video_output)
+                        st.download_button(
+                            label="📥 Download Rear-View Video",
+                            data=open(rear_video_output, "rb").read(),
+                            file_name=f"Annotated_RearView_{clean_slug}.mp4",
+                            mime="video/mp4",
+                            use_container_width=True,
+                            key="dl_rear_video"
+                        )
+                elif video_output and os.path.exists(video_output):
                     st.video(video_output)
-                    clean_slug = player_name.replace(" ", "_")
                     st.download_button(
                         label="📥 Download Annotated Video",
                         data=open(video_output, "rb").read(),
                         file_name=f"Annotated_{clean_slug}.mp4",
                         mime="video/mp4",
-                        use_container_width=True
+                        use_container_width=True,
+                        key="dl_single_video"
                     )
                 else:
                     st.info("Annotated video rendering in progress...")

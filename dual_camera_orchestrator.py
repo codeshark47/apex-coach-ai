@@ -52,9 +52,15 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
     head_stability = calculate_head_stability(rear_df, rear_events["BFC"], rear_events["BR"])
 
+    # SIDE-ON ANNOTATED VIDEO
     raw_video = os.path.join(output_dir, "annotated_raw.mp4")
     generate_fail_safe_video(side_on_path, raw_video, side_df, side_events)
     web_safe_video = transcode_to_h264(raw_video)
+
+    # REAR-VIEW ANNOTATED VIDEO (previously computed but never rendered)
+    rear_raw_video = os.path.join(output_dir, "annotated_rear_raw.mp4")
+    generate_fail_safe_video(rear_view_path, rear_raw_video, rear_df, rear_events)
+    rear_web_safe_video = transcode_to_h264(rear_raw_video)
 
     def clean_numeric(val):
         import numpy as np
@@ -105,5 +111,6 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                 "status": head_stability.get("status", "error")
             }
         },
-        "annotated_video_output": web_safe_video
+        "annotated_video_output": web_safe_video,
+        "rear_annotated_video_output": rear_web_safe_video
     }

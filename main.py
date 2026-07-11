@@ -17,51 +17,12 @@ LANDMARK_NAMES = [
 _LEFT_HIP_IDX = 23
 _RIGHT_HIP_IDX = 24
 
-# ============================================================
-# MULTI-PERSON IDENTITY DISAMBIGUATION
-# ============================================================
-# PROBLEM (confirmed against real footage, documented in Phase 3 handoff):
-# MediaPipe's multi-pose detection returns a list of detected people per
-# FRAME, in whatever order/confidence it finds them THAT FRAME, with zero
-# identity continuity across frames. If other people are visible (fielders,
-# keeper, non-striker), naively taking pose_landmarks[0] every frame can
-# silently jump between different real people frame to frame.
-#
-# This is a HEURISTIC disambiguation strategy, not a solved general
-# multi-person tracker:
-#   1. WARM-UP WINDOW (first ~1.5s of frames): track all detected people
-#      frame-to-frame via simple nearest-centroid matching (hip midpoint).
-#      Whoever accumulates the most total movement is assumed to be the
-#      bowler (sprinting in), since everyone else in frame during a run-up
-#      is comparatively static (fielders standing, keeper waiting, etc.)
-#   2. LOCK & FOLLOW: after the warm-up window, the target identity is
-#      "locked" and followed for the rest of the clip by picking whichever
-#      detected person is closest to the previously-known position each
-#      frame.
-#
-# KNOWN LIMITATIONS (not fixed by this, and not claimed to be):
-#   - Assumes the bowler is genuinely the most-moving person during warm-up.
-#     A fielder jogging into position at the same time could confuse this.
-#   - "Nearest to last position" can still misidentify if the bowler is
-#     briefly occluded by, or crosses paths with, another player.
-#   - UNTESTED against real multi-person footage — the matching/selection
-#     LOGIC is unit-tested against synthetic trajectory data, but
-#     MediaPipe's real behavior with actual people in frame can only be
-#     confirmed by running this against real footage.
-#   - If only ONE person is ever detected (the common case for existing
-#     single-bowler footage), this reduces to exactly the old
-#     pose_landmarks[0] behavior — backward compatible by construction,
-#     not by special-casing.
-#
-# CONFIGURATION (engineering choices, not validated against real footage):
 NUM_POSES = 5
 WARMUP_SECONDS = 1.5
 MAX_MATCH_DIST = 0.3
 
 
 def _hip_centroid(landmarks) -> Optional[tuple]:
-    """Midpoint of left/right hip landmarks — a stable, central body point
-    that moves smoothly with the person, less noisy than a limb extremity."""
     try:
         lh, rh = landmarks[_LEFT_HIP_IDX], landmarks[_RIGHT_HIP_IDX]
         return ((lh.x + rh.x) / 2.0, (lh.y + rh.y) / 2.0)
@@ -74,13 +35,6 @@ def _dist(a: tuple, b: tuple) -> float:
 
 
 def _greedy_match(track_positions: dict, detections: list, max_dist: float) -> dict:
-    """
-    Pure function, no MediaPipe dependency — unit-testable directly.
-    track_positions: {track_id: (x, y)} — each existing track's last known position.
-    detections: [(x, y), ...] — this frame's detected centroids.
-    Returns {track_id: detection_index} for the best greedy assignment
-    within max_dist, each track and each detection used at most once.
-    """
     pairs = []
     for tid, tpos in track_positions.items():
         for di, dpos in enumerate(detections):
@@ -101,11 +55,6 @@ def _greedy_match(track_positions: dict, detections: list, max_dist: float) -> d
 
 
 def _nearest_detection_idx(target_pos: tuple, detections: list) -> Optional[int]:
-    """Pure function — index of the closest detection to target_pos, or
-    None if detections is empty. No distance cap here: post-warmup, we
-    prefer to always follow the closest candidate (a big frame-to-frame
-    jump is more likely fast sprinting motion than a different person
-    appearing from nowhere) — a real limitation, documented above."""
     if not detections:
         return None
     best_idx, best_dist = None, None
@@ -120,11 +69,6 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     """
     Headless Perception Layer. Processes every frame sequentially without
     destructive cropping to ensure zero data loss.
-
-    Now detects up to NUM_POSES people per frame (not just 1) and uses a
-    warm-up-then-follow heuristic (see module docstring above) to keep
-    tracking the SAME real person across frames, instead of naively taking
-    whichever detection MediaPipe returns first each frame.
     """
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
@@ -264,6 +208,23 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
 
     output_df = pd.DataFrame(dataset_rows, columns=columns)
     output_df = output_df.sort_values("frame").reset_index(drop=True)
+
+    # --- GAP-FILL SMOOTHING ---
+    # MediaPipe can lose detection for a handful of consecutive frames when
+    # the bowler passes behind a net, sightscreen, or another player. Left
+    # as NaN, this makes the skeleton overlay flicker on/off in the
+    # annotated video. Short gaps (<= 8 frames, ~0.25s at 30fps) are
+    # linearly interpolated; longer gaps are deliberately left as NaN
+    # rather than fabricating a long stretch of invented pose data.
+    landmark_cols = [c for c in output_df.columns if c != "frame"]
+    output_df[landmark_cols] = output_df[landmark_cols].interpolate(
+        method="linear", limit=8, limit_area="inside"
+    )
+    # Light smoothing pass to remove residual per-frame jitter.
+    output_df[landmark_cols] = output_df[landmark_cols].rolling(
+        window=3, center=True, min_periods=1
+    ).mean()
+
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
     output_df.to_csv(output_csv_path, index=False)
 
