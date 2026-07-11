@@ -123,4 +123,3 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             }
         },
         "annotated_video_output": web_safe_video
-    }
