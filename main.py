@@ -18,47 +18,43 @@ _LEFT_HIP_IDX = 23
 _RIGHT_HIP_IDX = 24
 
 # ============================================================
-# SINGLE-TARGET DETECTION WITH CONTINUITY FILTERING
+# ROOT CAUSE FIX: MediaPipe was running in IMAGE mode, not VIDEO mode
 # ============================================================
-# Replaces an earlier multi-person "warm-up and lock" heuristic that
-# assumed whoever moved most in the first ~1.5s was the bowler. That
-# approach caused two confirmed real failures on actual footage:
-#   1. Locking onto a different real person (e.g. a fielder walking back
-#      to position) instead of the bowler.
-#   2. Locking onto a spurious low-confidence detection from background
-#      clutter (floodlight poles, buildings) and following that "ghost"
-#      for the entire clip, producing a skeleton that floats away from
-#      the real player.
-# None of the actual footage tested so far genuinely needs multi-person
-# disambiguation — it's a single subject on an open field. So instead of
-# a fragile heuristic solving a problem that doesn't exist, this uses:
-#   - NUM_POSES = 1: MediaPipe returns only its single highest-confidence
-#     detection per frame, removing the "pick the wrong candidate" failure
-#     mode entirely.
-#   - A raised confidence floor, so borderline background false-positives
-#     don't get reported as a detection at all.
-#   - Frame-to-frame continuity/outlier rejection: if the one detection
-#     MediaPipe does return has "teleported" further than a person could
-#     plausibly move in a single frame, it's treated as a missed frame
-#     (NaN) rather than trusted. The existing short-gap interpolation
-#     then bridges it smoothly, instead of drawing a floating ghost.
+# The previous version called `landmarker.detect(frame)` and never set
+# `running_mode` in PoseLandmarkerOptions — which DEFAULTS TO IMAGE MODE.
+# Verified directly against the installed mediapipe package's real API
+# signature, not assumed.
 #
-# MAX_PLAUSIBLE_JUMP is a normalized-coordinate threshold (fraction of
-# frame width/height) and may need retuning if footage framing changes
-# drastically (e.g. a much tighter or wider crop on the bowler).
+# IMAGE mode treats every single frame as a completely independent,
+# unrelated picture — MediaPipe's own internal temporal tracker (which
+# keeps a skeleton smoothly locked onto the same body across a sequence
+# of frames) never engages at all. This explains the reported symptom
+# precisely: the skeleton visibly wobbling/drifting even with the bowler
+# alone in frame, since each frame was re-detected from scratch with zero
+# continuity assist.
+#
+# Confirming evidence: `min_tracking_confidence` was already being set in
+# the old code, but that parameter ONLY has any effect in VIDEO/LIVE_STREAM
+# mode — in IMAGE mode it is silently ignored. Its presence strongly
+# suggests VIDEO mode was the original intent, just never actually enabled.
+#
+# FIX: running_mode=VIDEO + detect_for_video(image, timestamp_ms), with a
+# strictly increasing per-frame timestamp derived from fps. This lets
+# MediaPipe's own tracker do the heavy lifting for temporal stability,
+# which is a fundamentally better signal than any amount of post-hoc
+# smoothing/interpolation applied after the fact.
+#
+# The frame-to-frame continuity/outlier-rejection layer below is KEPT as a
+# secondary safety net specifically for a different failure mode: VIDEO
+# mode improves stability of tracking an already-locked subject, but does
+# not guarantee MediaPipe will never re-evaluate and pick a different
+# person if one becomes more prominent in the frame. That's a distinct
+# risk from mode-related jitter, and still needs its own guard.
 NUM_POSES = 1
 MIN_DETECTION_CONFIDENCE = 0.6
 MIN_PRESENCE_CONFIDENCE = 0.6
 MIN_TRACKING_CONFIDENCE = 0.6
 
-# Continuity/outlier rejection is now ADAPTIVE rather than a fixed
-# distance cap. A fixed cap (e.g. "reject any jump > 0.15") turned out to
-# wrongly reject genuine fast motion during the bowler's explosive
-# delivery leap, since real hip displacement during a jump can legitimately
-# exceed a small fixed threshold in a single frame. Instead: track the
-# recent frame-to-frame displacement history, and only reject a frame if
-# its jump is a large outlier relative to what the bowler was ALREADY
-# doing (i.e. a true unexplained teleport), not just "moving fast."
 JUMP_HISTORY_LEN = 5
 ADAPTIVE_MULTIPLIER = 3.0
 HARD_CAP_JUMP = 0.45  # absolute safety ceiling regardless of recent motion
@@ -83,9 +79,10 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     Headless Perception Layer. Processes every frame sequentially without
     destructive cropping to ensure zero data loss.
 
-    Uses single-target detection with continuity filtering (see module
-    docstring) to reject implausible frame-to-frame jumps caused by
-    background false-positive detections.
+    Uses MediaPipe's VIDEO running mode (detect_for_video) so the model's
+    own temporal tracker keeps the skeleton locked onto the same subject
+    across frames, plus a continuity/outlier-rejection safety net for the
+    separate risk of a different person being picked mid-clip.
     """
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
@@ -111,6 +108,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,  # THE FIX — was defaulting to IMAGE
         output_segmentation_masks=False,
         num_poses=NUM_POSES,
         min_pose_detection_confidence=MIN_DETECTION_CONFIDENCE,
@@ -122,6 +120,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
 
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    ms_per_frame = 1000.0 / fps
 
     columns = ["frame"]
     for name in LANDMARK_NAMES:
@@ -132,6 +131,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     frame_number = 0
     last_known_pos = None
     jump_history = collections.deque(maxlen=JUMP_HISTORY_LEN)
+    last_timestamp_ms = -1  # VIDEO mode requires strictly increasing timestamps
 
     while True:
         success, frame = cap.read()
@@ -140,7 +140,16 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        detection_result = landmarker.detect(mp_image_frame)
+
+        # Strictly increasing timestamp, required by VIDEO mode. Guards
+        # against any rounding producing a duplicate/decreasing value on
+        # variable-framerate source files.
+        timestamp_ms = int(round(frame_number * ms_per_frame))
+        if timestamp_ms <= last_timestamp_ms:
+            timestamp_ms = last_timestamp_ms + 1
+        last_timestamp_ms = timestamp_ms
+
+        detection_result = landmarker.detect_for_video(mp_image_frame, timestamp_ms)
         poses = detection_result.pose_landmarks or []
 
         row = [frame_number]
@@ -151,9 +160,6 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
             if accept and last_known_pos is not None:
                 jump = _dist(c, last_known_pos)
                 if jump > HARD_CAP_JUMP:
-                    # Always reject an extreme teleport regardless of
-                    # recent motion — this is the true "ghost detection"
-                    # guard (e.g. jumping to background clutter).
                     accept = False
                 elif len(jump_history) >= 2:
                     baseline = sorted(jump_history)[len(jump_history) // 2]  # median
