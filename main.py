@@ -132,6 +132,8 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     last_known_pos = None
     jump_history = collections.deque(maxlen=JUMP_HISTORY_LEN)
     last_timestamp_ms = -1  # VIDEO mode requires strictly increasing timestamps
+    consecutive_rejections = 0
+    MAX_CONSECUTIVE_REJECTIONS = 3  # sustained rejects = real motion, not a ghost
 
     while True:
         success, frame = cap.read()
@@ -165,8 +167,14 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
                     baseline = sorted(jump_history)[len(jump_history) // 2]  # median
                     if jump > max(baseline * ADAPTIVE_MULTIPLIER, 0.08):
                         accept = False
+                if not accept and consecutive_rejections >= MAX_CONSECUTIVE_REJECTIONS:
+                    accept = True
+                    jump_history.clear()
                 if accept:
                     jump_history.append(jump)
+                    consecutive_rejections = 0
+                else:
+                    consecutive_rejections += 1
             if accept:
                 for landmark in chosen_landmarks:
                     row.extend([landmark.x, landmark.y, landmark.z])
