@@ -417,6 +417,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         f_idx += 1
     cap.release()
     out.release()
+
+
+def transcode_to_h264(input_path: str) -> str:
     """
     Transcodes mp4v video to H264 for browser playback using ffmpeg.
 
