@@ -192,7 +192,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     # extended fake trajectory.
     landmark_cols = [c for c in output_df.columns if c != "frame"]
     output_df[landmark_cols] = output_df[landmark_cols].interpolate(
-        method="linear", limit=8, limit_area="inside"
+        method="linear", limit=8, limit_direction="both"
     )
     # Light smoothing pass to remove residual per-frame jitter.
     output_df[landmark_cols] = output_df[landmark_cols].rolling(

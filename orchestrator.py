@@ -285,9 +285,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
     ANGLE_MIN, ANGLE_MAX = 0.0, 180.0
     ELITE_MIN = 165.0
-    PANEL_H = max(140, int(height * 0.30))
+    PANEL_H = max(190, int(height * 0.38))
     PANEL_TOP = height - PANEL_H
-    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 65, 20, 34, 22
+    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 65, 20, 34, 26
 
     def x_to_px(fidx):
         span = max(total_frames - 1, 1)
@@ -303,11 +303,11 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     elite_y = y_to_px(ELITE_MIN)
     cv2.rectangle(chart_base, (MARGIN_L, MARGIN_T), (width - MARGIN_R, elite_y),
                   (30, 70, 30), -1)
-    for g in range(0, 181, 30):
+    for g in range(0, 181, 45):
         gy = y_to_px(g)
         cv2.line(chart_base, (MARGIN_L, gy), (width - MARGIN_R, gy), (55, 55, 55), 1, cv2.LINE_AA)
-        cv2.putText(chart_base, f"{g}", (8, gy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                    (150, 150, 150), 1, cv2.LINE_AA)
+        cv2.putText(chart_base, f"{g}", (8, gy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (170, 170, 170), 1, cv2.LINE_AA)
     prev_pt = None
     for fidx in range(total_frames):
         val = knee_arr[fidx] if fidx < len(knee_arr) else np.nan
