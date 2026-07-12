@@ -213,27 +213,12 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         output_fps, (width, height)
     )
 
-    # FIX for skeleton "flickering on/off": the old code drew directly from
-    # raw landmark data and skipped a connection/joint entirely for any
-    # frame where tracking briefly dropped out (even a single missing
-    # frame). Real tracking has brief gaps frame-to-frame, so the skeleton
-    # visibly blinked in and out following those gaps.
-    #
-    # Fix: linearly interpolate across SHORT gaps only (limit=3 frames,
-    # ~50-100ms depending on fps) before drawing, so brief dropouts bridge
-    # smoothly. Gaps longer than that are NOT filled — we don't want to
-    # fabricate an extended fake position for a genuinely-lost subject,
-    # only smooth over momentary tracking noise.
     df = df.copy()
     landmark_cols = [c for c in df.columns if c.endswith(("_x", "_y", "_z"))]
     df[landmark_cols] = df[landmark_cols].interpolate(
         method="linear", limit=3, limit_direction="both"
     )
 
-    # Per-region palette (BGR order for OpenCV): legs in green, everything
-    # else (arms/torso/head) in white/cream, joints in a warm amber-yellow
-    # glow — matching the reference coaching-app look instead of one flat
-    # cyan color for the whole skeleton.
     LEG_LINE_GLOW   = (20, 100, 20)
     LEG_LINE_CORE   = (60, 225, 90)
     UPPER_LINE_GLOW = (70, 70, 70)
@@ -264,8 +249,6 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         ("LEFT_KNEE", "LEFT_ANKLE"),
         ("RIGHT_HIP", "RIGHT_KNEE"),
         ("RIGHT_KNEE", "RIGHT_ANKLE"),
-        # Newly added — feet and head/neck, now that we've confirmed these
-        # landmarks are captured (LEFT/RIGHT_HEEL, LEFT/RIGHT_FOOT_INDEX).
         ("LEFT_ANKLE", "LEFT_HEEL"),
         ("LEFT_HEEL", "LEFT_FOOT_INDEX"),
         ("LEFT_ANKLE", "LEFT_FOOT_INDEX"),
@@ -275,21 +258,79 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         ("NOSE", "LEFT_SHOULDER"),
         ("NOSE", "RIGHT_SHOULDER"),
     ]
-
     joint_nodes = ["LEFT_KNEE", "RIGHT_KNEE", "LEFT_HIP", "RIGHT_HIP",
                    "LEFT_WRIST", "RIGHT_WRIST", "LEFT_ANKLE", "RIGHT_ANKLE",
                    "LEFT_SHOULDER", "RIGHT_SHOULDER", "NOSE"]
+
+    total_frames = int(df["frame"].max()) + 1 if len(df) else 0
+
+    def _row_knee_angle(r):
+        try:
+            h = np.array([float(r["LEFT_HIP_x"]), float(r["LEFT_HIP_y"])])
+            k = np.array([float(r["LEFT_KNEE_x"]), float(r["LEFT_KNEE_y"])])
+            a = np.array([float(r["LEFT_ANKLE_x"]), float(r["LEFT_ANKLE_y"])])
+            kh, ka = h - k, a - k
+            denom = np.linalg.norm(kh) * np.linalg.norm(ka)
+            if denom == 0 or np.isnan(denom):
+                return np.nan
+            cos_theta = np.dot(kh, ka) / denom
+            return float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0))))
+        except Exception:
+            return np.nan
+
+    knee_by_frame = {int(r["frame"]): _row_knee_angle(r) for _, r in df.iterrows()}
+    knee_series = pd.Series([knee_by_frame.get(i, np.nan) for i in range(total_frames)])
+    knee_series = knee_series.interpolate(limit_direction="both")
+    knee_arr = knee_series.to_numpy()
+
+    ANGLE_MIN, ANGLE_MAX = 0.0, 180.0
+    ELITE_MIN = 165.0
+    PANEL_H = max(140, int(height * 0.30))
+    PANEL_TOP = height - PANEL_H
+    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 65, 20, 34, 22
+
+    def x_to_px(fidx):
+        span = max(total_frames - 1, 1)
+        return MARGIN_L + int((fidx / span) * (width - MARGIN_L - MARGIN_R))
+
+    def y_to_px(angle):
+        clipped = max(ANGLE_MIN, min(ANGLE_MAX, angle))
+        frac = (clipped - ANGLE_MIN) / (ANGLE_MAX - ANGLE_MIN)
+        usable = PANEL_H - MARGIN_T - MARGIN_B
+        return MARGIN_T + int((1 - frac) * usable)
+
+    chart_base = np.full((PANEL_H, width, 3), (18, 18, 18), dtype=np.uint8)
+    elite_y = y_to_px(ELITE_MIN)
+    cv2.rectangle(chart_base, (MARGIN_L, MARGIN_T), (width - MARGIN_R, elite_y),
+                  (30, 70, 30), -1)
+    for g in range(0, 181, 30):
+        gy = y_to_px(g)
+        cv2.line(chart_base, (MARGIN_L, gy), (width - MARGIN_R, gy), (55, 55, 55), 1, cv2.LINE_AA)
+        cv2.putText(chart_base, f"{g}", (8, gy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (150, 150, 150), 1, cv2.LINE_AA)
+    prev_pt = None
+    for fidx in range(total_frames):
+        val = knee_arr[fidx] if fidx < len(knee_arr) else np.nan
+        if np.isnan(val):
+            prev_pt = None
+            continue
+        pt = (x_to_px(fidx), y_to_px(val))
+        if prev_pt is not None:
+            cv2.line(chart_base, prev_pt, pt, (0, 210, 255), 2, cv2.LINE_AA)
+        prev_pt = pt
+    cv2.putText(chart_base, "LEAD KNEE ANGLE", (MARGIN_L, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (235, 235, 235), 2, cv2.LINE_AA)
+
+    PHASE_BADGE_WINDOW = max(3, int(round(source_fps * 0.5)))
 
     f_idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         f_match = df[df["frame"] == f_idx]
         if not f_match.empty:
             row = f_match.iloc[0]
-
             for partA, partB in connections:
                 try:
                     if pd.isna(row[f"{partA}_x"]) or pd.isna(row[f"{partB}_x"]):
@@ -307,7 +348,6 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                         cv2.line(frame, (xA, yA), (xB, yB), core, 2, cv2.LINE_AA)
                 except Exception:
                     continue
-
             for node in joint_nodes:
                 try:
                     if pd.isna(row[f"{node}_x"]):
@@ -315,31 +355,68 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 7, JOINT_GLOW, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), 4, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 4, JOINT_GLOW, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 2, JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
-        status_text = "Analysis Phase: Run-Up"
-        if f_idx >= events["BR"]:
-            status_text = "Analysis Phase: Follow-Through"
-        elif f_idx >= events["FFC"]:
-            status_text = "Analysis Phase: Ball Release"
-        elif f_idx >= events["BFC"]:
-            status_text = "Analysis Phase: Delivery Stride"
+        panel_region = frame[PANEL_TOP:PANEL_TOP + PANEL_H, 0:width]
+        blended = cv2.addWeighted(panel_region, 0.35, chart_base, 0.65, 0)
+        frame[PANEL_TOP:PANEL_TOP + PANEL_H, 0:width] = blended
 
-        cv2.putText(frame, status_text, (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
+        cur_val = knee_arr[f_idx] if f_idx < len(knee_arr) else np.nan
+        if not np.isnan(cur_val):
+            px, py_rel = x_to_px(f_idx), y_to_px(cur_val)
+            py = PANEL_TOP + py_rel
+            cv2.line(frame, (px, PANEL_TOP + MARGIN_T), (px, PANEL_TOP + PANEL_H - MARGIN_B),
+                     (0, 210, 255), 1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 6, (0, 140, 210), -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 3, (0, 230, 255), -1, cv2.LINE_AA)
+            cv2.putText(frame, f"{cur_val:.0f}deg", (width - 150, PANEL_TOP + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2, cv2.LINE_AA)
+
+        status_text = "RUN-UP"
+        if f_idx >= events["BR"]:
+            status_text = "FOLLOW-THROUGH"
+        elif f_idx >= events["FFC"]:
+            status_text = "BALL RELEASE"
+        elif f_idx >= events["BFC"]:
+            status_text = "DELIVERY STRIDE"
+        cv2.putText(frame, status_text, (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (200, 200, 200), 2, cv2.LINE_AA)
+
+        event_labels = [("BFC", "CONTACT", (60, 225, 90)),
+                         ("FFC", "CONTACT", (60, 225, 90)),
+                         ("BR", "RELEASE", (0, 210, 255))]
+        active_badge = None
+        for key, label, color in event_labels:
+            ev_frame = events.get(key)
+            if ev_frame is not None and abs(f_idx - ev_frame) <= PHASE_BADGE_WINDOW:
+                active_badge = (label, color, ev_frame)
+                break
+
+        if active_badge is not None:
+            label, color, ev_frame = active_badge
+            badge_val = knee_arr[ev_frame] if ev_frame < len(knee_arr) else np.nan
+            box_w, box_h = 300, 130
+            box_x, box_y = 20, 50
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h),
+                          (15, 15, 15), -1)
+            frame[:] = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+            cv2.putText(frame, label, (box_x + 16, box_y + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3, cv2.LINE_AA)
+            cv2.putText(frame, "KNEE", (box_x + 16, box_y + 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (210, 210, 210), 2, cv2.LINE_AA)
+            if not np.isnan(badge_val):
+                cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + 100, box_y + 88),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3, cv2.LINE_AA)
 
         out.write(frame)
         f_idx += 1
-
     cap.release()
     out.release()
-
-
-def transcode_to_h264(input_path: str) -> str:
     """
     Transcodes mp4v video to H264 for browser playback using ffmpeg.
 
