@@ -355,7 +355,7 @@ with st.sidebar.expander("Calibrate camera for speed (once per setup)", expanded
         "where two points of known distance are visible (e.g. the two stumps, "
         "0.2286m apart), then click both points directly on the image below."
     )
-    calib_video = st.file_uploader("Reference video/frame source (.mp4)", type=["mp4"], key="calib_video")
+    calib_video = st.file_uploader("Reference video/frame source (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="calib_video")
 
     if "calib_points" not in st.session_state:
         st.session_state.calib_points = []
@@ -471,11 +471,11 @@ uploaded_rear = None
 uploaded_single = None
 
 if camera_mode == "Single Camera":
-    uploaded_single = st.sidebar.file_uploader("Bowling Video (.mp4)", type=["mp4"])
+    uploaded_single = st.sidebar.file_uploader("Bowling Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"])
 else:
     st.sidebar.info("Upload both angles for maximum accuracy. Events are detected independently on each stream.")
-    uploaded_side = st.sidebar.file_uploader("📹 Side-On Video (.mp4)", type=["mp4"], key="side")
-    uploaded_rear = st.sidebar.file_uploader("📹 Rear-View Video (.mp4)", type=["mp4"], key="rear")
+    uploaded_side = st.sidebar.file_uploader("📹 Side-On Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="side")
+    uploaded_rear = st.sidebar.file_uploader("📹 Rear-View Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="rear")
 
 single_ready = camera_mode == "Single Camera" and uploaded_single is not None
 dual_ready = (camera_mode == "Dual Camera — Recommended"
