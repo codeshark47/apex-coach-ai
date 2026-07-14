@@ -312,7 +312,7 @@ except RuntimeError as e:
 if history_enabled:
     with st.sidebar.expander("View past sessions", expanded=False):
         try:
-            athletes = store.list_athletes()
+            athletes = store.list_athletes(st.session_state.auth_user["id"])
         except Exception as e:
             athletes = []
             st.error(f"Could not load athletes: {e}")
@@ -322,7 +322,7 @@ if history_enabled:
             selected = st.selectbox("Select athlete", names, key="history_athlete_select")
             selected_id = next(a["id"] for a in athletes if a["name"] == selected)
             try:
-                history = store.get_athlete_history(selected_id)
+                history = store.get_athlete_history(selected_id, st.session_state.auth_user["id"])
             except Exception as e:
                 history = []
                 st.error(f"Could not load history: {e}")
@@ -887,7 +887,7 @@ if st.session_state.get("pending_result_payload") is not None:
             # would re-save a duplicate row to Supabase.
             if history_enabled and not st.session_state.get("history_saved_for_run", False):
                 try:
-                    athlete_id = store.get_or_create_athlete(player_name)
+                    athlete_id = store.get_or_create_athlete(player_name, st.session_state.auth_user["id"])
                     metrics_with_quality = {
                         **metrics,
                         "_data_quality": quality,
@@ -895,6 +895,7 @@ if st.session_state.get("pending_result_payload") is not None:
                     }
                     store.save_session(
                         athlete_id=athlete_id,
+                        coach_user_id=st.session_state.auth_user["id"],
                         video_filename=os.path.basename(video_path),
                         camera_mode=active_camera_mode,
                         fps=fps,
