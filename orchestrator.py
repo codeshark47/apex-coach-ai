@@ -283,6 +283,63 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     knee_series = knee_series.interpolate(limit_direction="both")
     knee_arr = knee_series.to_numpy()
 
+    # --- RELEASE HEIGHT % at BR (same formula as kinematics.calculate_release_height) ---
+    release_height_pct = None
+    br_frame = events.get("BR")
+    if br_frame is not None:
+        br_rows = df[df["frame"] == br_frame]
+        if not br_rows.empty:
+            r = br_rows.iloc[0]
+            try:
+                ankle_y = (float(r["LEFT_ANKLE_y"]) + float(r["RIGHT_ANKLE_y"])) / 2
+                nose_y = float(r["NOSE_y"])
+                wrist_y = float(r["RIGHT_WRIST_y"])
+                body_length = ankle_y - nose_y
+                if body_length > 0 and not np.isnan(body_length):
+                    release_height_pct = ((ankle_y - wrist_y) / body_length) * 100
+            except Exception:
+                release_height_pct = None
+
+    # --- ESTIMATED ELBOW EXTENSION (2D approximation of ICC's 15-degree law) ---
+    # NOTE: official ICC assessment requires 3D motion capture; this 2D
+    # estimate can be distorted by camera angle/arm rotation toward or away
+    # from the lens, and should be presented as an approximation, not an
+    # official ruling.
+    def _row_elbow_angle(r):
+        try:
+            s = np.array([float(r["RIGHT_SHOULDER_x"]), float(r["RIGHT_SHOULDER_y"])])
+            e = np.array([float(r["RIGHT_ELBOW_x"]), float(r["RIGHT_ELBOW_y"])])
+            w = np.array([float(r["RIGHT_WRIST_x"]), float(r["RIGHT_WRIST_y"])])
+            es, ew = s - e, w - e
+            denom = np.linalg.norm(es) * np.linalg.norm(ew)
+            if denom == 0 or np.isnan(denom):
+                return np.nan
+            cos_theta = np.dot(es, ew) / denom
+            return float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0))))
+        except Exception:
+            return np.nan
+
+    elbow_extension_deg = None
+    bfc_frame = events.get("BFC")
+    if bfc_frame is not None and br_frame is not None and bfc_frame < br_frame:
+        window_df = df[(df["frame"] >= bfc_frame) & (df["frame"] <= br_frame)]
+        best_frame, best_diff = None, None
+        for _, r in window_df.iterrows():
+            try:
+                sh_y = float(r["RIGHT_SHOULDER_y"])
+                wr_y = float(r["RIGHT_WRIST_y"])
+                diff = abs(wr_y - sh_y)
+                if best_diff is None or diff < best_diff:
+                    best_diff, best_frame = diff, r
+            except Exception:
+                continue
+        br_rows2 = df[df["frame"] == br_frame]
+        if best_frame is not None and not br_rows2.empty:
+            angle_horizontal = _row_elbow_angle(best_frame)
+            angle_release = _row_elbow_angle(br_rows2.iloc[0])
+            if not np.isnan(angle_horizontal) and not np.isnan(angle_release):
+                elbow_extension_deg = max(0.0, angle_release - angle_horizontal)
+
     ANGLE_MIN, ANGLE_MAX = 0.0, 180.0
     ELITE_MIN = 165.0
     PANEL_H = max(190, int(height * 0.38))
@@ -399,7 +456,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         if active_badge is not None:
             label, color, ev_frame = active_badge
             badge_val = knee_arr[ev_frame] if ev_frame < len(knee_arr) else np.nan
-            box_w, box_h = 300, 130
+            is_release = (label == "RELEASE")
+            box_w = 340
+            box_h = 220 if is_release else 130
             box_x, box_y = 20, 50
             overlay = frame.copy()
             cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h),
@@ -412,6 +471,24 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             if not np.isnan(badge_val):
                 cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + 100, box_y + 88),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3, cv2.LINE_AA)
+            if is_release:
+                cv2.putText(frame, "RELEASE HEIGHT", (box_x + 16, box_y + 118),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+                if release_height_pct is not None:
+                    cv2.putText(frame, f"{release_height_pct:.0f}%", (box_x + 190, box_y + 122),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 210, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, "ELBOW EXT. (2D EST.)", (box_x + 16, box_y + 155),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+                if elbow_extension_deg is not None:
+                    ext_color = (60, 225, 90) if elbow_extension_deg <= 15.0 else (0, 60, 230)
+                    cv2.putText(frame, f"{elbow_extension_deg:.0f}deg", (box_x + 250, box_y + 158),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, ext_color, 2, cv2.LINE_AA)
+                    verdict = "WITHIN 15deg LIMIT" if elbow_extension_deg <= 15.0 else "EXCEEDS 15deg LIMIT"
+                    cv2.putText(frame, verdict, (box_x + 16, box_y + 190),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ext_color, 1, cv2.LINE_AA)
+                else:
+                    cv2.putText(frame, "insufficient data", (box_x + 16, box_y + 190),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1, cv2.LINE_AA)
 
         out.write(frame)
         f_idx += 1
