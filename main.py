@@ -159,6 +159,27 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
             chosen_landmarks = poses[0]
             c = _hip_centroid(chosen_landmarks)
             accept = c is not None
+
+            if accept and last_known_pos is None:
+                # GATING THE VERY FIRST LOCK-ON: while the bowler is still
+                # walking/running into frame, a partial detection (e.g. just
+                # a hand/arm visible at the frame edge before the rest of the
+                # body is in view) can register as a confident "pose" before
+                # a real full-body detection is available. Locking onto that
+                # partial detection produces a skeleton that visually starts
+                # mid-frame/mid-limb instead of appearing cleanly once the
+                # bowler is actually trackable. Require visible ankles before
+                # trusting a detection as the initial tracked subject — a
+                # hand/arm-only crop won't have them. Frames that fail this
+                # stay NaN (bridged by the existing gap-fill) until a real
+                # full-body detection appears.
+                try:
+                    l_ankle_vis = float(chosen_landmarks[27].visibility)
+                    r_ankle_vis = float(chosen_landmarks[28].visibility)
+                    if max(l_ankle_vis, r_ankle_vis) < 0.5:
+                        accept = False
+                except (IndexError, AttributeError, TypeError):
+                    accept = False
             if accept and last_known_pos is not None:
                 jump = _dist(c, last_known_pos)
                 if jump > HARD_CAP_JUMP:
