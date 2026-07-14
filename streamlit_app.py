@@ -658,37 +658,36 @@ if st.session_state.get("pending_result_payload") is not None:
                     st.warning(f"Speed estimate unavailable: {speed_result['message']}")
 
             st.divider()
-            st.header("🏃 Run-Up Analysis")
-            if run_up_result is None:
-                st.info("Run-up data unavailable — landmark file not found.")
-            elif run_up_result["status"] != "success":
-                st.info(run_up_result.get("message", "Run-up analysis unavailable for this clip."))
-            else:
-                ru1, ru2, ru3 = st.columns(3)
-                ru1.metric("Run-Up Duration", f"{run_up_result['run_up_duration_seconds']}s")
-                ru2.metric("Detected Foot Contacts", run_up_result["stride_count"])
-                cv = run_up_result["rhythm_consistency_cv"]
-                ru3.metric("Rhythm Consistency (CV)", f"{cv}" if cv is not None else "N/A",
-                           help="Coefficient of variation of time between foot contacts. "
-                                "Lower = more consistent pacing. There's no universal "
-                                "'good' cutoff — compare this bowler's own value across "
-                                "sessions over time rather than against a fixed target.")
-
-                if strike_summary:
-                    st.markdown("**Foot Strike Pattern (run-up)**")
-                    sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("Heel-Strike", strike_summary["heel"])
-                    sc2.metric("Midfoot", strike_summary["midfoot"])
-                    sc3.metric("Forefoot", strike_summary["forefoot"])
-                    total_known = strike_summary["heel"] + strike_summary["midfoot"] + strike_summary["forefoot"]
-                    if total_known > 0 and strike_summary["heel"] / total_known > 0.6:
-                        st.caption(
-                            "ℹ️ This run-up shows a heel-strike-dominant pattern. Heel-striking "
-                            "during a sprint approach is generally considered less efficient than "
-                            "midfoot/forefoot contact — worth discussing with the bowler, though "
-                            "this is a general running-mechanics observation, not a cricket-specific "
-                            "validated threshold."
-                        )
+            with st.expander("🏃 Run-Up Analysis", expanded=False):
+                if run_up_result is None:
+                    st.info("Run-up data unavailable — landmark file not found.")
+                elif run_up_result["status"] != "success":
+                    st.info(run_up_result.get("message", "Run-up analysis unavailable for this clip."))
+                else:
+                    ru1, ru2, ru3 = st.columns(3)
+                    ru1.metric("Run-Up Duration", f"{run_up_result['run_up_duration_seconds']}s")
+                    ru2.metric("Detected Foot Contacts", run_up_result["stride_count"])
+                    cv = run_up_result["rhythm_consistency_cv"]
+                    ru3.metric("Rhythm Consistency (CV)", f"{cv}" if cv is not None else "N/A",
+                               help="Coefficient of variation of time between foot contacts. "
+                                    "Lower = more consistent pacing. There's no universal "
+                                    "'good' cutoff — compare this bowler's own value across "
+                                    "sessions over time rather than against a fixed target.")
+                    if strike_summary:
+                        st.markdown("**Foot Strike Pattern (run-up)**")
+                        sc1, sc2, sc3 = st.columns(3)
+                        sc1.metric("Heel-Strike", strike_summary["heel"])
+                        sc2.metric("Midfoot", strike_summary["midfoot"])
+                        sc3.metric("Forefoot", strike_summary["forefoot"])
+                        total_known = strike_summary["heel"] + strike_summary["midfoot"] + strike_summary["forefoot"]
+                        if total_known > 0 and strike_summary["heel"] / total_known > 0.6:
+                            st.caption(
+                                "ℹ️ This run-up shows a heel-strike-dominant pattern. Heel-striking "
+                                "during a sprint approach is generally considered less efficient than "
+                                "midfoot/forefoot contact — worth discussing with the bowler, though "
+                                "this is a general running-mechanics observation, not a cricket-specific "
+                                "validated threshold."
+                            )
 
             st.divider()
 
@@ -798,22 +797,23 @@ if st.session_state.get("pending_result_payload") is not None:
 
                 # CBC REFERENCE RANGES — now sourced from metric_ranges.py, colored dots reflect real classification
                 st.divider()
-                st.markdown("#### 🩺 Reference Ranges")
-                metric_value_lookup = {
-                    "front_knee_bracing": knee_deg,
-                    "hip_shoulder_separation": hip_deg,
-                    "trunk_lean": trunk_deg,
-                    "release_height": rel_ratio,
-                    "head_stability": head_val,
-                }
-                dot = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪"}
-                for key in mr.all_metric_keys():
-                    r = mr.RANGES[key]
-                    tier = mr.classify(key, metric_value_lookup.get(key))
-                    st.markdown(
-                        f"**{r.label}** {dot[tier]} — "
-                        f"🟢 Optimal: `{r.display_optimal}`"
-                    )
+                with st.expander("🩺 Reference Ranges", expanded=False):
+                    metric_value_lookup = {
+                        "front_knee_bracing": knee_deg,
+                        "hip_shoulder_separation": hip_deg,
+                        "trunk_lean": trunk_deg,
+                        "release_height": rel_ratio,
+                        "head_stability": head_val,
+                    }
+                    dot = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪"}
+                    for key in mr.all_metric_keys():
+                        r = mr.RANGES[key]
+                        tier = mr.classify(key, metric_value_lookup.get(key))
+                        st.markdown(
+                            f"**{r.label}** {dot[tier]} — "
+                            f"🟢 Optimal: `{r.display_optimal}`"
+                        ) 
+                    
 
             with col_insights:
                 st.header("🧠 Autonomous AI Coach Assessment")

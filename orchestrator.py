@@ -458,7 +458,7 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             badge_val = knee_arr[ev_frame] if ev_frame < len(knee_arr) else np.nan
             is_release = (label == "RELEASE")
             box_w = 340
-            box_h = 220 if is_release else 130
+            box_h = 150 if is_release else 130
             box_x, box_y = 20, 50
             overlay = frame.copy()
             cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h),
@@ -477,18 +477,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                 if release_height_pct is not None:
                     cv2.putText(frame, f"{release_height_pct:.0f}%", (box_x + 190, box_y + 122),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 210, 255), 2, cv2.LINE_AA)
-                cv2.putText(frame, "ELBOW EXT. (2D EST.)", (box_x + 16, box_y + 155),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
-                if elbow_extension_deg is not None:
-                    ext_color = (60, 225, 90) if elbow_extension_deg <= 15.0 else (0, 60, 230)
-                    cv2.putText(frame, f"{elbow_extension_deg:.0f}deg", (box_x + 250, box_y + 158),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, ext_color, 2, cv2.LINE_AA)
-                    verdict = "WITHIN 15deg LIMIT" if elbow_extension_deg <= 15.0 else "EXCEEDS 15deg LIMIT"
-                    cv2.putText(frame, verdict, (box_x + 16, box_y + 190),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ext_color, 1, cv2.LINE_AA)
-                else:
-                    cv2.putText(frame, "insufficient data", (box_x + 16, box_y + 190),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1, cv2.LINE_AA)
+                # ELBOW EXTENSION DISABLED — 2D-derived readings were producing
+                # false positives (e.g. 81deg on a visibly legal action).
+                # Needs a real accuracy fix before showing this to users again.
 
         out.write(frame)
         f_idx += 1
