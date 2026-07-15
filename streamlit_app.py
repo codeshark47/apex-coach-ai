@@ -481,7 +481,17 @@ single_ready = camera_mode == "Single Camera" and uploaded_single is not None
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None)
 
-if single_ready or dual_ready:
+import usage_limits
+_usage = usage_limits.get_usage(st.session_state.auth_user["id"])
+if _usage["remaining"] <= 0:
+    st.sidebar.error(
+        f"You've used all {_usage['limit']} free analyses on this account. "
+        "Contact us to unlock unlimited access."
+    )
+else:
+    st.sidebar.caption(f"🎟️ {_usage['remaining']} of {_usage['limit']} free analyses remaining")
+
+if (single_ready or dual_ready) and _usage["remaining"] > 0:
     if st.sidebar.button("🚀 Execute Biomechanical Analysis Run", use_container_width=True):
         os.makedirs("input", exist_ok=True)
 
@@ -521,6 +531,7 @@ if single_ready or dual_ready:
         st.session_state.pending_player_name = player_name
         st.session_state.ai_insights_cache = None       # force regeneration for this NEW result
         st.session_state.history_saved_for_run = False  # allow exactly one history save for this NEW result
+        st.session_state.usage_recorded_for_run = False  # allow exactly one usage-count increment for this NEW result
         st.session_state.pop("angle_confirm_radio", None)  # don't inherit the previous video's angle answer
 
 # Render results from session_state (not directly gated on this rerun's
@@ -539,6 +550,12 @@ if st.session_state.get("pending_result_payload") is not None:
         # ================================================================
         if result_payload.get("status") == "success":
             st.success("✅ Kinematic Pipeline Finished Successfully!")
+            if not st.session_state.get("usage_recorded_for_run", False):
+                try:
+                    usage_limits.record_usage(st.session_state.auth_user["id"])
+                    st.session_state.usage_recorded_for_run = True
+                except Exception as e:
+                    st.warning(f"Could not update usage count: {e}")
 
             metrics = result_payload["biomechanical_metrics"]
             frames = result_payload["time_indices"]
