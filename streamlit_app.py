@@ -482,14 +482,19 @@ dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None)
 
 import usage_limits
-_usage = usage_limits.get_usage(st.session_state.auth_user["id"])
-if _usage["remaining"] <= 0:
-    st.sidebar.error(
-        f"You've used all {_usage['limit']} free analyses on this account. "
-        "Contact us to unlock unlimited access."
-    )
+_is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
+if _is_admin_user:
+    _usage = {"used": 0, "limit": float("inf"), "remaining": float("inf")}
+    st.sidebar.caption("🛠️ Admin account — unlimited analyses")
 else:
-    st.sidebar.caption(f"🎟️ {_usage['remaining']} of {_usage['limit']} free analyses remaining")
+    _usage = usage_limits.get_usage(st.session_state.auth_user["id"])
+    if _usage["remaining"] <= 0:
+        st.sidebar.error(
+            f"You've used all {_usage['limit']} free analyses on this account. "
+            "Contact us to unlock unlimited access."
+        )
+    else:
+        st.sidebar.caption(f"🎟️ {_usage['remaining']} of {_usage['limit']} free analyses remaining")
 
 if (single_ready or dual_ready) and _usage["remaining"] > 0:
     if st.sidebar.button("🚀 Execute Biomechanical Analysis Run", use_container_width=True):
@@ -551,11 +556,14 @@ if st.session_state.get("pending_result_payload") is not None:
         if result_payload.get("status") == "success":
             st.success("✅ Kinematic Pipeline Finished Successfully!")
             if not st.session_state.get("usage_recorded_for_run", False):
-                try:
-                    usage_limits.record_usage(st.session_state.auth_user["id"])
+                if _is_admin_user:
                     st.session_state.usage_recorded_for_run = True
-                except Exception as e:
-                    st.warning(f"Could not update usage count: {e}")
+                else:
+                    try:
+                        usage_limits.record_usage(st.session_state.auth_user["id"])
+                        st.session_state.usage_recorded_for_run = True
+                    except Exception as e:
+                        st.warning(f"Could not update usage count: {e}")
 
             metrics = result_payload["biomechanical_metrics"]
             frames = result_payload["time_indices"]

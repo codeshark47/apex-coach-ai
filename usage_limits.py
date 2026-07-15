@@ -47,3 +47,25 @@ def record_usage(user_id: str) -> dict:
     new_used = current["used"] + 1
     client.table("demo_usage").update({"used_count": new_used}).eq("user_id", user_id).execute()
     return {"used": new_used, "limit": current["limit"], "remaining": max(0, current["limit"] - new_used)}
+
+
+def is_admin(email: str) -> bool:
+    """
+    Checks if this email is in the ADMIN_EMAILS allowlist (comma-separated),
+    read from Streamlit secrets or env vars — same pattern as every other
+    credential in this app. Admins bypass the demo usage limit entirely and
+    are never written to the demo_usage table.
+    """
+    if not email:
+        return False
+    raw = None
+    try:
+        import streamlit as st
+        raw = st.secrets.get("ADMIN_EMAILS")
+    except Exception:
+        pass
+    raw = raw or os.environ.get("ADMIN_EMAILS")
+    if not raw:
+        return False
+    allowlist = {e.strip().lower() for e in raw.split(",") if e.strip()}
+    return email.strip().lower() in allowlist
