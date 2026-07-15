@@ -401,8 +401,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     core = LEG_LINE_CORE if is_leg else UPPER_LINE_CORE
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), glow, 5, cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), core, 2, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), glow, 2, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), core, 1, cv2.LINE_AA)
                 except Exception:
                     continue
             for node in joint_nodes:
@@ -412,8 +412,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 4, JOINT_GLOW, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), 2, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 3, JOINT_GLOW, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 1, JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
