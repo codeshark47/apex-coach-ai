@@ -64,6 +64,7 @@ MAX_CONSECUTIVE_REJECTIONS = 3
 
 BUFFER_REQUIRED = 4          # consecutive plausible+continuous frames needed to confirm initial lock
 MAX_BUFFER_STEP = 0.12       # max plausible frame-to-frame movement while still buffering (walking pace)
+MIN_BUFFER_TOTAL_MOVEMENT = 0.035  # minimum cumulative movement across the buffer to rule out a static false lock (background clutter, a standing bystander)
 APPEARANCE_HISTORY_LEN = 5
 APPEARANCE_TIEBREAK_WEIGHT = 0.08  # small scoring bonus for appearance match; not a hard gate
 
@@ -241,7 +242,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
                 continue
             bbox = _bbox_from_landmarks(landmarks, width, height)
             hist = _compute_histogram(frame, bbox)
-            candidates.append({"landmarks": landmarks, "centroid": centroid, "hist": hist})
+            candidates.append({"landmarks": landmarks, "centroid": centroid, "hist": hist, "bbox": bbox})
 
         row = [frame_number]
 
@@ -251,7 +252,11 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
             chosen = None
             if not lock_buffer:
                 if candidates:
-                    chosen = candidates[0]
+                    # Prefer the largest/most prominent figure as the initial
+                    # seed rather than whichever detection MediaPipe happens
+                    # to list first — more likely to be the real subject than
+                    # an arbitrary background candidate.
+                    chosen = max(candidates, key=lambda c: (c["bbox"][3] - c["bbox"][1]))
             else:
                 prev_centroid = lock_buffer[-1]["centroid"]
                 best, best_dist = None, None
@@ -267,6 +272,26 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
                 lock_buffer = candidates[:1] if candidates else []
 
             if len(lock_buffer) >= BUFFER_REQUIRED:
+                # Require genuine sustained MOVEMENT before confirming — a
+                # static false-positive detection (background clutter, a
+                # standing bystander) can trivially satisfy "consistent
+                # position frame-to-frame" without ever being a person
+                # walking/running into frame. Without this, a static false
+                # lock could form BEFORE the bowler ever appears, then get
+                # force-switched onto the real bowler later via the
+                # rejection escape valve — the "skeleton waits, then jumps
+                # onto him" failure.
+                total_movement = sum(
+                    _dist(lock_buffer[i]["centroid"], lock_buffer[i + 1]["centroid"])
+                    for i in range(len(lock_buffer) - 1)
+                )
+                if total_movement < MIN_BUFFER_TOTAL_MOVEMENT:
+                    lock_buffer.pop(0)
+                    row.extend([np.nan] * (33 * 3))
+                    dataset_rows.append(row)
+                    frame_number += 1
+                    continue
+
                 # Confirmed — backfill the buffered frames' data
                 locked = True
                 start_frame = frame_number - len(lock_buffer) + 1
