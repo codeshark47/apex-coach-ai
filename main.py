@@ -178,7 +178,29 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
                     r_ankle_vis = float(chosen_landmarks[28].visibility)
                     if max(l_ankle_vis, r_ankle_vis) < 0.5:
                         accept = False
-                except (IndexError, AttributeError, TypeError):
+                    else:
+                        # SECOND GATE: body proportion plausibility. MediaPipe
+                        # always outputs a full 33-point guess even from a
+                        # partial view (e.g. just a hand), and that guess can
+                        # carry a passable visibility score despite being
+                        # wrong. A real standing/moving person is clearly
+                        # taller than they are wide; a hallucinated guess from
+                        # a hand-only crop tends to compress into an
+                        # implausible near-square shape. Require the
+                        # shoulder-to-ankle span to be at least 1.3x the
+                        # shoulder width before trusting this as a genuine
+                        # initial lock-on.
+                        l_sh = np.array([float(chosen_landmarks[11].x), float(chosen_landmarks[11].y)])
+                        r_sh = np.array([float(chosen_landmarks[12].x), float(chosen_landmarks[12].y)])
+                        l_an = np.array([float(chosen_landmarks[27].x), float(chosen_landmarks[27].y)])
+                        r_an = np.array([float(chosen_landmarks[28].x), float(chosen_landmarks[28].y)])
+                        shoulder_width = _dist(tuple(l_sh), tuple(r_sh))
+                        mid_sh = ((l_sh[0] + r_sh[0]) / 2, (l_sh[1] + r_sh[1]) / 2)
+                        mid_an = ((l_an[0] + r_an[0]) / 2, (l_an[1] + r_an[1]) / 2)
+                        body_span = _dist(mid_sh, mid_an)
+                        if shoulder_width <= 0 or body_span < shoulder_width * 1.3:
+                            accept = False
+                except (IndexError, AttributeError, TypeError, ValueError):
                     accept = False
             if accept and last_known_pos is not None:
                 jump = _dist(c, last_known_pos)
