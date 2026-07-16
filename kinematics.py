@@ -1,13 +1,20 @@
 import numpy as np
 import pandas as pd
 
-def calculate_knee_bracing(row: pd.Series) -> dict:
-    """Computes the 2D angle of the lead knee joint at FFC via Law of Cosines."""
+def calculate_knee_bracing(row: pd.Series, lead_side: str = "left") -> dict:
+    """
+    Computes the 2D angle of the lead knee joint via Law of Cosines.
+    lead_side: which side is the LEAD (front) leg — 'left' for a right-arm
+    bowler's standard action, 'right' for a left-arm bowler (the lead leg
+    is always opposite the bowling arm). Defaults to 'left' to preserve
+    existing behavior for any caller not yet passing this explicitly.
+    """
     try:
-        h = np.array([float(row["LEFT_HIP_x"]), float(row["LEFT_HIP_y"])])
-        k = np.array([float(row["LEFT_KNEE_x"]), float(row["LEFT_KNEE_y"])])
-        a = np.array([float(row["LEFT_ANKLE_x"]), float(row["LEFT_ANKLE_y"])])
-        
+        side = "LEFT" if lead_side == "left" else "RIGHT"
+        h = np.array([float(row[f"{side}_HIP_x"]), float(row[f"{side}_HIP_y"])])
+        k = np.array([float(row[f"{side}_KNEE_x"]), float(row[f"{side}_KNEE_y"])])
+        a = np.array([float(row[f"{side}_ANKLE_x"]), float(row[f"{side}_ANKLE_y"])])
+
         kh, ka = h - k, a - k
         denom = np.linalg.norm(kh) * np.linalg.norm(ka)
         if denom == 0 or np.isnan(denom):

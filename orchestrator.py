@@ -12,8 +12,32 @@ from kinematics import (
 )
 
 
-def detect_delivery_events(df: pd.DataFrame, fps: int) -> dict:
-    """Robust physical milestone detection using velocity windows."""
+def detect_bowling_arm(df: pd.DataFrame) -> str:
+    """
+    Auto-detects which arm is the bowling arm by comparing vertical
+    range of motion of each wrist across the whole clip. The bowling arm
+    swings through a dramatically larger vertical arc during delivery
+    than the non-bowling arm, which stays comparatively still. Returns
+    'right' or 'left'. Defaults to 'right' (the original hardcoded
+    assumption) if landmarks are unavailable.
+    """
+    try:
+        r_wrist_y = df["RIGHT_WRIST_y"].dropna()
+        l_wrist_y = df["LEFT_WRIST_y"].dropna()
+        r_range = float(r_wrist_y.max() - r_wrist_y.min()) if len(r_wrist_y) > 1 else 0.0
+        l_range = float(l_wrist_y.max() - l_wrist_y.min()) if len(l_wrist_y) > 1 else 0.0
+        return "left" if l_range > r_range else "right"
+    except Exception:
+        return "right"
+
+
+def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right") -> dict:
+    """
+    Robust physical milestone detection using velocity windows.
+    bowling_arm: 'right' or 'left' — determines which wrist is used for
+    release detection and which ankle is front/back foot. The lead (front)
+    foot is always the ankle OPPOSITE the bowling arm.
+    """
     total_frames = len(df)
 
     if total_frames < 10:
@@ -23,24 +47,27 @@ def detect_delivery_events(df: pd.DataFrame, fps: int) -> dict:
             "BR": int(total_frames * 0.8)
         }
 
-    r_wrist_y = df["RIGHT_WRIST_y"].interpolate(method="linear").bfill().ffill().values
-    br_idx = int(np.argmin(r_wrist_y))
+    bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
+    lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+
+    wrist_y = df[f"{bowl_side}_WRIST_y"].interpolate(method="linear").bfill().ffill().values
+    br_idx = int(np.argmin(wrist_y))
 
     if br_idx <= 5 or br_idx >= total_frames - 2:
         br_idx = int(total_frames * 0.75)
 
-    l_ankle_y = df["LEFT_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
+    lead_ankle_y = df[f"{lead_side}_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
     lookback_start = max(0, br_idx - int(fps * 0.6))
-    ffc_window = l_ankle_y[lookback_start:br_idx]
+    ffc_window = lead_ankle_y[lookback_start:br_idx]
 
     if len(ffc_window) > 0:
         ffc_idx = lookback_start + int(np.argmax(ffc_window))
     else:
         ffc_idx = max(0, br_idx - int(fps * 0.3))
 
-    r_ankle_y = df["RIGHT_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
+    back_ankle_y = df[f"{bowl_side}_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
     bfc_lookback = max(0, ffc_idx - int(fps * 0.5))
-    bfc_window = r_ankle_y[bfc_lookback:ffc_idx]
+    bfc_window = back_ankle_y[bfc_lookback:ffc_idx]
 
     if len(bfc_window) > 0:
         bfc_idx = bfc_lookback + int(np.argmax(bfc_window))
@@ -128,13 +155,15 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
         }
 
 
-def calculate_release_height_ratio_safe(br_row: pd.Series) -> dict:
+def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right") -> dict:
     """
     Calculates release height leverage ratio with expanded real-world tolerances.
     Prevents N/A dropouts on high-arm actions or varied camera distances.
+    bowling_arm: 'right' or 'left' — determines which wrist measures release.
     """
     try:
-        y_wrist = br_row.get("RIGHT_WRIST_y")
+        bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
+        y_wrist = br_row.get(f"{bowl_side}_WRIST_y")
         y_head = br_row.get("NOSE_y")
         y_ankle = br_row.get("LEFT_ANKLE_y") or br_row.get("RIGHT_ANKLE_y")
 
@@ -580,8 +609,9 @@ def run_complete_bowling_analysis(video_path: str,
     df = pd.read_csv(csv_path)
     fps = extraction["fps"]
 
-    # STAGE 2 — EVENT DETECTION
-    events = detect_delivery_events(df, fps)
+    # STAGE 2 — BOWLING ARM DETECTION + EVENT DETECTION
+    bowling_arm = detect_bowling_arm(df)
+    events = detect_delivery_events(df, fps, bowling_arm=bowling_arm)
 
     # STAGE 3 — FRAME VALIDATION
     ffc_rows = df[df["frame"] == events["FFC"]]
@@ -604,13 +634,25 @@ def run_complete_bowling_analysis(video_path: str,
             "message": f"BR frame {events['BR']} not found in landmark data."
         }
     br_row = br_rows.iloc[0]
+    lead_side = "left" if bowling_arm == "right" else "right"
 
     # STAGE 4 — METRIC CALCULATIONS
-    knee_analysis = calculate_knee_bracing(ffc_row)
+    knee_analysis = calculate_knee_bracing(ffc_row, lead_side=lead_side)
+    knee_at_release = calculate_knee_bracing(br_row, lead_side=lead_side)
     lean_analysis = calculate_trunk_lean(br_row)
     head_stability = calculate_head_stability(df, events["BFC"], events["BR"])
     hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
-    release_height = calculate_release_height_ratio_safe(br_row)
+    release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm)
+
+    # FFC-to-Release knee angle delta ("yielding knee" check flagged in
+    # external biomechanical audit): a static single-frame knee angle at
+    # FFC can't show whether the knee then BENDS (yields) before release,
+    # which is a real, separate coaching concern from the FFC angle alone.
+    knee_delta = None
+    knee_delta_status = "unavailable"
+    if knee_analysis.get("status") == "success" and knee_at_release.get("status") == "success":
+        knee_delta = round(knee_at_release["degrees"] - knee_analysis["degrees"], 1)
+        knee_delta_status = "yielding" if knee_delta < -5.0 else ("braced" if knee_delta >= 0 else "minor_yield")
 
     # STAGE 5 — VIDEO GENERATION
     raw_output_video = os.path.join(output_dir, "annotated_raw.mp4")
@@ -682,9 +724,13 @@ def run_complete_bowling_analysis(video_path: str,
                 "tier": (knee_analysis.get("classification") or
                          knee_analysis.get("tier") or "Unknown"),
                 "status": knee_analysis.get("status", "error"),
-                "critique": knee_analysis.get("critique", "N/A")
+                "critique": knee_analysis.get("critique", "N/A"),
+                "degrees_at_release": knee_at_release.get("degrees"),
+                "yield_delta_degrees": knee_delta,
+                "yield_status": knee_delta_status
             },
             "hip_shoulder_separation": hip_separation,
+            "bowling_arm_detected": bowling_arm,
             "release_height": {
                 "ratio": release_height.get("ratio"),
                 "classification": (release_height.get("classification") or
