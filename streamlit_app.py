@@ -780,9 +780,23 @@ if st.session_state.get("pending_result_payload") is not None:
                 def ui_val(val):
                     return str(round(float(val), 4)) if val is not None else "N/A"
 
+                detected_arm = result_payload.get("bowling_arm_detected")
+                if detected_arm:
+                    st.caption(f"🎯 Bowling arm auto-detected: **{detected_arm.title()}-arm**")
+
                 m1, m2 = st.columns(2)
                 m1.metric("Lead Knee Bracing Angle", ui_deg(knee_deg),
                            metrics.get('front_knee_bracing', {}).get('tier', 'N/A'))
+                yield_delta = metrics.get('front_knee_bracing', {}).get('yield_delta_degrees')
+                yield_status = metrics.get('front_knee_bracing', {}).get('yield_status')
+                if yield_delta is not None:
+                    deg_at_release = metrics.get('front_knee_bracing', {}).get('degrees_at_release')
+                    if yield_status == "yielding":
+                        m1.caption(f"⚠️ Yields to {round(deg_at_release, 1)}° at release ({yield_delta:+.1f}°) — soft knee")
+                    elif yield_status == "braced":
+                        m1.caption(f"✅ Holds/extends to {round(deg_at_release, 1)}° at release ({yield_delta:+.1f}°) — braced")
+                    else:
+                        m1.caption(f"ℹ️ {round(deg_at_release, 1)}° at release ({yield_delta:+.1f}°)")
                 m2.metric("Hip-Shoulder Rotation Twist", ui_deg(hip_deg),
                            metrics.get('hip_shoulder_separation', {}).get('tier', 'N/A'))
 
