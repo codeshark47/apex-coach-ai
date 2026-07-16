@@ -7,6 +7,7 @@ from orchestrator import (
     calculate_release_height_ratio_safe,
     generate_fail_safe_video,
     transcode_to_h264,
+    detect_bowling_arm,
 )
 from main import extract_video_landmarks
 from kinematics import calculate_knee_bracing, calculate_trunk_lean, calculate_head_stability
@@ -27,7 +28,16 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     side_df  = pd.read_csv(side_csv)
     side_fps = side_extraction["fps"]
-    side_events = embedded_detect_events(side_df, fps=side_fps)
+
+    # BOWLING ARM AUTO-DETECTION — detected from the side-on stream (the
+    # primary view for delivery mechanics), then applied consistently to
+    # both camera streams so left-arm and right-arm bowlers are both
+    # measured correctly, matching the fix already applied to Single
+    # Camera mode.
+    bowling_arm = detect_bowling_arm(side_df)
+    lead_side = "left" if bowling_arm == "right" else "right"
+
+    side_events = embedded_detect_events(side_df, fps=side_fps, bowling_arm=bowling_arm)
 
     side_ffc_rows = side_df[side_df["frame"] == side_events["FFC"]]
     side_br_rows  = side_df[side_df["frame"] == side_events["BR"]]
@@ -35,9 +45,18 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     if side_ffc_rows.empty or side_br_rows.empty:
         return {"status": "failed", "stage": "side_frame_extraction", "message": "Kinematic frames missing from side-on stream."}
 
-    knee_analysis  = calculate_knee_bracing(side_ffc_rows.iloc[0])
-    lean_analysis  = calculate_trunk_lean(side_br_rows.iloc[0])
-    release_height = calculate_release_height_ratio_safe(side_br_rows.iloc[0])
+    knee_analysis     = calculate_knee_bracing(side_ffc_rows.iloc[0], lead_side=lead_side)
+    knee_at_release   = calculate_knee_bracing(side_br_rows.iloc[0], lead_side=lead_side)
+    lean_analysis     = calculate_trunk_lean(side_br_rows.iloc[0])
+    release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm)
+
+    # FFC-to-Release knee angle delta ("yielding knee" check from external
+    # biomechanical audit) — same logic as Single Camera mode.
+    knee_delta = None
+    knee_delta_status = "unavailable"
+    if knee_analysis.get("status") == "success" and knee_at_release.get("status") == "success":
+        knee_delta = round(knee_at_release["degrees"] - knee_analysis["degrees"], 1)
+        knee_delta_status = "yielding" if knee_delta < -5.0 else ("braced" if knee_delta >= 0 else "minor_yield")
 
     print("[DUAL-CAM CORE] Extracting rear-view tracking vectors...")
     rear_csv = os.path.join(output_dir, "landmarks_rear.csv")
@@ -47,7 +66,7 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     rear_df  = pd.read_csv(rear_csv)
     rear_fps = rear_extraction["fps"]
-    rear_events = embedded_detect_events(rear_df, fps=rear_fps)
+    rear_events = embedded_detect_events(rear_df, fps=rear_fps, bowling_arm=bowling_arm)
 
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
     head_stability = calculate_head_stability(rear_df, rear_events["BFC"], rear_events["BR"])
@@ -57,7 +76,7 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     generate_fail_safe_video(side_on_path, raw_video, side_df, side_events)
     web_safe_video = transcode_to_h264(raw_video)
 
-    # REAR-VIEW ANNOTATED VIDEO (previously computed but never rendered)
+    # REAR-VIEW ANNOTATED VIDEO
     rear_raw_video = os.path.join(output_dir, "annotated_rear_raw.mp4")
     generate_fail_safe_video(rear_view_path, rear_raw_video, rear_df, rear_events)
     rear_web_safe_video = transcode_to_h264(rear_raw_video)
@@ -74,6 +93,7 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     return {
         "status": "success",
         "camera_mode": "dual",
+        "bowling_arm_detected": bowling_arm,
         "video_metadata": {
             "source_file": os.path.basename(side_on_path),
             "fps": side_fps,
@@ -93,7 +113,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             "front_knee_bracing": {
                 "degrees": knee_bracing_val,
                 "tier": knee_analysis.get("tier", "Unknown"),
-                "status": "success" if knee_bracing_val is not None else "error"
+                "status": "success" if knee_bracing_val is not None else "error",
+                "degrees_at_release": knee_at_release.get("degrees"),
+                "yield_delta_degrees": knee_delta,
+                "yield_status": knee_delta_status
             },
             "release_height": {
                 "ratio": clean_numeric(release_height.get("ratio")),
