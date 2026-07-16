@@ -63,9 +63,17 @@ RANGES = {
     "hip_shoulder_separation": MetricRange(
         label="Hip-Shoulder Separation",
         unit="°",
-        kind="higher_better",
+        kind="band",
         green=(25.0, 50.0),
         amber=(15.0, 25.0),
+        amber_high=(50.0, 65.0),
+        # FIX: was kind="higher_better", which silently classified ANY value
+        # above the green ceiling (including physically implausible readings
+        # like 84 degrees) as "green" since that logic only ever checks for
+        # values being too LOW, never too HIGH. Hip-shoulder separation has a
+        # real anatomical ceiling — converted to "band" so values above 65
+        # correctly flag as red (critical/likely tracking error) instead of
+        # silently passing as optimal.
         display_optimal="25–50°",
     ),
     "trunk_lean": MetricRange(

@@ -57,7 +57,16 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
         angle = round(float(np.degrees(np.arctan2(np.abs(dx), dy))), 1)
         if np.isnan(angle):
             return {"degrees": 0.0, "tier": "Tracking Drop", "status": "error"}
-            
+
+        # FIX: a value above 90 degrees is physically nonsensical for "lean
+        # from vertical" (it would mean the torso axis is pointing more
+        # sideways/upside-down than upright), and indicates a tracking
+        # error (e.g. shoulder/hip landmark swap or an odd momentary
+        # detection) rather than a real extreme lean. Flag it as unreliable
+        # instead of reporting a false, alarming number like 168 degrees.
+        if angle > 90.0:
+            return {"degrees": angle, "tier": "Tracking Unreliable (implausible angle)", "status": "error"}
+
         tier = "Optimal Upright Posture" if angle <= 8.0 else "Excessive Lateral Flexion"
         return {"degrees": angle, "tier": tier, "status": "success"}
     except Exception:
