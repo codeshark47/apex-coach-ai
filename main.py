@@ -72,9 +72,18 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
         output_segmentation_masks=False,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5
+        # LOWERED from 0.5: a bowler still distant/small early in the
+        # run-up often doesn't clear a 0.5 confidence threshold, so the
+        # skeleton doesn't appear until he's closer/larger in frame later
+        # in the clip. This is a detection-confidence issue, NOT an
+        # identity-switching issue (confirmed: no other person in frame).
+        # Lower threshold trades a little more sensitivity to background
+        # false positives for earlier detection of a genuine, distant
+        # bowler — acceptable here since there's no second person to be
+        # confused with.
+        min_pose_detection_confidence=0.3,
+        min_pose_presence_confidence=0.3,
+        min_tracking_confidence=0.4
     )
 
     landmarker = vision.PoseLandmarker.create_from_options(options)
