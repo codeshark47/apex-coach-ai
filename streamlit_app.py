@@ -810,6 +810,10 @@ if st.session_state.get("pending_result_payload") is not None:
                 m5.metric("Head Stability Variance", ui_val(head_val),
                            (metrics.get('head_stability', {}).get('classification')
                             or metrics.get('head_stability', {}).get('tier', 'N/A')))
+                rel_debug = metrics.get('release_height', {}).get('debug_raw')
+                if rel_debug:
+                    with st.expander("🔧 Debug Info — Release Height Ratio"):
+                        st.json(rel_debug)
 
 
 
