@@ -115,7 +115,21 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     br_search_window = max(2, int(round(fps * 0.4)))
     br_search_end = min(total_frames, ffc_idx + br_search_window)
     br_slice = wrist_y[ffc_idx:br_search_end]
-    if len(br_slice) > 0:
+
+    # Prefer a REAL (non-gap-filled) detection for the peak. Verified on
+    # real footage: the fastest part of the arm swing (right at release)
+    # is exactly where MediaPipe is most likely to briefly lose the wrist
+    # to motion blur, which then gets forward-filled to a frozen, stale
+    # value — that stale flat value can look like an unbeatable "peak" to
+    # a simple argmin and win the search even though it's not a real,
+    # current position. Only fall back to the filled data if the whole
+    # window has no real detection at all.
+    wrist_had_real = (~df[f"{bowl_side}_WRIST_y"].isna()).values
+    real_mask_slice = wrist_had_real[ffc_idx:br_search_end]
+    if len(br_slice) > 0 and real_mask_slice.any():
+        candidate_slice = np.where(real_mask_slice, br_slice, np.inf)
+        br_idx = ffc_idx + int(np.argmin(candidate_slice))
+    elif len(br_slice) > 0:
         br_idx = ffc_idx + int(np.argmin(br_slice))
     else:
         br_idx = min(ffc_idx + 1, total_frames - 1)
