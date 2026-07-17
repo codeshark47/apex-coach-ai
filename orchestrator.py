@@ -601,7 +601,8 @@ def transcode_to_h264(input_path: str) -> str:
 
 
 def run_complete_bowling_analysis(video_path: str,
-                                   output_dir: str = "output") -> dict:
+                                   output_dir: str = "output",
+                                   bowling_arm_override: str = None) -> dict:
     """
     Core orchestration loop.
     Extracts landmarks, detects events, calculates all 5 biomechanical
@@ -624,7 +625,10 @@ def run_complete_bowling_analysis(video_path: str,
     fps = extraction["fps"]
 
     # STAGE 2 — BOWLING ARM DETECTION + EVENT DETECTION
-    bowling_arm = detect_bowling_arm(df)
+    if bowling_arm_override in ("left", "right"):
+        bowling_arm = bowling_arm_override
+    else:
+        bowling_arm = detect_bowling_arm(df)
     events = detect_delivery_events(df, fps, bowling_arm=bowling_arm)
 
     # STAGE 3 — FRAME VALIDATION
