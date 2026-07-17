@@ -176,12 +176,29 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
             }
 
         body_height = abs(float(y_ankle) - float(y_head))
-        if body_height < 0.05:
+        # A properly framed bowler at release should span well over a
+        # third of the frame height, head to ankle. Anything much smaller
+        # almost always means a mistracked landmark (commonly the ankle),
+        # not a genuinely tiny/out-of-frame bowler — a 0.05 threshold was
+        # letting clearly-wrong values (e.g. 0.16-0.19) through and
+        # producing fabricated ratios like 124%.
+        if body_height < 0.35:
             return {
                 "ratio": None,
                 "classification": "Body height too small",
                 "status": "error",
-                "error_message": "Body height span too small — bowler may be out of frame."
+                "error_message": (
+                    f"Body height span ({round(body_height, 3)}) too small for a "
+                    f"reliable reading — likely a mistracked landmark (often the "
+                    f"ankle) rather than a genuinely out-of-frame bowler."
+                ),
+                "debug_raw": {
+                    "y_wrist": round(float(y_wrist), 4),
+                    "y_head": round(float(y_head), 4),
+                    "y_ankle": round(float(y_ankle), 4),
+                    "body_height": round(float(body_height), 4),
+                    "bowl_side_used": bowl_side,
+                }
             }
 
         ratio = round(abs(float(y_ankle) - float(y_wrist)) / body_height, 4)
