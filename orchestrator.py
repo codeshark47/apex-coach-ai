@@ -204,7 +204,8 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
                 "ratio": None,
                 "classification": "Measurement error — verify camera angle",
                 "status": "error",
-                "error_message": f"Ratio {ratio} outside physical bounds."
+                "error_message": f"Ratio {ratio} outside physical bounds.",
+                "debug_raw": debug_raw
             }
 
         if ratio >= 0.85:
