@@ -186,22 +186,18 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
 
         ratio = round(abs(float(y_ankle) - float(y_wrist)) / body_height, 4)
 
-        # DIAGNOSTIC: automatically log the raw inputs whenever release
-        # height is unusually high/low, so we can investigate a specific
-        # real occurrence directly instead of trying to re-locate matching
-        # CSV data after the fact (output/landmarks.csv gets overwritten
-        # by every subsequent run, making manual correlation unreliable).
-        if ratio > 1.10 or ratio < 0.75:
-            try:
-                import datetime
-                with open("debug_release_height.log", "a") as f:
-                    f.write(
-                        f"{datetime.datetime.now().isoformat()} | ratio={ratio} | "
-                        f"y_wrist={y_wrist} | y_head={y_head} | y_ankle={y_ankle} | "
-                        f"body_height={body_height}\n"
-                    )
-            except Exception:
-                pass
+        # DIAGNOSTIC: include raw inputs directly in the return payload so
+        # they're visible on the live deployed report itself. A local log
+        # file doesn't work here — Streamlit Cloud runs on separate
+        # servers from any dev terminal, so a file written there is
+        # unreachable for inspection afterward.
+        debug_raw = {
+            "y_wrist": round(float(y_wrist), 4),
+            "y_head": round(float(y_head), 4),
+            "y_ankle": round(float(y_ankle), 4),
+            "body_height": round(float(body_height), 4),
+            "bowl_side_used": bowl_side,
+        }
 
         if ratio > 1.30 or ratio < 0.30:
             return {
@@ -218,7 +214,7 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         else:
             classification = "Low-Sling Action"
 
-        return {"ratio": ratio, "classification": classification, "status": "success"}
+        return {"ratio": ratio, "classification": classification, "status": "success", "debug_raw": debug_raw}
 
     except Exception as e:
         return {
