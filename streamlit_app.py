@@ -488,9 +488,130 @@ else:
     uploaded_side = st.sidebar.file_uploader("📹 Side-On Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="side")
     uploaded_rear = st.sidebar.file_uploader("📹 Rear-View Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="rear")
 
-single_ready = camera_mode == "Single Camera" and uploaded_single is not None
+
+def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
+    """
+    One-time-per-video step: save the upload, show a scrubbable reference
+    frame, and have the coach click directly on the bowler. Returns
+    ((x_px, y_px), frame_index) once clicked, else (None, 0).
+
+    This is the credible fix for the "skeleton locks onto the wrong
+    person" risk (documented at length in main.py) — instead of another
+    automatic guess, the coach tells the app who to track, once, and
+    main.py's seeded tracker just follows whoever's torso stays closest
+    to that identity frame to frame.
+    """
+    if uploaded_file is None:
+        return None, 0
+
+    file_identity = f"{uploaded_file.name}_{uploaded_file.size}"
+    point_key = f"{key_prefix}_seed_point"
+    frame_key = f"{key_prefix}_seed_frame"
+    identity_key = f"{key_prefix}_seed_identity"
+    ref_path_key = f"{key_prefix}_seed_ref_path"
+
+    if st.session_state.get(identity_key) != file_identity:
+        # New file uploaded (or first time) — reset any prior click and
+        # cache a temp copy on disk so we can pull reference frames from it.
+        os.makedirs("input", exist_ok=True)
+        ref_path = os.path.abspath(os.path.join("input", f"_seed_ref_{key_prefix}_{uploaded_file.name}"))
+        with open(ref_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.session_state[identity_key] = file_identity
+        st.session_state[ref_path_key] = ref_path
+        st.session_state[point_key] = None
+        st.session_state[frame_key] = 0
+
+    ref_path = st.session_state[ref_path_key]
+    total_frames = cal.get_frame_count(ref_path)
+
+    with st.sidebar.expander(f"🎯 Confirm the bowler — {label}", expanded=st.session_state.get(point_key) is None):
+        st.caption(
+            "Scrub to any frame where the bowler is clearly visible, then click "
+            "directly on him. This tells the app exactly who to track for the "
+            "whole clip, instead of guessing — the single most reliable fix for "
+            "the skeleton ever locking onto the wrong person."
+        )
+        if total_frames > 1:
+            frame_idx = st.slider(
+                "Scrub to a frame with the bowler visible",
+                min_value=0, max_value=max(total_frames - 1, 0),
+                value=min(total_frames - 1, total_frames // 3),
+                key=f"{key_prefix}_seed_slider"
+            )
+        else:
+            frame_idx = 0
+
+        frame = cal.extract_reference_frame(ref_path, frame_index=frame_idx)
+
+        if st.session_state.get(f"_{key_prefix}_last_frame_idx") != frame_idx:
+            st.session_state[point_key] = None
+            st.session_state[f"_{key_prefix}_last_frame_idx"] = frame_idx
+
+        if frame is not None:
+            from PIL import Image, ImageDraw
+            from streamlit_image_coordinates import streamlit_image_coordinates
+
+            pil_img = Image.fromarray(frame)
+            orig_w, orig_h = pil_img.size
+
+            display_img = pil_img.copy()
+            point = st.session_state.get(point_key)
+            if point is not None:
+                draw = ImageDraw.Draw(display_img)
+                r = max(5, orig_w // 100)
+                px, py = point
+                draw.ellipse((px - r, py - r, px + r, py + r), outline="lime", width=4)
+
+            if point is None:
+                st.caption("📍 Click directly on the bowler below.")
+            else:
+                st.caption("✅ Bowler confirmed — click again to move the marker.")
+
+            click = streamlit_image_coordinates(display_img, key=f"{key_prefix}_seed_click_widget")
+
+            if click is not None:
+                rendered_w = click.get("width") or orig_w
+                rendered_h = click.get("height") or orig_h
+                scale_x = orig_w / rendered_w
+                scale_y = orig_h / rendered_h
+                new_point = (round(click["x"] * scale_x), round(click["y"] * scale_y))
+
+                if st.session_state.get(point_key) != new_point:
+                    st.session_state[point_key] = new_point
+                    st.session_state[frame_key] = frame_idx
+                    st.rerun()
+
+            if st.session_state.get(point_key) is not None:
+                if st.button("↺ Reset marker", key=f"{key_prefix}_reset_seed"):
+                    st.session_state[point_key] = None
+                    st.rerun()
+        else:
+            st.error("Could not read a frame from that video.")
+
+    return st.session_state.get(point_key), st.session_state.get(frame_key, 0)
+
+
+single_seed_point, single_seed_frame = (None, 0)
+side_seed_point, side_seed_frame = (None, 0)
+rear_seed_point, rear_seed_frame = (None, 0)
+
+if camera_mode == "Single Camera":
+    single_seed_point, single_seed_frame = render_bowler_seed_ui(uploaded_single, "single", "Bowling video")
+else:
+    side_seed_point, side_seed_frame = render_bowler_seed_ui(uploaded_side, "side", "Side-on video")
+    rear_seed_point, rear_seed_frame = render_bowler_seed_ui(uploaded_rear, "rear", "Rear-view video")
+
+single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
+                 and single_seed_point is not None)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
-              and uploaded_side is not None and uploaded_rear is not None)
+              and uploaded_side is not None and uploaded_rear is not None
+              and side_seed_point is not None and rear_seed_point is not None)
+
+if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is None:
+    st.sidebar.warning("👆 Click the bowler in the frame above to enable analysis.")
+elif camera_mode != "Single Camera" and uploaded_side is not None and uploaded_rear is not None and (side_seed_point is None or rear_seed_point is None):
+    st.sidebar.warning("👆 Click the bowler in both frames above to enable analysis.")
 
 import usage_limits
 _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
@@ -528,10 +649,17 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
         with st.spinner("Executing kinematic extraction and landmark mapping..."):
             if camera_mode == "Dual Camera — Recommended":
                 from dual_camera_orchestrator import run_dual_camera_analysis
-                result_payload = run_dual_camera_analysis(video_path, rear_path, bowling_arm_override=bowling_arm_override)
+                result_payload = run_dual_camera_analysis(
+                    video_path, rear_path, bowling_arm_override=bowling_arm_override,
+                    side_seed_point=side_seed_point, side_seed_frame_index=side_seed_frame,
+                    rear_seed_point=rear_seed_point, rear_seed_frame_index=rear_seed_frame,
+                )
                 active_camera_mode = "Dual Camera"
             else:
-                result_payload = run_complete_bowling_analysis(video_path, bowling_arm_override=bowling_arm_override)
+                result_payload = run_complete_bowling_analysis(
+                    video_path, bowling_arm_override=bowling_arm_override,
+                    seed_point=single_seed_point, seed_frame_index=single_seed_frame,
+                )
                 active_camera_mode = "Single Camera"
 
         # Persist across reruns: Streamlit reruns the ENTIRE script on every

@@ -820,17 +820,25 @@ def transcode_to_h264(input_path: str) -> str:
 
 def run_complete_bowling_analysis(video_path: str,
                                    output_dir: str = "output",
-                                   bowling_arm_override: str = None) -> dict:
+                                   bowling_arm_override: str = None,
+                                   seed_point: tuple = None,
+                                   seed_frame_index: int = 0) -> dict:
     """
     Core orchestration loop.
     Extracts landmarks, detects events, calculates all 5 biomechanical
     metrics, generates annotated video, and returns unified payload.
+
+    seed_point/seed_frame_index: optional coach click identifying the
+    bowler in a reference frame, passed straight through to
+    extract_video_landmarks — see that function's docstring.
     """
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "landmarks.csv")
 
     # STAGE 1 — LANDMARK EXTRACTION
-    extraction = extract_video_landmarks(video_path, csv_path)
+    extraction = extract_video_landmarks(video_path, csv_path,
+                                          seed_point=seed_point,
+                                          seed_frame_index=seed_frame_index)
 
     if extraction["status"] == "error":
         return {

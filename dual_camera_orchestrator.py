@@ -14,16 +14,25 @@ from kinematics import calculate_knee_bracing, calculate_trunk_lean, calculate_h
 
 
 def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir: str = "output",
-                              bowling_arm_override: str = None) -> dict:
+                              bowling_arm_override: str = None,
+                              side_seed_point: tuple = None, side_seed_frame_index: int = 0,
+                              rear_seed_point: tuple = None, rear_seed_frame_index: int = 0) -> dict:
     """
     SaaS Architecture Dual Camera Engine.
     Processes side-on and rear streams independently to bypass manual sync issues.
+
+    side_seed_point/rear_seed_point: optional coach click identifying the
+    bowler in each stream's own reference frame — the two camera angles
+    are separate videos, so each needs its own seed. See
+    main.extract_video_landmarks for details.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     print("[DUAL-CAM CORE] Extracting side-on tracking vectors...")
     side_csv = os.path.join(output_dir, "landmarks_side.csv")
-    side_extraction = extract_video_landmarks(side_on_path, side_csv)
+    side_extraction = extract_video_landmarks(side_on_path, side_csv,
+                                               seed_point=side_seed_point,
+                                               seed_frame_index=side_seed_frame_index)
     if side_extraction["status"] == "error":
         return {"status": "failed", "stage": "side_camera", "message": side_extraction["error_message"]}
 
@@ -64,7 +73,9 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     print("[DUAL-CAM CORE] Extracting rear-view tracking vectors...")
     rear_csv = os.path.join(output_dir, "landmarks_rear.csv")
-    rear_extraction = extract_video_landmarks(rear_view_path, rear_csv)
+    rear_extraction = extract_video_landmarks(rear_view_path, rear_csv,
+                                               seed_point=rear_seed_point,
+                                               seed_frame_index=rear_seed_frame_index)
     if rear_extraction["status"] == "error":
         return {"status": "failed", "stage": "rear_camera", "message": rear_extraction["error_message"]}
 

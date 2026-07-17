@@ -41,10 +41,40 @@ LANDMARK_NAMES = [
 ]
 
 
-def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
+# Torso landmarks (nose, both shoulders, both hips) used to match a
+# candidate person across frames — stable and central regardless of how
+# the arms/legs are swinging, unlike e.g. the wrists.
+_TORSO_INDICES = [0, 11, 12, 23, 24]
+
+
+def _centroid_xy(landmarks_list):
+    pts = [(landmarks_list[i].x, landmarks_list[i].y) for i in _TORSO_INDICES]
+    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+
+def extract_video_landmarks(video_path: str, output_csv_path: str,
+                             seed_point: tuple = None,
+                             seed_frame_index: int = 0) -> dict:
     """
     Headless Perception Layer. Processes every frame sequentially without
     destructive cropping to ensure zero data loss.
+
+    seed_point: (x_px, y_px) pixel coordinates a coach clicked directly on
+    the bowler in a reference frame (seed_frame_index), from the SAME
+    video. When given, MediaPipe detects multiple candidate people per
+    frame instead of just one, and this function tracks whichever
+    candidate stays closest, frame to frame, to the person last
+    confirmed — walking forward and backward out from the seed frame,
+    anchored by the coach's explicit click. This is deliberately NOT
+    another "guess who's the bowler" heuristic (see the comment block
+    below on why those failed repeatedly) — the identity is given
+    explicitly by a human; the only thing this function decides is
+    "which detected person, this frame, is closest to where they were a
+    moment ago."
+
+    When seed_point is None (default), behaves exactly as before:
+    single-person detection, the one candidate MediaPipe returns is used
+    every frame — zero behavior change for any existing caller.
     """
     if not os.path.exists(video_path):
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
@@ -67,11 +97,17 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     except ImportError:
         return {"status": "error", "error_message": "MediaPipe Tasks API framework binding is missing."}
 
+    multi_person = seed_point is not None
+
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
         output_segmentation_masks=False,
+        # Detect several candidate people per frame only when a coach has
+        # given a seed click to disambiguate between them — the default
+        # (no seed) stays single-person detection, unchanged from before.
+        num_poses=3 if multi_person else 1,
         # LOWERED from 0.5: a bowler still distant/small early in the
         # run-up often doesn't clear a 0.5 confidence threshold, so the
         # skeleton doesn't appear until he's closer/larger in frame later
@@ -90,13 +126,17 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
 
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
     ms_per_frame = 1000.0 / fps
 
     columns = ["frame"]
     for name in LANDMARK_NAMES:
         columns.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
 
-    dataset_rows = []
+    # PASS 1: detect. Collect every candidate person MediaPipe finds each
+    # frame (just the one candidate, in the default single-person case).
+    frame_candidates = []
     frame_number = 0
     last_timestamp_ms = -1
 
@@ -114,11 +154,108 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         last_timestamp_ms = timestamp_ms
 
         detection_result = landmarker.detect_for_video(mp_image_frame, timestamp_ms)
-        row = [frame_number]
+        frame_candidates.append(list(detection_result.pose_landmarks) if detection_result.pose_landmarks else [])
+        frame_number += 1
 
-        if detection_result.pose_landmarks and len(detection_result.pose_landmarks) > 0:
-            first_person_landmarks = detection_result.pose_landmarks[0]
-            for landmark in first_person_landmarks:
+    cap.release()
+    landmarker.close()
+
+    total_frames = frame_number
+
+    # PASS 2: select. Default (no seed) — just take the one candidate per
+    # frame, identical to the old behavior. With a seed — walk outward
+    # from the seed frame in both directions, at each step choosing
+    # whichever candidate's torso is closest to where the tracked person
+    # was a moment ago. A frame with no detection at all leaves the
+    # anchor unchanged, so the next real detection still matches against
+    # the last KNOWN position rather than resetting.
+    chosen_landmarks = [None] * total_frames
+
+    if not multi_person:
+        for i in range(total_frames):
+            cands = frame_candidates[i]
+            chosen_landmarks[i] = cands[0] if cands else None
+    else:
+        # A frame where only ONE candidate is detected still needs a
+        # plausibility check, not just an automatic accept — otherwise a
+        # different, more-consistently-detected bystander (e.g. a coach
+        # standing close to the camera) becomes "the closest available
+        # candidate" by default whenever the real tracked person isn't
+        # detected that frame, and tracking silently snaps onto them.
+        # Verified on real footage: without this cap, seeded tracking
+        # still drifted onto a coach who was the sole detected person in
+        # most frames while the actual (smaller, more distant) bowler was
+        # only sporadically detected. The cap scales with how long it's
+        # been since a real match, since the true person could genuinely
+        # have moved further by the time detection resumes after a gap.
+        MAX_DIST_PER_SECOND = 0.6
+
+        def pick_closest(cands, anchor_xy, max_dist):
+            best, best_dist = None, None
+            for cand in cands:
+                cx, cy = _centroid_xy(cand)
+                dist = ((cx - anchor_xy[0]) ** 2 + (cy - anchor_xy[1]) ** 2) ** 0.5
+                if best_dist is None or dist < best_dist:
+                    best, best_dist = cand, dist
+            if best is None or best_dist > max_dist:
+                return None
+            return best
+
+        seed_idx = max(0, min(seed_frame_index, total_frames - 1))
+        seed_xy = (seed_point[0] / frame_width, seed_point[1] / frame_height)
+
+        # The seed match needs its own, more generous tolerance — it's
+        # answering "which PERSON is this" (a click anywhere on their
+        # body vs. a computed torso centroid, which can genuinely differ
+        # by a lot: a head-click vs. a centroid averaging head+shoulders+
+        # hips), not "did this person move plausibly since last frame"
+        # like the tighter per-frame tolerance below. Still much smaller
+        # than the distance between two DIFFERENT people in a real scene.
+        SEED_MATCH_TOLERANCE = 0.2
+        chosen = pick_closest(frame_candidates[seed_idx], seed_xy, SEED_MATCH_TOLERANCE)
+        chosen_landmarks[seed_idx] = chosen
+        seed_anchor = _centroid_xy(chosen) if chosen is not None else seed_xy
+
+        # Tolerance grows with elapsed gap (a real person could genuinely
+        # move further before detection resumes), but is capped rather
+        # than left to grow indefinitely — after roughly half a second
+        # with no confirmed match, a re-match is refused entirely and
+        # those frames stay honestly untracked (N/A downstream) instead
+        # of eventually accepting a wrong-but-by-then-"plausible"
+        # bystander. Matches the app's broader principle of showing
+        # nothing rather than a number built on a bad assumption.
+        MAX_DIST_CAP = 0.25
+
+        anchor = seed_anchor
+        frames_since_confirmed = 1
+        for i in range(seed_idx + 1, total_frames):
+            max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
+            chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
+            chosen_landmarks[i] = chosen
+            if chosen is not None:
+                anchor = _centroid_xy(chosen)
+                frames_since_confirmed = 1
+            else:
+                frames_since_confirmed += 1
+
+        anchor = seed_anchor
+        frames_since_confirmed = 1
+        for i in range(seed_idx - 1, -1, -1):
+            max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
+            chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
+            chosen_landmarks[i] = chosen
+            if chosen is not None:
+                anchor = _centroid_xy(chosen)
+                frames_since_confirmed = 1
+            else:
+                frames_since_confirmed += 1
+
+    dataset_rows = []
+    for i in range(total_frames):
+        row = [i]
+        landmarks_list = chosen_landmarks[i]
+        if landmarks_list:
+            for landmark in landmarks_list:
                 # MediaPipe scores its own confidence in each point
                 # (visibility). Previously this was discarded — every
                 # point was plotted regardless of confidence, including a
@@ -136,12 +273,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
                     row.extend([np.nan, np.nan, np.nan])
         else:
             row.extend([np.nan] * (33 * 3))
-
         dataset_rows.append(row)
-        frame_number += 1
-
-    cap.release()
-    landmarker.close()
 
     output_df = pd.DataFrame(dataset_rows, columns=columns)
     landmark_cols = [c for c in output_df.columns if c != "frame"]
