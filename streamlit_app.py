@@ -465,6 +465,17 @@ camera_mode = st.sidebar.radio(
 )
 
 st.sidebar.divider()
+bowling_arm_choice = st.sidebar.selectbox(
+    "🎯 Bowling Arm",
+    ["Auto-detect (recommended)", "Right-arm", "Left-arm"],
+    help="If auto-detection picks the wrong arm on a specific video, override it here before uploading."
+)
+bowling_arm_override = {
+    "Auto-detect (recommended)": None,
+    "Right-arm": "right",
+    "Left-arm": "left",
+}[bowling_arm_choice]
+st.sidebar.divider()
 st.sidebar.header("📁 Upload Video")
 uploaded_side = None
 uploaded_rear = None
@@ -517,10 +528,10 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
         with st.spinner("Executing kinematic extraction and landmark mapping..."):
             if camera_mode == "Dual Camera — Recommended":
                 from dual_camera_orchestrator import run_dual_camera_analysis
-                result_payload = run_dual_camera_analysis(video_path, rear_path)
+                result_payload = run_dual_camera_analysis(video_path, rear_path, bowling_arm_override=bowling_arm_override)
                 active_camera_mode = "Dual Camera"
             else:
-                result_payload = run_complete_bowling_analysis(video_path)
+                result_payload = run_complete_bowling_analysis(video_path, bowling_arm_override=bowling_arm_override)
                 active_camera_mode = "Single Camera"
 
         # Persist across reruns: Streamlit reruns the ENTIRE script on every
