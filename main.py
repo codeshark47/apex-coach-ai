@@ -150,63 +150,39 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         landmarker_local.close()
         return candidates
 
-    def has_implausible_jump(landmarks_per_frame):
-        # Two checks, since MediaPipe's own single-pose VIDEO-mode tracker
-        # can switch onto a different real person two different ways:
-        #
-        # 1. An abrupt single-frame jump.
-        threshold_frame = max(0.08, 3.0 / fps)
-        for i in range(len(landmarks_per_frame) - 1):
-            a, b = landmarks_per_frame[i], landmarks_per_frame[i + 1]
-            if a is None or b is None:
-                continue
-            ax, ay = _centroid_xy(a)
-            bx, by = _centroid_xy(b)
-            if ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5 > threshold_frame:
-                return True
-
-        # 2. A SMOOTH drift onto a different person over a short window —
-        # verified on real footage: tracking slid from one real person to
-        # a totally different one over ~0.1s, where every SINGLE
-        # frame-to-frame step was individually small enough to pass check
-        # 1 above, but the total displacement over that short a window was
-        # far beyond anything a real person can physically cover (nearly
-        # half the frame width in ~0.1s). Window is time-based so it means
-        # the same real duration regardless of fps.
-        window = max(3, int(round(fps * 0.1)))
-        threshold_window = 0.3
-        for i in range(len(landmarks_per_frame) - window):
-            a, b = landmarks_per_frame[i], landmarks_per_frame[i + window]
-            if a is None or b is None:
-                continue
-            ax, ay = _centroid_xy(a)
-            bx, by = _centroid_xy(b)
-            if ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5 > threshold_window:
-                return True
-
-        return False
-
-    # ALWAYS run the fast, reliable single-person pass first — multi-pose
+    # ALWAYS run the fast, reliable single-person pass — multi-pose
     # detection (needed to disambiguate between several people) measurably
     # degrades MediaPipe's own per-frame reliability, verified on real
     # footage: the exact same person, at the exact same critical moment,
     # went from fully tracked (single-pose) to completely missing
-    # (multi-pose) for several frames. Paying that cost is only justified
-    # when there's actual evidence of wrong-person risk, so it's checked
-    # for, not assumed just because a seed was given.
+    # (multi-pose) for several frames. When a seed is given, this result
+    # is used as a preferred data SOURCE, not authoritative on its own —
+    # see the merge logic below for why.
     single_pass_candidates = run_detection_pass(1)
     total_frames = len(single_pass_candidates)
     single_pose_chosen = [cands[0] if cands else None for cands in single_pass_candidates]
 
-    multi_person = seed_point is not None and has_implausible_jump(single_pose_chosen)
-
-    chosen_landmarks = [None] * total_frames
-
-    if not multi_person:
+    if seed_point is None:
         chosen_landmarks = single_pose_chosen
     else:
-        # A real identity-confusion risk was detected — worth the
-        # multi-pose detection cost to disambiguate using the coach's seed.
+        # A seed was given, so ALWAYS compute the seeded multi-pose track
+        # too — not just when has_implausible_jump flags a risk. Verified
+        # on real footage that jump-detection has a blind spot: a
+        # STATIONARY false-positive (MediaPipe matching a person-like
+        # pattern in trees/background clutter, not a real person at all)
+        # never "jumps" anywhere, so it slipped through undetected as if
+        # it were the real, correctly-tracked bowler for dozens of frames.
+        #
+        # The seeded track is then used as a VALIDATOR, not the direct
+        # data source: for each frame, single-pose's landmarks are used
+        # (better per-frame quality, confirmed elsewhere this session)
+        # ONLY where they agree with where the seeded track says the
+        # tracked person actually is. Where they disagree — single-pose
+        # has wandered onto something else — the seeded value is used
+        # instead (or honest NaN if the seeded track has no confident
+        # match there either). This gets single-pose's better quality on
+        # the frames it can be trusted, without ever silently trusting a
+        # phantom detection just because it happened to be smooth.
         frame_candidates = run_detection_pass(3)
         # A frame where only ONE candidate is detected still needs a
         # plausibility check, not just an automatic accept — otherwise a
@@ -235,6 +211,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
 
         seed_idx = max(0, min(seed_frame_index, total_frames - 1))
         seed_xy = (seed_point[0] / frame_width, seed_point[1] / frame_height)
+        seeded_chosen = [None] * total_frames
 
         # The seed match needs its own, more generous tolerance — it's
         # answering "which PERSON is this" (a click anywhere on their
@@ -245,7 +222,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         # than the distance between two DIFFERENT people in a real scene.
         SEED_MATCH_TOLERANCE = 0.2
         chosen = pick_closest(frame_candidates[seed_idx], seed_xy, SEED_MATCH_TOLERANCE)
-        chosen_landmarks[seed_idx] = chosen
+        seeded_chosen[seed_idx] = chosen
         seed_anchor = _centroid_xy(chosen) if chosen is not None else seed_xy
 
         # Tolerance grows with elapsed gap (a real person could genuinely
@@ -263,7 +240,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         for i in range(seed_idx + 1, total_frames):
             max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
             chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
-            chosen_landmarks[i] = chosen
+            seeded_chosen[i] = chosen
             if chosen is not None:
                 anchor = _centroid_xy(chosen)
                 frames_since_confirmed = 1
@@ -275,12 +252,49 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         for i in range(seed_idx - 1, -1, -1):
             max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
             chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
-            chosen_landmarks[i] = chosen
+            seeded_chosen[i] = chosen
             if chosen is not None:
                 anchor = _centroid_xy(chosen)
                 frames_since_confirmed = 1
             else:
                 frames_since_confirmed += 1
+
+        # MERGE: prefer single-pose's landmarks (better per-frame
+        # completeness/quality) on any frame where they're validated by
+        # the seeded track's independently-verified position; otherwise
+        # trust the seeded track instead (or NaN if neither can validate
+        # a position there). The seeded track doesn't need data at the
+        # EXACT same frame to validate single-pose — a brief gap in the
+        # (less reliable per-frame) seeded track shouldn't force
+        # discarding perfectly good single-pose data next to it, so the
+        # NEAREST seeded reference within a short time window is used
+        # instead. Verified this matters: requiring an exact-frame match
+        # was discarding genuinely correct single-pose tracking right at
+        # a fast, blurry release moment where the seeded track happened
+        # to have a brief dropout of its own.
+        AGREEMENT_TOLERANCE = 0.15
+        sd_points = [(i, _centroid_xy(seeded_chosen[i])) for i in range(total_frames) if seeded_chosen[i] is not None]
+        MAX_VALIDATION_GAP = max(3, int(round(fps * 0.5)))
+
+        def nearest_sd_centroid(i):
+            best, best_gap = None, None
+            for j, c in sd_points:
+                gap = abs(j - i)
+                if gap <= MAX_VALIDATION_GAP and (best_gap is None or gap < best_gap):
+                    best, best_gap = c, gap
+            return best
+
+        chosen_landmarks = [None] * total_frames
+        for i in range(total_frames):
+            sp = single_pose_chosen[i]
+            sd = seeded_chosen[i]
+            reference = _centroid_xy(sd) if sd is not None else nearest_sd_centroid(i)
+            if sp is not None and reference is not None:
+                spx, spy = _centroid_xy(sp)
+                if ((spx - reference[0]) ** 2 + (spy - reference[1]) ** 2) ** 0.5 <= AGREEMENT_TOLERANCE:
+                    chosen_landmarks[i] = sp
+                    continue
+            chosen_landmarks[i] = sd
 
     dataset_rows = []
     for i in range(total_frames):
