@@ -130,11 +130,36 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     landmarker.close()
 
     output_df = pd.DataFrame(dataset_rows, columns=columns)
-
-    # Brief gap-fill for genuine short occlusion (net, motion blur) — NOT
-    # related to the identity-switching bugs, kept separately since it was
-    # a real, narrow improvement on its own.
     landmark_cols = [c for c in output_df.columns if c != "frame"]
+
+    # OUTLIER REJECTION (Hampel filter): a plain moving average (below)
+    # blends a single bad frame into its neighbors instead of removing it,
+    # which is why the skeleton still looked "loose"/spiky during fast,
+    # motion-blurred phases even after widening the averaging window. This
+    # flags any frame where a landmark jumps further from its own local
+    # neighborhood than is statistically normal for THAT landmark's recent
+    # motion, and treats it as a bad detection (filled in like a genuine
+    # occlusion gap) before smoothing. It compares each point to the local
+    # median absolute deviation rather than a fixed distance/speed number,
+    # so it self-adjusts to each landmark's own motion instead of being
+    # tuned to one video's camera distance or delivery speed. This is
+    # NOT part of "who to track" logic — it only cleans the already-selected
+    # trajectory, so it carries none of the identity-switching risk.
+    HAMPEL_WINDOW = 5
+    HAMPEL_N_SIGMAS = 3
+    for col in landmark_cols:
+        series = output_df[col]
+        rolling_median = series.rolling(window=HAMPEL_WINDOW, center=True, min_periods=1).median()
+        abs_dev = (series - rolling_median).abs()
+        mad = abs_dev.rolling(window=HAMPEL_WINDOW, center=True, min_periods=1).median()
+        threshold = HAMPEL_N_SIGMAS * 1.4826 * mad
+        is_outlier = (mad > 0) & (abs_dev > threshold)
+        output_df.loc[is_outlier, col] = np.nan
+
+    # Brief gap-fill for genuine short occlusion (net, motion blur) and the
+    # outliers just flagged above — NOT related to the identity-switching
+    # bugs, kept separately since it was a real, narrow improvement on its
+    # own.
     output_df[landmark_cols] = output_df[landmark_cols].interpolate(
         method="linear", limit=5, limit_direction="both"
     )
@@ -144,18 +169,9 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     # separate, unrelated feature) were reverted from this same file.
     # This is intentionally NOT part of "who to track" logic — it only
     # smooths the already-selected trajectory, so it carries none of the
-    # identity-switching risk from last night's heuristics. Fixes the
-    # skeleton looking "loose"/jittery even when correctly locked onto
-    # the bowler the whole time.
-    # WIDENED from window=3: the lighter window still let real
-    # per-frame jitter through during the fast, motion-blurred delivery
-    # and follow-through phase, where MediaPipe's per-frame confidence
-    # and precision naturally drop (fast motion = more blur = noisier
-    # landmark estimates for the SAME correctly-tracked person — this is
-    # a precision issue, not an identity issue). A slightly wider window
-    # trades a small amount of responsiveness for meaningfully steadier
-    # tracking during exactly the phase that matters most for a
-    # professional-looking result.
+    # identity-switching risk from last night's heuristics. Now runs on
+    # outlier-cleaned data (above), so it's smoothing real motion instead
+    # of also having to absorb occasional bad-frame spikes.
     output_df[landmark_cols] = output_df[landmark_cols].rolling(
         window=5, center=True, min_periods=1
     ).mean()

@@ -373,13 +373,31 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     # instead of always assuming right-arm, and shows nothing rather than a
     # fabricated number when tracking is unreliable.
     release_height_pct = None
+    # Normalized (0-1) points for the release-height line drawn on the BR
+    # frame: from the bowling-arm wrist straight down to ground level (the
+    # same ankle landmark already used to calculate the ratio above), so
+    # the line visually matches the number rather than being a separate
+    # guess. Only set when the ratio itself is trustworthy — same
+    # "don't show it if we don't trust it" rule as the number.
+    release_line_pts = None
     br_frame = events.get("BR")
     if br_frame is not None:
         br_rows = df[df["frame"] == br_frame]
         if not br_rows.empty:
-            rh = calculate_release_height_ratio_safe(br_rows.iloc[0], bowling_arm=bowling_arm)
+            br_row_for_release = br_rows.iloc[0]
+            rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm)
             if rh.get("ratio") is not None:
                 release_height_pct = rh["ratio"] * 100
+                dbg = rh.get("debug_raw") or {}
+                bowl_side = dbg.get("bowl_side_used")
+                wrist_x = br_row_for_release.get(f"{bowl_side}_WRIST_x") if bowl_side else None
+                if (wrist_x is not None and not pd.isna(wrist_x)
+                        and "y_wrist" in dbg and "y_ankle" in dbg):
+                    release_line_pts = {
+                        "wrist_x": float(wrist_x),
+                        "wrist_y": dbg["y_wrist"],
+                        "ground_y": dbg["y_ankle"],
+                    }
 
     # --- ESTIMATED ELBOW EXTENSION (2D approximation of ICC's 15-degree law) ---
     # NOTE: official ICC assessment requires 3D motion capture; this 2D
@@ -486,6 +504,31 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                         cv2.line(frame, (xA, yA), (xB, yB), core, 1, cv2.LINE_AA)
                 except Exception:
                     continue
+
+            # SPINE: MediaPipe has no single spine landmark, so this is a
+            # virtual centerline from the shoulder midpoint to the hip
+            # midpoint. Without it the torso was just a hollow box (shoulder
+            # line + two side lines + hip line) with nothing down the
+            # middle, which is what made the skeleton look unrigged/amateur
+            # rather than like a proper body frame.
+            try:
+                spine_cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
+                              "LEFT_HIP_x", "LEFT_HIP_y", "RIGHT_HIP_x", "RIGHT_HIP_y"]
+                if not any(pd.isna(row[c]) for c in spine_cols):
+                    neck_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
+                    neck_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
+                    midhip_x = (float(row["LEFT_HIP_x"]) + float(row["RIGHT_HIP_x"])) / 2
+                    midhip_y = (float(row["LEFT_HIP_y"]) + float(row["RIGHT_HIP_y"])) / 2
+                    sx1, sy1 = int(neck_x * width), int(neck_y * height)
+                    sx2, sy2 = int(midhip_x * width), int(midhip_y * height)
+                    if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
+                        cv2.line(frame, (sx1, sy1), (sx2, sy2), UPPER_LINE_GLOW, 2, cv2.LINE_AA)
+                        cv2.line(frame, (sx1, sy1), (sx2, sy2), UPPER_LINE_CORE, 1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), 3, JOINT_GLOW, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), 1, JOINT_CORE, -1, cv2.LINE_AA)
+            except Exception:
+                pass
+
             for node in joint_nodes:
                 try:
                     if pd.isna(row[f"{node}_x"]):
@@ -565,7 +608,35 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                 # false positives (e.g. 81deg on a visibly legal action).
                 # Needs a real accuracy fix before showing this to users again.
 
+                # RELEASE HEIGHT LINE: a vertical line from the bowling-arm
+                # wrist straight down to ground level (same ankle landmark
+                # used to calculate the ratio above), drawn only on the
+                # actual BR frame — no ball tracking involved, this is a
+                # visual read-out of the same number shown as text.
+                if f_idx == ev_frame and release_line_pts is not None:
+                    lx = int(release_line_pts["wrist_x"] * width)
+                    ly_wrist = int(release_line_pts["wrist_y"] * height)
+                    ly_ground = int(release_line_pts["ground_y"] * height)
+                    if (0 < lx < width and 0 < ly_wrist < height
+                            and 0 < ly_ground < height):
+                        cv2.line(frame, (lx, ly_wrist), (lx, ly_ground),
+                                 (0, 210, 255), 2, cv2.LINE_AA)
+                        cv2.circle(frame, (lx, ly_wrist), 5, (0, 210, 255), -1, cv2.LINE_AA)
+                        cv2.circle(frame, (lx, ly_ground), 5, (0, 210, 255), -1, cv2.LINE_AA)
+
         out.write(frame)
+
+        # FREEZE ON RELEASE: hold the exact Ball Release frame (with its
+        # skeleton/badge already drawn) for a beat before playback
+        # continues, like a broadcast replay highlight. Duplicates the same
+        # already-rendered frame at the output's own fps, so it doesn't
+        # touch source detection/tracking at all.
+        if br_frame is not None and f_idx == br_frame:
+            RELEASE_FREEZE_SECONDS = 0.8
+            freeze_frame_count = max(1, int(round(output_fps * RELEASE_FREEZE_SECONDS)))
+            for _ in range(freeze_frame_count):
+                out.write(frame)
+
         f_idx += 1
     cap.release()
     out.release()
