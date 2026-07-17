@@ -13,7 +13,8 @@ from main import extract_video_landmarks
 from kinematics import calculate_knee_bracing, calculate_trunk_lean, calculate_head_stability
 
 
-def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir: str = "output") -> dict:
+def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir: str = "output",
+                              bowling_arm_override: str = None) -> dict:
     """
     SaaS Architecture Dual Camera Engine.
     Processes side-on and rear streams independently to bypass manual sync issues.
@@ -34,7 +35,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     # both camera streams so left-arm and right-arm bowlers are both
     # measured correctly, matching the fix already applied to Single
     # Camera mode.
-    bowling_arm = detect_bowling_arm(side_df)
+    if bowling_arm_override in ("left", "right"):
+        bowling_arm = bowling_arm_override
+    else:
+        bowling_arm = detect_bowling_arm(side_df)
     lead_side = "left" if bowling_arm == "right" else "right"
 
     side_events = embedded_detect_events(side_df, fps=side_fps, bowling_arm=bowling_arm)
