@@ -147,8 +147,17 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     # identity-switching risk from last night's heuristics. Fixes the
     # skeleton looking "loose"/jittery even when correctly locked onto
     # the bowler the whole time.
+    # WIDENED from window=3: the lighter window still let real
+    # per-frame jitter through during the fast, motion-blurred delivery
+    # and follow-through phase, where MediaPipe's per-frame confidence
+    # and precision naturally drop (fast motion = more blur = noisier
+    # landmark estimates for the SAME correctly-tracked person — this is
+    # a precision issue, not an identity issue). A slightly wider window
+    # trades a small amount of responsiveness for meaningfully steadier
+    # tracking during exactly the phase that matters most for a
+    # professional-looking result.
     output_df[landmark_cols] = output_df[landmark_cols].rolling(
-        window=3, center=True, min_periods=1
+        window=5, center=True, min_periods=1
     ).mean()
 
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
