@@ -51,21 +51,54 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
 
     wrist_y = df[f"{bowl_side}_WRIST_y"].interpolate(method="linear").bfill().ffill().values
-    br_idx = int(np.argmin(wrist_y))
-
-    if br_idx <= 5 or br_idx >= total_frames - 2:
-        br_idx = int(total_frames * 0.75)
-
     lead_ankle_y = df[f"{lead_side}_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
-    lookback_start = max(0, br_idx - int(fps * 0.6))
-    ffc_window = lead_ankle_y[lookback_start:br_idx]
-
-    if len(ffc_window) > 0:
-        ffc_idx = lookback_start + int(np.argmax(ffc_window))
-    else:
-        ffc_idx = max(0, br_idx - int(fps * 0.3))
-
     back_ankle_y = df[f"{bowl_side}_ANKLE_y"].interpolate(method="linear").bfill().ffill().values
+
+    # FRONT-FOOT PLANT (FFC), found independently of the wrist: the start
+    # of the LAST sustained stretch where the lead ankle stops moving and
+    # stays grounded. A normal running stride touches down and lifts again
+    # within a couple of frames; the actual delivery-stride plant stays
+    # down through release, so it's the only point in the clip where the
+    # ankle holds still for a sustained duration. This matters because
+    # searching for release (the wrist's highest point) across the WHOLE
+    # clip can lock onto an earlier arm-raise during the bowler's
+    # gather/jump instead of the real release — constraining the release
+    # search to start only after this plant fixes that.
+    plateau_window = max(2, int(round(fps * 0.12)))
+    ankle_range = float(np.nanmax(lead_ankle_y) - np.nanmin(lead_ankle_y))
+    stability_floor = max(ankle_range * 0.04, 1e-6)
+    rolling_std = pd.Series(lead_ankle_y).rolling(
+        window=plateau_window, center=False, min_periods=plateau_window
+    ).std().values
+    is_stable = rolling_std < stability_floor
+    plant_end_candidates = np.where(is_stable)[0]
+
+    if len(plant_end_candidates) > 0:
+        # Walk back from the end of the LAST stable stretch to where it
+        # started — that start is the moment the foot actually touched
+        # down and stopped moving.
+        ffc_idx = int(plant_end_candidates[-1])
+        while ffc_idx > 0 and is_stable[ffc_idx - 1]:
+            ffc_idx -= 1
+        ffc_idx = max(0, ffc_idx - plateau_window + 1)
+    else:
+        # No clear plateau found (short/noisy clip) — fall back to the
+        # single-frame peak, restricted to the back half of the clip to
+        # avoid an early running stride.
+        half = int(total_frames * 0.5)
+        ffc_idx = half + int(np.argmax(lead_ankle_y[half:]))
+
+    # BALL RELEASE (BR): the bowling wrist's highest point, searched ONLY
+    # in a realistic window after front-foot plant — never before it,
+    # since release always follows the plant.
+    br_search_window = max(2, int(round(fps * 0.4)))
+    br_search_end = min(total_frames, ffc_idx + br_search_window)
+    br_slice = wrist_y[ffc_idx:br_search_end]
+    if len(br_slice) > 0:
+        br_idx = ffc_idx + int(np.argmin(br_slice))
+    else:
+        br_idx = min(ffc_idx + 1, total_frames - 1)
+
     bfc_lookback = max(0, ffc_idx - int(fps * 0.5))
     bfc_window = back_ankle_y[bfc_lookback:ffc_idx]
 
@@ -619,10 +652,20 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     ly_ground = int(release_line_pts["ground_y"] * height)
                     if (0 < lx < width and 0 < ly_wrist < height
                             and 0 < ly_ground < height):
+                        DROP_LINE_COLOR = (60, 60, 255)  # BGR — highly visible red
                         cv2.line(frame, (lx, ly_wrist), (lx, ly_ground),
-                                 (0, 210, 255), 2, cv2.LINE_AA)
-                        cv2.circle(frame, (lx, ly_wrist), 5, (0, 210, 255), -1, cv2.LINE_AA)
-                        cv2.circle(frame, (lx, ly_ground), 5, (0, 210, 255), -1, cv2.LINE_AA)
+                                 DROP_LINE_COLOR, 2, cv2.LINE_AA)
+                        cv2.circle(frame, (lx, ly_wrist), 5, DROP_LINE_COLOR, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (lx, ly_ground), 5, DROP_LINE_COLOR, -1, cv2.LINE_AA)
+                        label = "Ball Release Height"
+                        (label_w, label_h), _ = cv2.getTextSize(
+                            label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                        label_x = min(max(lx + 10, 0), width - label_w - 10)
+                        label_y = min(max(ly_wrist + (ly_ground - ly_wrist) // 2, label_h + 6), height - 6)
+                        cv2.rectangle(frame, (label_x - 6, label_y - label_h - 6),
+                                      (label_x + label_w + 6, label_y + 6), (15, 15, 15), -1)
+                        cv2.putText(frame, label, (label_x, label_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, DROP_LINE_COLOR, 2, cv2.LINE_AA)
 
         out.write(frame)
 

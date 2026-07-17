@@ -119,7 +119,21 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         if detection_result.pose_landmarks and len(detection_result.pose_landmarks) > 0:
             first_person_landmarks = detection_result.pose_landmarks[0]
             for landmark in first_person_landmarks:
-                row.extend([landmark.x, landmark.y, landmark.z])
+                # MediaPipe scores its own confidence in each point
+                # (visibility). Previously this was discarded — every
+                # point was plotted regardless of confidence, including a
+                # stray/uncertain detection before the bowler has properly
+                # entered a tight frame. Treating a low-confidence point as
+                # missing (same as full occlusion) instead of plotting it
+                # lets the existing gap-fill interpolation and outlier
+                # filter below bridge across it, instead of the skeleton
+                # visibly snapping from an uncertain position once a
+                # confident detection appears.
+                visibility = landmark.visibility if landmark.visibility is not None else 1.0
+                if visibility >= 0.5:
+                    row.extend([landmark.x, landmark.y, landmark.z])
+                else:
+                    row.extend([np.nan, np.nan, np.nan])
         else:
             row.extend([np.nan] * (33 * 3))
 
