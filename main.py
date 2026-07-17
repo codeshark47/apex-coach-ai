@@ -97,85 +97,117 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
     except ImportError:
         return {"status": "error", "error_message": "MediaPipe Tasks API framework binding is missing."}
 
-    multi_person = seed_point is not None
-
-    base_options = python.BaseOptions(model_asset_path=model_path)
-    options = vision.PoseLandmarkerOptions(
-        base_options=base_options,
-        running_mode=vision.RunningMode.VIDEO,
-        output_segmentation_masks=False,
-        # Detect several candidate people per frame only when a coach has
-        # given a seed click to disambiguate between them — the default
-        # (no seed) stays single-person detection, unchanged from before.
-        num_poses=3 if multi_person else 1,
-        # LOWERED from 0.5: a bowler still distant/small early in the
-        # run-up often doesn't clear a 0.5 confidence threshold, so the
-        # skeleton doesn't appear until he's closer/larger in frame later
-        # in the clip. This is a detection-confidence issue, NOT an
-        # identity-switching issue (confirmed: no other person in frame).
-        # Lower threshold trades a little more sensitivity to background
-        # false positives for earlier detection of a genuine, distant
-        # bowler — acceptable here since there's no second person to be
-        # confused with.
-        min_pose_detection_confidence=0.3,
-        min_pose_presence_confidence=0.3,
-        min_tracking_confidence=0.4
-    )
-
-    landmarker = vision.PoseLandmarker.create_from_options(options)
-
     cap = cv2.VideoCapture(video_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-    ms_per_frame = 1000.0 / fps
+    cap.release()
 
     columns = ["frame"]
     for name in LANDMARK_NAMES:
         columns.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
 
-    # PASS 1: detect. Collect every candidate person MediaPipe finds each
-    # frame (just the one candidate, in the default single-person case).
-    frame_candidates = []
-    frame_number = 0
-    last_timestamp_ms = -1
+    def run_detection_pass(num_poses):
+        base_options_local = python.BaseOptions(model_asset_path=model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options_local,
+            running_mode=vision.RunningMode.VIDEO,
+            output_segmentation_masks=False,
+            num_poses=num_poses,
+            # LOWERED from 0.5: a bowler still distant/small early in the
+            # run-up often doesn't clear a 0.5 confidence threshold, so the
+            # skeleton doesn't appear until he's closer/larger in frame later
+            # in the clip. This is a detection-confidence issue, NOT an
+            # identity-switching issue (confirmed: no other person in frame).
+            # Lower threshold trades a little more sensitivity to background
+            # false positives for earlier detection of a genuine, distant
+            # bowler — acceptable here since there's no second person to be
+            # confused with.
+            min_pose_detection_confidence=0.3,
+            min_pose_presence_confidence=0.3,
+            min_tracking_confidence=0.4
+        )
+        landmarker_local = vision.PoseLandmarker.create_from_options(options)
+        cap_local = cv2.VideoCapture(video_path)
+        ms_per_frame_local = 1000.0 / fps
+        candidates = []
+        idx = 0
+        last_ts = -1
+        while True:
+            success, frame = cap_local.read()
+            if not success:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            ts = int(round(idx * ms_per_frame_local))
+            if ts <= last_ts:
+                ts = last_ts + 1
+            last_ts = ts
+            detection_result = landmarker_local.detect_for_video(mp_image_frame, ts)
+            candidates.append(list(detection_result.pose_landmarks) if detection_result.pose_landmarks else [])
+            idx += 1
+        cap_local.release()
+        landmarker_local.close()
+        return candidates
 
-    while True:
-        success, frame = cap.read()
-        if not success:
-            break
+    def has_implausible_jump(landmarks_per_frame):
+        # Two checks, since MediaPipe's own single-pose VIDEO-mode tracker
+        # can switch onto a different real person two different ways:
+        #
+        # 1. An abrupt single-frame jump.
+        threshold_frame = max(0.08, 3.0 / fps)
+        for i in range(len(landmarks_per_frame) - 1):
+            a, b = landmarks_per_frame[i], landmarks_per_frame[i + 1]
+            if a is None or b is None:
+                continue
+            ax, ay = _centroid_xy(a)
+            bx, by = _centroid_xy(b)
+            if ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5 > threshold_frame:
+                return True
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        # 2. A SMOOTH drift onto a different person over a short window —
+        # verified on real footage: tracking slid from one real person to
+        # a totally different one over ~0.1s, where every SINGLE
+        # frame-to-frame step was individually small enough to pass check
+        # 1 above, but the total displacement over that short a window was
+        # far beyond anything a real person can physically cover (nearly
+        # half the frame width in ~0.1s). Window is time-based so it means
+        # the same real duration regardless of fps.
+        window = max(3, int(round(fps * 0.1)))
+        threshold_window = 0.3
+        for i in range(len(landmarks_per_frame) - window):
+            a, b = landmarks_per_frame[i], landmarks_per_frame[i + window]
+            if a is None or b is None:
+                continue
+            ax, ay = _centroid_xy(a)
+            bx, by = _centroid_xy(b)
+            if ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5 > threshold_window:
+                return True
 
-        timestamp_ms = int(round(frame_number * ms_per_frame))
-        if timestamp_ms <= last_timestamp_ms:
-            timestamp_ms = last_timestamp_ms + 1
-        last_timestamp_ms = timestamp_ms
+        return False
 
-        detection_result = landmarker.detect_for_video(mp_image_frame, timestamp_ms)
-        frame_candidates.append(list(detection_result.pose_landmarks) if detection_result.pose_landmarks else [])
-        frame_number += 1
+    # ALWAYS run the fast, reliable single-person pass first — multi-pose
+    # detection (needed to disambiguate between several people) measurably
+    # degrades MediaPipe's own per-frame reliability, verified on real
+    # footage: the exact same person, at the exact same critical moment,
+    # went from fully tracked (single-pose) to completely missing
+    # (multi-pose) for several frames. Paying that cost is only justified
+    # when there's actual evidence of wrong-person risk, so it's checked
+    # for, not assumed just because a seed was given.
+    single_pass_candidates = run_detection_pass(1)
+    total_frames = len(single_pass_candidates)
+    single_pose_chosen = [cands[0] if cands else None for cands in single_pass_candidates]
 
-    cap.release()
-    landmarker.close()
+    multi_person = seed_point is not None and has_implausible_jump(single_pose_chosen)
 
-    total_frames = frame_number
-
-    # PASS 2: select. Default (no seed) — just take the one candidate per
-    # frame, identical to the old behavior. With a seed — walk outward
-    # from the seed frame in both directions, at each step choosing
-    # whichever candidate's torso is closest to where the tracked person
-    # was a moment ago. A frame with no detection at all leaves the
-    # anchor unchanged, so the next real detection still matches against
-    # the last KNOWN position rather than resetting.
     chosen_landmarks = [None] * total_frames
 
     if not multi_person:
-        for i in range(total_frames):
-            cands = frame_candidates[i]
-            chosen_landmarks[i] = cands[0] if cands else None
+        chosen_landmarks = single_pose_chosen
     else:
+        # A real identity-confusion risk was detected — worth the
+        # multi-pose detection cost to disambiguate using the coach's seed.
+        frame_candidates = run_detection_pass(3)
         # A frame where only ONE candidate is detected still needs a
         # plausibility check, not just an automatic accept — otherwise a
         # different, more-consistently-detected bystander (e.g. a coach
@@ -365,7 +397,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
 
     return {
         "status": "success",
-        "total_frames_processed": frame_number,
+        "total_frames_processed": total_frames,
         "fps": fps,
         "output_file": output_csv_path
     }
