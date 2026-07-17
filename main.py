@@ -159,23 +159,61 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
     # tuned to one video's camera distance or delivery speed. This is
     # NOT part of "who to track" logic — it only cleans the already-selected
     # trajectory, so it carries none of the identity-switching risk.
+    # A landmark's x/y/z describe ONE physical point and must be thrown
+    # out together. Checking each coordinate independently (as an earlier
+    # version of this did) could flag only x (or only y) as an outlier
+    # while leaving the other coordinate untouched — the interpolated x
+    # then no longer corresponds to the real y, producing a landmark that
+    # snaps to a spatially incoherent position. Verified on real footage:
+    # this produced a visible disconnected limb line jumping away from
+    # the body. Now flags outliers per coordinate first, then unions the
+    # flags across x/y/z before nulling, so a landmark is only ever kept
+    # or dropped as a whole point.
     HAMPEL_WINDOW = 5
     HAMPEL_N_SIGMAS = 3
+    per_col_outlier = {}
     for col in landmark_cols:
         series = output_df[col]
         rolling_median = series.rolling(window=HAMPEL_WINDOW, center=True, min_periods=1).median()
         abs_dev = (series - rolling_median).abs()
         mad = abs_dev.rolling(window=HAMPEL_WINDOW, center=True, min_periods=1).median()
         threshold = HAMPEL_N_SIGMAS * 1.4826 * mad
-        is_outlier = (mad > 0) & (abs_dev > threshold)
-        output_df.loc[is_outlier, col] = np.nan
+        per_col_outlier[col] = (mad > 0) & (abs_dev > threshold)
+
+    landmark_bases = sorted({c.rsplit("_", 1)[0] for c in landmark_cols})
+    for base in landmark_bases:
+        coord_cols = [c for c in (f"{base}_x", f"{base}_y", f"{base}_z") if c in per_col_outlier]
+        combined_outlier = per_col_outlier[coord_cols[0]]
+        for c in coord_cols[1:]:
+            combined_outlier = combined_outlier | per_col_outlier[c]
+        for c in coord_cols:
+            output_df.loc[combined_outlier, c] = np.nan
 
     # Brief gap-fill for genuine short occlusion (net, motion blur) and the
     # outliers just flagged above — NOT related to the identity-switching
     # bugs, kept separately since it was a real, narrow improvement on its
-    # own.
+    # own. Limit is time-based (not a fixed frame count) so it means the
+    # same ~0.1s across a 30fps and a 120fps video.
+    #
+    # Kept intentionally tight: verified on real footage that a limb
+    # genuinely undetected for longer than this (e.g. an arm occluded by
+    # the body during running) would otherwise get silently patched into
+    # a fabricated, frozen position once it reappears — which then gets
+    # drawn as if it were a real, current position (a stray disconnected
+    # limb line), and can also fool event-detection into treating that
+    # frozen value as a genuine peak. Anything longer than this now stays
+    # real NaN, which the existing drawing/event-detection code already
+    # skips gracefully instead of trusting a guess.
+    # limit_area="inside" matters as much as the limit itself: without it,
+    # pandas pads a one-sided-reachable gap from whichever edge IS within
+    # reach even when the other side has no real data at all for a long
+    # stretch — verified this is what was still producing a flat/frozen
+    # value a few frames deep into a genuinely long tracking gap even
+    # after tightening the limit. "inside" only fills a gap that has real
+    # data bracketing it on BOTH sides.
+    gap_fill_limit = max(1, int(round(fps * 0.1)))
     output_df[landmark_cols] = output_df[landmark_cols].interpolate(
-        method="linear", limit=5, limit_direction="both"
+        method="linear", limit=gap_fill_limit, limit_direction="both", limit_area="inside"
     )
 
     # LIGHT SMOOTHING: was present in an earlier working version, removed

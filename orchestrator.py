@@ -376,8 +376,15 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
     df = df.copy()
     landmark_cols = [c for c in df.columns if c.endswith(("_x", "_y", "_z"))]
+    # Same fix as main.py's gap-fill: time-based limit (not a fixed frame
+    # count) plus limit_area="inside" so a genuinely long tracking loss
+    # (e.g. an arm occluded during running) stays real NaN — which the
+    # drawing loop below already skips gracefully — instead of getting
+    # padded into a fabricated, frozen position that then gets drawn as a
+    # stray disconnected limb.
+    draw_gap_fill_limit = max(1, int(round(source_fps * 0.1)))
     df[landmark_cols] = df[landmark_cols].interpolate(
-        method="linear", limit=3, limit_direction="both"
+        method="linear", limit=draw_gap_fill_limit, limit_direction="both", limit_area="inside"
     )
 
     LEG_LINE_GLOW   = (20, 100, 20)
