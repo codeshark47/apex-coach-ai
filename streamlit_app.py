@@ -811,9 +811,7 @@ if st.session_state.get("pending_result_payload") is not None:
                            (metrics.get('head_stability', {}).get('classification')
                             or metrics.get('head_stability', {}).get('tier', 'N/A')))
 
-                with st.expander("🔧 Debug Metrics Payload", expanded=True):
-                    st.write("### Release Height Diagnostics")
-                    st.json(metrics.get("release_height", {}))
+
 
                 if resolved_angle in ("rear", "front", "unknown"):
                     if resolved_angle == "rear":
