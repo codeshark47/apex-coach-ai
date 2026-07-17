@@ -139,6 +139,18 @@ def extract_video_landmarks(video_path: str, output_csv_path: str) -> dict:
         method="linear", limit=5, limit_direction="both"
     )
 
+    # LIGHT SMOOTHING: was present in an earlier working version, removed
+    # by accident when the identity-tracking heuristics (a completely
+    # separate, unrelated feature) were reverted from this same file.
+    # This is intentionally NOT part of "who to track" logic — it only
+    # smooths the already-selected trajectory, so it carries none of the
+    # identity-switching risk from last night's heuristics. Fixes the
+    # skeleton looking "loose"/jittery even when correctly locked onto
+    # the bowler the whole time.
+    output_df[landmark_cols] = output_df[landmark_cols].rolling(
+        window=3, center=True, min_periods=1
+    ).mean()
+
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
     output_df.to_csv(output_csv_path, index=False)
 
