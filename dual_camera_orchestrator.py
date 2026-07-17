@@ -77,12 +77,12 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     # SIDE-ON ANNOTATED VIDEO
     raw_video = os.path.join(output_dir, "annotated_raw.mp4")
-    generate_fail_safe_video(side_on_path, raw_video, side_df, side_events)
+    generate_fail_safe_video(side_on_path, raw_video, side_df, side_events, bowling_arm=bowling_arm)
     web_safe_video = transcode_to_h264(raw_video)
 
     # REAR-VIEW ANNOTATED VIDEO
     rear_raw_video = os.path.join(output_dir, "annotated_rear_raw.mp4")
-    generate_fail_safe_video(rear_view_path, rear_raw_video, rear_df, rear_events)
+    generate_fail_safe_video(rear_view_path, rear_raw_video, rear_df, rear_events, bowling_arm=bowling_arm)
     rear_web_safe_video = transcode_to_h264(rear_raw_video)
 
     def clean_numeric(val):

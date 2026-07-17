@@ -165,7 +165,15 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
         y_wrist = br_row.get(f"{bowl_side}_WRIST_y")
         y_head = br_row.get("NOSE_y")
-        y_ankle = br_row.get("LEFT_ANKLE_y") or br_row.get("RIGHT_ANKLE_y")
+
+        y_ankle_left = br_row.get("LEFT_ANKLE_y")
+        y_ankle_right = br_row.get("RIGHT_ANKLE_y")
+        if y_ankle_left is not None and not pd.isna(y_ankle_left):
+            y_ankle, ankle_side = y_ankle_left, "LEFT"
+        elif y_ankle_right is not None and not pd.isna(y_ankle_right):
+            y_ankle, ankle_side = y_ankle_right, "RIGHT"
+        else:
+            y_ankle, ankle_side = None, None
 
         if any(v is None or pd.isna(v) for v in [y_wrist, y_head, y_ankle]):
             return {
@@ -176,45 +184,59 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
             }
 
         body_height = abs(float(y_ankle) - float(y_head))
-        # A properly framed bowler at release should span well over a
-        # third of the frame height, head to ankle. Anything much smaller
-        # almost always means a mistracked landmark (commonly the ankle),
-        # not a genuinely tiny/out-of-frame bowler — a 0.05 threshold was
-        # letting clearly-wrong values (e.g. 0.16-0.19) through and
-        # producing fabricated ratios like 124%.
-        if body_height < 0.35:
-            return {
-                "ratio": None,
-                "classification": "Body height too small",
-                "status": "error",
-                "error_message": (
-                    f"Body height span ({round(body_height, 3)}) too small for a "
-                    f"reliable reading — likely a mistracked landmark (often the "
-                    f"ankle) rather than a genuinely out-of-frame bowler."
-                ),
-                "debug_raw": {
-                    "y_wrist": round(float(y_wrist), 4),
-                    "y_head": round(float(y_head), 4),
-                    "y_ankle": round(float(y_ankle), 4),
-                    "body_height": round(float(body_height), 4),
-                    "bowl_side_used": bowl_side,
-                }
-            }
 
-        ratio = round(abs(float(y_ankle) - float(y_wrist)) / body_height, 4)
-
-        # DIAGNOSTIC: include raw inputs directly in the return payload so
-        # they're visible on the live deployed report itself. A local log
-        # file doesn't work here — Streamlit Cloud runs on separate
-        # servers from any dev terminal, so a file written there is
-        # unreachable for inspection afterward.
         debug_raw = {
             "y_wrist": round(float(y_wrist), 4),
             "y_head": round(float(y_head), 4),
             "y_ankle": round(float(y_ankle), 4),
             "body_height": round(float(body_height), 4),
             "bowl_side_used": bowl_side,
+            "ankle_side_used": ankle_side,
         }
+
+        # Numerical-stability floor only — a near-zero denominator blows the
+        # ratio up regardless of whether tracking is good. This is NOT a
+        # mistracking signal by itself: a video's head-to-ankle span in the
+        # frame depends heavily on camera distance, so a flat cutoff here
+        # (previously 0.35) rejects legitimately well-tracked videos just
+        # because they were filmed wider or further away.
+        if body_height < 0.05:
+            return {
+                "ratio": None,
+                "classification": "Body height too small",
+                "status": "error",
+                "error_message": (
+                    f"Body height span ({round(body_height, 3)}) too small to "
+                    f"divide by reliably."
+                ),
+                "debug_raw": debug_raw
+            }
+
+        # Real mistracking check: at ball release the front/plant foot is on
+        # the ground, so the ankle landmark should sit below both the knee
+        # and hip in the frame (larger y = lower in image coordinates). This
+        # holds regardless of camera distance/framing, unlike a raw span
+        # cutoff, so it catches an actual mistracked ankle without punishing
+        # videos filmed wider or further away.
+        y_knee = br_row.get(f"{ankle_side}_KNEE_y")
+        y_hip = br_row.get(f"{ankle_side}_HIP_y")
+        if y_knee is not None and not pd.isna(y_knee) and y_hip is not None and not pd.isna(y_hip):
+            if float(y_ankle) < float(y_knee) or float(y_ankle) < float(y_hip):
+                return {
+                    "ratio": None,
+                    "classification": "Ankle landmark implausible",
+                    "status": "error",
+                    "error_message": (
+                        f"{ankle_side} ankle is not below the {ankle_side.lower()} "
+                        f"knee/hip on the BR frame — landmark is likely "
+                        f"mistracked rather than the reading being real."
+                    ),
+                    "debug_raw": {**debug_raw,
+                                  "y_knee": round(float(y_knee), 4),
+                                  "y_hip": round(float(y_hip), 4)}
+                }
+
+        ratio = round(abs(float(y_ankle) - float(y_wrist)) / body_height, 4)
 
         if ratio > 1.30 or ratio < 0.30:
             return {
@@ -245,7 +267,8 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
 
 def generate_fail_safe_video(video_path: str, output_path: str,
                               df: pd.DataFrame, events: dict,
-                              slow_motion_factor: float = 4.0):
+                              slow_motion_factor: float = 4.0,
+                              bowling_arm: str = "right"):
     """
     Generates annotated skeleton overlay video using mp4v codec.
 
@@ -343,22 +366,20 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     knee_series = knee_series.interpolate(limit_direction="both")
     knee_arr = knee_series.to_numpy()
 
-    # --- RELEASE HEIGHT % at BR (same formula as kinematics.calculate_release_height) ---
+    # --- RELEASE HEIGHT % at BR ---
+    # Reuses calculate_release_height_ratio_safe (same function that feeds the
+    # report card) instead of a separate formula, so the number burned into
+    # the video can never disagree with the report, respects bowling_arm
+    # instead of always assuming right-arm, and shows nothing rather than a
+    # fabricated number when tracking is unreliable.
     release_height_pct = None
     br_frame = events.get("BR")
     if br_frame is not None:
         br_rows = df[df["frame"] == br_frame]
         if not br_rows.empty:
-            r = br_rows.iloc[0]
-            try:
-                ankle_y = (float(r["LEFT_ANKLE_y"]) + float(r["RIGHT_ANKLE_y"])) / 2
-                nose_y = float(r["NOSE_y"])
-                wrist_y = float(r["RIGHT_WRIST_y"])
-                body_length = ankle_y - nose_y
-                if body_length > 0 and not np.isnan(body_length):
-                    release_height_pct = ((ankle_y - wrist_y) / body_length) * 100
-            except Exception:
-                release_height_pct = None
+            rh = calculate_release_height_ratio_safe(br_rows.iloc[0], bowling_arm=bowling_arm)
+            if rh.get("ratio") is not None:
+                release_height_pct = rh["ratio"] * 100
 
     # --- ESTIMATED ELBOW EXTENSION (2D approximation of ICC's 15-degree law) ---
     # NOTE: official ICC assessment requires 3D motion capture; this 2D
@@ -537,6 +558,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                 if release_height_pct is not None:
                     cv2.putText(frame, f"{release_height_pct:.0f}%", (box_x + 190, box_y + 122),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 210, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(frame, "N/A", (box_x + 190, box_y + 122),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2, cv2.LINE_AA)
                 # ELBOW EXTENSION DISABLED — 2D-derived readings were producing
                 # false positives (e.g. 81deg on a visibly legal action).
                 # Needs a real accuracy fix before showing this to users again.
@@ -691,7 +715,7 @@ def run_complete_bowling_analysis(video_path: str,
 
     # STAGE 5 — VIDEO GENERATION
     raw_output_video = os.path.join(output_dir, "annotated_raw.mp4")
-    generate_fail_safe_video(video_path, raw_output_video, df, events)
+    generate_fail_safe_video(video_path, raw_output_video, df, events, bowling_arm=bowling_arm)
     web_safe_video_file = transcode_to_h264(raw_output_video)
 
     # STAGE 6 — SAFE KEY EXTRACTION
