@@ -64,6 +64,14 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     # clip can lock onto an earlier arm-raise during the bowler's
     # gather/jump instead of the real release — constraining the release
     # search to start only after this plant fixes that.
+    # Tried a percentile-based threshold (relative to this clip's own
+    # distribution) instead of a fixed fraction of total range, on the
+    # theory it would self-normalize better across videos. Verified
+    # against real footage: it backfired — it became so strict that only
+    # an artificial dead-flat stretch survived (see the real-detection
+    # guard below), collapsing FFC to frame ~2. Reverted to the looser
+    # range-based floor, which verified correctly on real footage once
+    # combined with that guard.
     plateau_window = max(2, int(round(fps * 0.12)))
     ankle_range = float(np.nanmax(lead_ankle_y) - np.nanmin(lead_ankle_y))
     stability_floor = max(ankle_range * 0.04, 1e-6)
@@ -71,6 +79,19 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
         window=plateau_window, center=False, min_periods=plateau_window
     ).std().values
     is_stable = rolling_std < stability_floor
+
+    # A frame can only count as "stable" if it — and the rest of its
+    # plateau_window — had a REAL detection before any gap-filling. Before
+    # the bowler has entered the frame, every point is missing and gets
+    # backfilled to one repeated constant (zero variance by construction),
+    # which otherwise looks MORE "stable" than genuine stillness and can
+    # get mistaken for the plant. Verified: this is what actually excludes
+    # the empty-frame stretch, not the threshold formula.
+    had_real_detection = (~df[f"{lead_side}_ANKLE_y"].isna()).values
+    window_all_real = pd.Series(had_real_detection).rolling(
+        window=plateau_window, center=False, min_periods=plateau_window
+    ).min().astype(bool).values
+    is_stable = is_stable & window_all_real
     plant_end_candidates = np.where(is_stable)[0]
 
     if len(plant_end_candidates) > 0:
@@ -199,12 +220,22 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         y_wrist = br_row.get(f"{bowl_side}_WRIST_y")
         y_head = br_row.get("NOSE_y")
 
-        y_ankle_left = br_row.get("LEFT_ANKLE_y")
-        y_ankle_right = br_row.get("RIGHT_ANKLE_y")
-        if y_ankle_left is not None and not pd.isna(y_ankle_left):
-            y_ankle, ankle_side = y_ankle_left, "LEFT"
-        elif y_ankle_right is not None and not pd.isna(y_ankle_right):
-            y_ankle, ankle_side = y_ankle_right, "RIGHT"
+        # Use the FRONT/LEAD ankle (opposite the bowling arm) — that's the
+        # foot planted on the ground at release, same "lead_side" convention
+        # used elsewhere (detect_delivery_events, calculate_knee_bracing).
+        # Previously this just preferred whichever ankle was labeled "LEFT"
+        # regardless of which leg that actually was — for a left-arm
+        # bowler the left ankle is the TRAILING leg, which normally lifts
+        # during follow-through, so checking it against the "ankle should
+        # be grounded" rule below was flagging normal motion as an error.
+        lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+        trail_side = "RIGHT" if lead_side == "LEFT" else "LEFT"
+        y_ankle_lead = br_row.get(f"{lead_side}_ANKLE_y")
+        y_ankle_trail = br_row.get(f"{trail_side}_ANKLE_y")
+        if y_ankle_lead is not None and not pd.isna(y_ankle_lead):
+            y_ankle, ankle_side = y_ankle_lead, lead_side
+        elif y_ankle_trail is not None and not pd.isna(y_ankle_trail):
+            y_ankle, ankle_side = y_ankle_trail, trail_side
         else:
             y_ankle, ankle_side = None, None
 
@@ -603,12 +634,23 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         event_labels = [("BFC", "CONTACT", (60, 225, 90)),
                          ("FFC", "CONTACT", (60, 225, 90)),
                          ("BR", "RELEASE", (0, 210, 255))]
+        # Pick whichever event is actually CLOSEST to this frame, not just
+        # the first one in the list that's within range. BFC/FFC/BR often
+        # land within a few frames of each other for a real delivery, so
+        # "first match wins" was showing the earlier event's badge
+        # (CONTACT) even on the exact BR frame itself, hiding the RELEASE
+        # badge and the release-height line/text that only draw when the
+        # RELEASE badge is showing.
         active_badge = None
+        best_distance = None
         for key, label, color in event_labels:
             ev_frame = events.get(key)
-            if ev_frame is not None and abs(f_idx - ev_frame) <= PHASE_BADGE_WINDOW:
+            if ev_frame is None:
+                continue
+            distance = abs(f_idx - ev_frame)
+            if distance <= PHASE_BADGE_WINDOW and (best_distance is None or distance < best_distance):
                 active_badge = (label, color, ev_frame)
-                break
+                best_distance = distance
 
         if active_badge is not None:
             label, color, ev_frame = active_badge
