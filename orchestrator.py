@@ -186,6 +186,23 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
 
         ratio = round(abs(float(y_ankle) - float(y_wrist)) / body_height, 4)
 
+        # DIAGNOSTIC: automatically log the raw inputs whenever release
+        # height is unusually high/low, so we can investigate a specific
+        # real occurrence directly instead of trying to re-locate matching
+        # CSV data after the fact (output/landmarks.csv gets overwritten
+        # by every subsequent run, making manual correlation unreliable).
+        if ratio > 1.10 or ratio < 0.75:
+            try:
+                import datetime
+                with open("debug_release_height.log", "a") as f:
+                    f.write(
+                        f"{datetime.datetime.now().isoformat()} | ratio={ratio} | "
+                        f"y_wrist={y_wrist} | y_head={y_head} | y_ankle={y_ankle} | "
+                        f"body_height={body_height}\n"
+                    )
+            except Exception:
+                pass
+
         if ratio > 1.30 or ratio < 0.30:
             return {
                 "ratio": None,
