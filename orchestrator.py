@@ -749,7 +749,8 @@ def run_complete_bowling_analysis(video_path: str,
                 "ratio": release_height.get("ratio"),
                 "classification": (release_height.get("classification") or
                                     release_height.get("tier") or "Unknown"),
-                "status": release_height.get("status", "error")
+                "status": release_height.get("status", "error"),
+                "debug_raw": release_height.get("debug_raw")
             },
             "head_stability": {
                 "value": (head_stability.get("deviation_index") or
