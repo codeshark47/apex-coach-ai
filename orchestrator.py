@@ -343,6 +343,40 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         }
 
 
+def _draw_rounded_rect(img, pt1, pt2, color, radius):
+    """Filled rounded rectangle — cv2 has no native support for this."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+    cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
+    cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
+    for cx, cy in [(x1 + radius, y1 + radius), (x2 - radius, y1 + radius),
+                   (x1 + radius, y2 - radius), (x2 - radius, y2 - radius)]:
+        cv2.circle(img, (cx, cy), radius, color, -1)
+
+
+def _draw_panel(frame, pt1, pt2, fill_color=(15, 15, 15), radius=14,
+                 fill_alpha=0.55, shadow_offset=6, shadow_alpha=0.35):
+    """
+    Rounded panel with a soft drop shadow, alpha-blended onto frame in
+    place. Replaces the old flat sharp-cornered rectangle, which read as
+    a basic "programmer UI" overlay rather than a broadcast graphic.
+    """
+    x1, y1 = pt1
+    x2, y2 = pt2
+    h, w = frame.shape[:2]
+
+    shadow = frame.copy()
+    sx1, sy1 = x1 + shadow_offset, y1 + shadow_offset
+    sx2, sy2 = min(x2 + shadow_offset, w - 1), min(y2 + shadow_offset, h - 1)
+    _draw_rounded_rect(shadow, (sx1, sy1), (sx2, sy2), (0, 0, 0), radius)
+    frame[:] = cv2.addWeighted(shadow, shadow_alpha, frame, 1 - shadow_alpha, 0)
+
+    fill = frame.copy()
+    _draw_rounded_rect(fill, (x1, y1), (x2, y2), fill_color, radius)
+    frame[:] = cv2.addWeighted(fill, fill_alpha, frame, 1 - fill_alpha, 0)
+
+
 def generate_fail_safe_video(video_path: str, output_path: str,
                               df: pd.DataFrame, events: dict,
                               slow_motion_factor: float = 4.0,
@@ -367,6 +401,20 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     source_fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
 
     output_fps = max(1, int(round(source_fps / slow_motion_factor)))
+
+    # LOGO WATERMARK: subtle brand mark in a fixed corner, low opacity so
+    # it doesn't distract from the analysis itself. Loaded once, resized
+    # once — composited per-frame is just an alpha blend, cheap.
+    logo_rgba = None
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apex_logo.png.png")
+    if os.path.exists(logo_path):
+        raw_logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+        if raw_logo is not None and raw_logo.shape[2] == 4:
+            logo_w = max(40, int(width * 0.09))
+            logo_h = int(raw_logo.shape[0] * (logo_w / raw_logo.shape[1]))
+            logo_rgba = cv2.resize(raw_logo, (logo_w, logo_h), interpolation=cv2.INTER_AREA)
+    LOGO_MARGIN = 14
+    LOGO_OPACITY = 0.6
 
     out = cv2.VideoWriter(
         output_path,
@@ -564,6 +612,14 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
     PHASE_BADGE_WINDOW = max(3, int(round(source_fps * 0.5)))
 
+    # Tracks the bowler's last-known horizontal screen position (0-1) so
+    # the info badge can be placed on whichever side he ISN'T on — a
+    # fixed top-left badge was covering him directly at release on
+    # tightly-framed footage, exactly the moment a coach most wants an
+    # unobstructed view. Persists across any frame with no tracking data
+    # so the badge doesn't flicker sides during a brief gap.
+    last_known_bowler_x = None
+
     f_idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
@@ -572,6 +628,10 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         f_match = df[df["frame"] == f_idx]
         if not f_match.empty:
             row = f_match.iloc[0]
+            torso_x_cols = ["NOSE_x", "LEFT_HIP_x", "RIGHT_HIP_x"]
+            torso_x_vals = [float(row[c]) for c in torso_x_cols if not pd.isna(row[c])]
+            if torso_x_vals:
+                last_known_bowler_x = sum(torso_x_vals) / len(torso_x_vals)
             for partA, partB in connections:
                 try:
                     if pd.isna(row[f"{partA}_x"]) or pd.isna(row[f"{partB}_x"]):
@@ -626,6 +686,24 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                 except Exception:
                     continue
 
+        # Composited BEFORE the chart panel overwrites the bottom of the
+        # frame, and anchored bottom-right of the VIDEO area specifically
+        # (not the chart panel) — the badge only ever appears in the top
+        # area, so this placement can never collide with it regardless of
+        # which side the badge dynamically picks.
+        if logo_rgba is not None:
+            lh, lw = logo_rgba.shape[:2]
+            lx1 = width - lw - LOGO_MARGIN
+            ly1 = PANEL_TOP - lh - LOGO_MARGIN
+            if lx1 > 0 and ly1 > 0:
+                roi = frame[ly1:ly1 + lh, lx1:lx1 + lw]
+                logo_bgr = logo_rgba[:, :, :3]
+                logo_alpha = (logo_rgba[:, :, 3:4].astype(np.float32) / 255.0) * LOGO_OPACITY
+                frame[ly1:ly1 + lh, lx1:lx1 + lw] = (
+                    logo_bgr.astype(np.float32) * logo_alpha
+                    + roi.astype(np.float32) * (1 - logo_alpha)
+                ).astype(np.uint8)
+
         panel_region = frame[PANEL_TOP:PANEL_TOP + PANEL_H, 0:width]
         blended = cv2.addWeighted(panel_region, 0.35, chart_base, 0.65, 0)
         frame[PANEL_TOP:PANEL_TOP + PANEL_H, 0:width] = blended
@@ -679,11 +757,16 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             is_release = (label == "RELEASE")
             box_w = 340
             box_h = 150 if is_release else 130
-            box_x, box_y = 20, 50
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h),
-                          (15, 15, 15), -1)
-            frame[:] = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+            # Default to the left (matches the old fixed behavior) unless
+            # the bowler is known to be on the left half of frame, in
+            # which case the badge moves to the right so it never sits
+            # directly on top of him.
+            if last_known_bowler_x is not None and last_known_bowler_x < 0.5:
+                box_x = width - box_w - 20
+            else:
+                box_x = 20
+            box_y = 50
+            _draw_panel(frame, (box_x, box_y), (box_x + box_w, box_y + box_h))
             cv2.putText(frame, label, (box_x + 16, box_y + 42),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3, cv2.LINE_AA)
             cv2.putText(frame, "KNEE", (box_x + 16, box_y + 78),
@@ -725,8 +808,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                             label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
                         label_x = min(max(lx + 10, 0), width - label_w - 10)
                         label_y = min(max(ly_wrist + (ly_ground - ly_wrist) // 2, label_h + 6), height - 6)
-                        cv2.rectangle(frame, (label_x - 6, label_y - label_h - 6),
-                                      (label_x + label_w + 6, label_y + 6), (15, 15, 15), -1)
+                        _draw_panel(frame, (label_x - 6, label_y - label_h - 6),
+                                    (label_x + label_w + 6, label_y + 6),
+                                    radius=6, shadow_offset=3)
                         cv2.putText(frame, label, (label_x, label_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, DROP_LINE_COLOR, 2, cv2.LINE_AA)
 
