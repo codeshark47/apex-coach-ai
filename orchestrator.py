@@ -726,9 +726,17 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             status_text = "BALL RELEASE"
         elif f_idx >= events["BFC"]:
             status_text = "DELIVERY STRIDE"
-        cv2.putText(frame, status_text, (20, 30),
+        # Was plain text drawn straight onto the video with no background —
+        # low contrast and hard to read against a bright sky, reading more
+        # like a debug label than a broadcast lower-third. Same rounded
+        # pill treatment as the other badges for a consistent look.
+        (status_w, status_h), _ = cv2.getTextSize(
+            status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        _draw_panel(frame, (12, 12), (12 + status_w + 24, 12 + status_h + 20),
+                    radius=status_h // 2 + 6, shadow_offset=3, fill_alpha=0.5)
+        cv2.putText(frame, status_text, (24, 12 + status_h + 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                    (200, 200, 200), 2, cv2.LINE_AA)
+                    (235, 235, 235), 2, cv2.LINE_AA)
 
         event_labels = [("BFC", "CONTACT", (60, 225, 90)),
                          ("FFC", "CONTACT", (60, 225, 90)),
