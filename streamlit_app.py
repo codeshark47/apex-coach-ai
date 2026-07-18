@@ -525,7 +525,12 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
     ref_path = st.session_state[ref_path_key]
     total_frames = cal.get_frame_count(ref_path)
 
-    with st.sidebar.expander(f"🎯 Confirm the bowler — {label}", expanded=st.session_state.get(point_key) is None):
+    # Rendered in the MAIN content area (not the sidebar) — the sidebar is
+    # a narrow, fixed-width column on desktop browsers, which was
+    # squeezing a wide cricket video frame down to a size too small to
+    # click accurately. The main area uses the full page width
+    # (layout="wide" is set above), giving a much larger, clearer image.
+    with st.expander(f"🎯 Confirm the bowler — {label}", expanded=st.session_state.get(point_key) is None):
         st.caption(
             "Scrub to any frame where the bowler is clearly visible, then click "
             "directly on him. This tells the app exactly who to track for the "
@@ -568,7 +573,10 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
             else:
                 st.caption("✅ Bowler confirmed — click again to move the marker.")
 
-            click = streamlit_image_coordinates(display_img, key=f"{key_prefix}_seed_click_widget")
+            click = streamlit_image_coordinates(
+                display_img, key=f"{key_prefix}_seed_click_widget",
+                use_column_width="always"
+            )
 
             if click is not None:
                 rendered_w = click.get("width") or orig_w
