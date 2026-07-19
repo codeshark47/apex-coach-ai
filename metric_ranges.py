@@ -194,6 +194,39 @@ def describe_range(metric_key: str) -> str:
         raise ValueError(f"Unsupported kind '{r.kind}' for '{metric_key}'")
 
 
+def format_value(metric_key: str, value) -> str:
+    """Human-readable value + unit, matching describe_range's convention."""
+    r = RANGES[metric_key]
+    if r.unit == "%":
+        return f"{float(value) * 100:.0f}%"
+    return f"{value}{r.unit}"
+
+
+def measurement_warning(metric_key: str, value) -> str:
+    """
+    Flags a value so extreme it's more likely a camera-angle/tracking
+    artifact than a real reading. Was previously trapped in a separate,
+    unsynced module (reference_ranges.py) used only by the PDF report —
+    consolidated here so it's available anywhere without re-duplicating
+    the thresholds a third time. Returns None when nothing is flagged.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN
+        return None
+    if metric_key == "trunk_lean" and v > 45:
+        return "Value exceeds 45° — possible camera angle artifact. Verify video angle before prescribing corrections."
+    if metric_key == "hip_shoulder_separation" and v < 5:
+        return "Value below 5° — possible rear-view camera limitation affecting measurement accuracy."
+    if metric_key == "release_height" and v > 1.15:
+        return "Ratio exceeds 1.15 — measurement error likely. Check landmark tracking quality."
+    return None
+
+
 def extract_metric_value(metrics: dict, metric_key: str):
     """
     Single shared lookup: maps a metric_ranges key to the numeric value

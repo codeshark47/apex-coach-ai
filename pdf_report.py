@@ -4,8 +4,12 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
-# --- TASK 6 IMPORT: BRING IN THE CENTRAL REFERENCE RANGE SYSTEM ---
-from reference_ranges import classify_with_range
+# Single source of truth for reference ranges — same classifier the live
+# UI and the AI coaching report use, so the PDF can never again disagree
+# with what a coach saw on screen for the same delivery (verified this
+# had drifted: hip-shoulder separation 55-60 degrees and release height
+# 110-112% were "Acceptable" live but "Critical" in the old PDF path).
+import metric_ranges as mr
 
 def generate_automated_pdf(analysis_payload: dict, ai_insights: dict, output_pdf_path: str = "output/Bowling_Analysis_Report.pdf") -> str:
     os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
@@ -79,39 +83,36 @@ def generate_automated_pdf(analysis_payload: dict, ai_insights: dict, output_pdf
         "head_stability": "Head Stability Variance Index"
     }
     
+    ZONE_DISPLAY = {
+        "red": ("CRITICAL", CRITICAL_COLOR),
+        "amber": ("ACCEPTABLE", WARNING_COLOR),
+        "green": ("OPTIMAL", PRIMARY),
+        "unknown": ("NO DATA", colors.HexColor("#718096")),
+    }
+
     for key in target_keys:
         item = metrics.get(key)
         name = display_names.get(key, key.replace('_', ' ').title())
-        
+
         if not item:
             metrics_data.append([Paragraph(name, body_style), Paragraph("N/A", body_style), Paragraph("No Data", body_style), Paragraph("N/A", body_style)])
             continue
-            
-        val = item.get("degrees") or item.get("ratio") or item.get("value") or item.get("deviation_index")
-        
+
+        val = mr.extract_metric_value(metrics, key)
+
         if val is None:
             metrics_data.append([Paragraph(name, body_style), Paragraph("N/A", body_style), Paragraph("Error", body_style), Paragraph("N/A", body_style)])
             continue
-            
-        # Call the standalone range engine to handle active lab profiling layout rules
-        classification = classify_with_range(key, float(val))
-        zone_label = classification["zone"].upper()
-        
-        # Color coordinate the text block zones dynamically
-        if zone_label == "CRITICAL":
-            zone_html = f"<font color='{CRITICAL_COLOR.hexval()}'><b>CRITICAL</b></font>"
-        elif zone_label == "ACCEPTABLE":
-            zone_html = f"<font color='{WARNING_COLOR.hexval()}'><b>ACCEPTABLE</b></font>"
-        else:
-            zone_html = f"<font color='{PRIMARY.hexval()}'><b>OPTIMAL</b></font>"
-            
-        # Handle string formatting details across units
-        unit = classification.get("unit", "")
-        unit_str = "°" if unit == "degrees" else ""
-        
-        val_display = f"<b>{val}{unit_str}</b>"
-        range_display = f"Optimal: {classification['optimal_range']} | Acceptable: {classification['acceptable_range']}"
-        
+
+        zone = mr.classify(key, val)
+        zone_label, zone_color = ZONE_DISPLAY[zone]
+        zone_html = f"<font color='{zone_color.hexval()}'><b>{zone_label}</b></font>"
+
+        val_display = f"<b>{mr.format_value(key, val)}</b>"
+        # describe_range() already leads with "- {label}: " — strip that
+        # since the metric name is shown in its own column here.
+        range_display = mr.describe_range(key).split(": ", 1)[1]
+
         # Add basic metric row entry
         metrics_data.append([
             Paragraph(name, body_style),
@@ -119,11 +120,12 @@ def generate_automated_pdf(analysis_payload: dict, ai_insights: dict, output_pdf
             Paragraph(zone_html, body_style),
             Paragraph(range_display, body_style)
         ])
-        
+
         # Inject warning alert row immediately below if camera anomalies are intercepted
-        if classification.get("measurement_warning"):
+        warning = mr.measurement_warning(key, val)
+        if warning:
             metrics_data.append([
-                Paragraph(f"⚠️ {classification['measurement_warning']}", warn_style),
+                Paragraph(f"⚠️ {warning}", warn_style),
                 Paragraph("", body_style),
                 Paragraph("", body_style),
                 Paragraph("", body_style)
@@ -145,13 +147,11 @@ def generate_automated_pdf(analysis_payload: dict, ai_insights: dict, output_pdf
     for key in target_keys:
         item = metrics.get(key)
         if item:
-            val = item.get("degrees") or item.get("ratio") or item.get("value") or item.get("deviation_index")
-            if val is not None:
-                classification = classify_with_range(key, float(val))
-                if classification.get("measurement_warning"):
-                    row_idx += 1
-                    t_styles.append(('SPAN', (0, row_idx), (3, row_idx)))
-                    t_styles.append(('BACKGROUND', (0, row_idx), (3, row_idx), colors.HexColor("#FFF5F5")))
+            val = mr.extract_metric_value(metrics, key)
+            if val is not None and mr.measurement_warning(key, val):
+                row_idx += 1
+                t_styles.append(('SPAN', (0, row_idx), (3, row_idx)))
+                t_styles.append(('BACKGROUND', (0, row_idx), (3, row_idx), colors.HexColor("#FFF5F5")))
         row_idx += 1
 
     t_metrics.setStyle(TableStyle(t_styles))
