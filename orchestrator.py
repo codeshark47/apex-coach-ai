@@ -592,6 +592,11 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     elite_y = y_to_px(ELITE_MIN)
     cv2.rectangle(chart_base, (MARGIN_L, MARGIN_T), (width - MARGIN_R, elite_y),
                   (30, 70, 30), -1)
+    # The green band was an unexplained color with no label — a coach
+    # watching has no way to know it marks the elite/braced reference
+    # range without this.
+    cv2.putText(chart_base, f"ELITE ({ELITE_MIN:.0f}+ deg)", (MARGIN_L + 8, MARGIN_T + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 220, 140), 1, cv2.LINE_AA)
     for g in range(0, 181, 45):
         gy = y_to_px(g)
         cv2.line(chart_base, (MARGIN_L, gy), (width - MARGIN_R, gy), (55, 55, 55), 1, cv2.LINE_AA)
