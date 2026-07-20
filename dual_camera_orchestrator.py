@@ -16,7 +16,8 @@ from kinematics import calculate_knee_bracing, calculate_trunk_lean, calculate_h
 def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir: str = "output",
                               bowling_arm_override: str = None,
                               side_seed_point: tuple = None, side_seed_frame_index: int = 0,
-                              rear_seed_point: tuple = None, rear_seed_frame_index: int = 0) -> dict:
+                              rear_seed_point: tuple = None, rear_seed_frame_index: int = 0,
+                              side_extra_seeds: list = None, rear_extra_seeds: list = None) -> dict:
     """
     SaaS Architecture Dual Camera Engine.
     Processes side-on and rear streams independently to bypass manual sync issues.
@@ -25,6 +26,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     bowler in each stream's own reference frame — the two camera angles
     are separate videos, so each needs its own seed. See
     main.extract_video_landmarks for details.
+
+    side_extra_seeds/rear_extra_seeds: optional additional (frame_index,
+    point) re-confirmations later in each stream — same purpose as
+    Single Camera mode's extra_seeds, passed straight through.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -32,7 +37,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     side_csv = os.path.join(output_dir, "landmarks_side.csv")
     side_extraction = extract_video_landmarks(side_on_path, side_csv,
                                                seed_point=side_seed_point,
-                                               seed_frame_index=side_seed_frame_index)
+                                               seed_frame_index=side_seed_frame_index,
+                                               extra_seeds=side_extra_seeds)
     if side_extraction["status"] == "error":
         return {"status": "failed", "stage": "side_camera", "message": side_extraction["error_message"]}
 
@@ -75,7 +81,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     rear_csv = os.path.join(output_dir, "landmarks_rear.csv")
     rear_extraction = extract_video_landmarks(rear_view_path, rear_csv,
                                                seed_point=rear_seed_point,
-                                               seed_frame_index=rear_seed_frame_index)
+                                               seed_frame_index=rear_seed_frame_index,
+                                               extra_seeds=rear_extra_seeds)
     if rear_extraction["status"] == "error":
         return {"status": "failed", "stage": "rear_camera", "message": rear_extraction["error_message"]}
 

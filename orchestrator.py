@@ -1152,7 +1152,8 @@ def run_complete_bowling_analysis(video_path: str,
                                    output_dir: str = "output",
                                    bowling_arm_override: str = None,
                                    seed_point: tuple = None,
-                                   seed_frame_index: int = 0) -> dict:
+                                   seed_frame_index: int = 0,
+                                   extra_seeds: list = None) -> dict:
     """
     Core orchestration loop.
     Extracts landmarks, detects events, calculates all 5 biomechanical
@@ -1161,6 +1162,14 @@ def run_complete_bowling_analysis(video_path: str,
     seed_point/seed_frame_index: optional coach click identifying the
     bowler in a reference frame, passed straight through to
     extract_video_landmarks — see that function's docstring.
+
+    extra_seeds: optional list of (frame_index, point) pairs — lets a
+    coach re-confirm the bowler's identity at additional points later
+    in the clip if tracking is lost for a long stretch (e.g. a bystander
+    standing between the bowler and camera for several seconds). Each
+    seed only has to survive the gap to its nearest neighboring seed
+    instead of one seed carrying the whole video — see
+    main._walk_from_seed for how zones are split between seeds.
     """
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "landmarks.csv")
@@ -1168,7 +1177,8 @@ def run_complete_bowling_analysis(video_path: str,
     # STAGE 1 — LANDMARK EXTRACTION
     extraction = extract_video_landmarks(video_path, csv_path,
                                           seed_point=seed_point,
-                                          seed_frame_index=seed_frame_index)
+                                          seed_frame_index=seed_frame_index,
+                                          extra_seeds=extra_seeds)
 
     if extraction["status"] == "error":
         return {

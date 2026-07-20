@@ -621,15 +621,54 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
     return st.session_state.get(point_key), st.session_state.get(frame_key, 0)
 
 
+def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
+    """
+    Optional second (or more) confirmation point, later in the same
+    clip. Exists for exactly the failure mode found on real footage:
+    tracking can lose the bowler for several seconds (occlusion,
+    motion blur, or he's simply too small/distant for MediaPipe to
+    detect at all during part of the clip) and the single seed has
+    nothing to re-anchor to for the rest of the video. Re-confirming
+    identity here lets the tracker split the clip into zones, each
+    only needing to survive the gap to its NEAREST seed instead of one
+    seed carrying the whole thing — see main._walk_from_seed.
+
+    Returns a list of (frame_index, point) tuples for every extra
+    confirmation the coach has added, or None if none were added.
+    """
+    if uploaded_file is None:
+        return None
+    with st.expander(f"➕ Tracking lost partway through — add a second confirmation ({label})", expanded=False):
+        st.caption(
+            "Only needed if the skeleton drifts onto someone else partway through "
+            "this clip (e.g. a coach or another player standing nearby). Scrub to "
+            "a later frame where the bowler is clearly visible again and click him "
+            "— same as above, just a second time."
+        )
+        point, frame_idx = render_bowler_seed_ui(uploaded_file, f"{key_prefix}_extra", f"{label} — 2nd confirmation")
+        if point is not None:
+            return [(frame_idx, point)]
+    return None
+
+
 single_seed_point, single_seed_frame = (None, 0)
 side_seed_point, side_seed_frame = (None, 0)
 rear_seed_point, rear_seed_frame = (None, 0)
+single_extra_seeds = None
+side_extra_seeds = None
+rear_extra_seeds = None
 
 if camera_mode == "Single Camera":
     single_seed_point, single_seed_frame = render_bowler_seed_ui(uploaded_single, "single", "Bowling video")
+    if single_seed_point is not None:
+        single_extra_seeds = render_extra_seed_ui(uploaded_single, "single", "Bowling video")
 else:
     side_seed_point, side_seed_frame = render_bowler_seed_ui(uploaded_side, "side", "Side-on video")
     rear_seed_point, rear_seed_frame = render_bowler_seed_ui(uploaded_rear, "rear", "Rear-view video")
+    if side_seed_point is not None:
+        side_extra_seeds = render_extra_seed_ui(uploaded_side, "side", "Side-on video")
+    if rear_seed_point is not None:
+        rear_extra_seeds = render_extra_seed_ui(uploaded_rear, "rear", "Rear-view video")
 
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
                  and single_seed_point is not None and bowling_arm_selected)
@@ -685,12 +724,14 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     video_path, rear_path, bowling_arm_override=bowling_arm_override,
                     side_seed_point=side_seed_point, side_seed_frame_index=side_seed_frame,
                     rear_seed_point=rear_seed_point, rear_seed_frame_index=rear_seed_frame,
+                    side_extra_seeds=side_extra_seeds, rear_extra_seeds=rear_extra_seeds,
                 )
                 active_camera_mode = "Dual Camera"
             else:
                 result_payload = run_complete_bowling_analysis(
                     video_path, bowling_arm_override=bowling_arm_override,
                     seed_point=single_seed_point, seed_frame_index=single_seed_frame,
+                    extra_seeds=single_extra_seeds,
                 )
                 active_camera_mode = "Single Camera"
 

@@ -52,9 +52,84 @@ def _centroid_xy(landmarks_list):
     return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
 
 
+def _walk_from_seed(seed_idx, seed_xy, frame_candidates, fps, lo_bound, hi_bound):
+    """
+    Anchors at seed_idx (matching seed_xy within SEED_MATCH_TOLERANCE),
+    then walks forward to hi_bound and backward to lo_bound using
+    distance-growth capped at MAX_DIST_CAP, with a hard MAX_GAP_FRAMES
+    ceiling on how long a gap can run before giving up on that
+    direction (see extract_video_landmarks for why this ceiling exists
+    — a long-unconfirmed anchor position stops being a trustworthy
+    reference for "who's nearby").
+
+    Only touches frames within [lo_bound, hi_bound] — this is what lets
+    multiple seeds coexist: each one only walks within its own assigned
+    zone of the clip (split at the midpoint to its neighboring seeds),
+    so seeds never fight over which one "wins" a given frame.
+
+    Returns {frame_idx: chosen_landmarks_or_None} for every frame in
+    [lo_bound, hi_bound].
+    """
+    SEED_MATCH_TOLERANCE = 0.2
+    MAX_DIST_PER_SECOND = 0.6
+    MAX_DIST_CAP = 0.25
+    MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
+
+    def pick_closest(cands, anchor_xy, max_dist):
+        best, best_dist = None, None
+        for cand in cands:
+            cx, cy = _centroid_xy(cand)
+            dist = ((cx - anchor_xy[0]) ** 2 + (cy - anchor_xy[1]) ** 2) ** 0.5
+            if best_dist is None or dist < best_dist:
+                best, best_dist = cand, dist
+        if best is None or best_dist > max_dist:
+            return None
+        return best
+
+    result = {}
+    chosen = pick_closest(frame_candidates[seed_idx], seed_xy, SEED_MATCH_TOLERANCE) if frame_candidates[seed_idx] else None
+    result[seed_idx] = chosen
+    seed_anchor = _centroid_xy(chosen) if chosen is not None else seed_xy
+
+    anchor = seed_anchor
+    frames_since_confirmed = 1
+    for i in range(seed_idx + 1, hi_bound + 1):
+        if frames_since_confirmed > MAX_GAP_FRAMES:
+            result[i] = None
+            frames_since_confirmed += 1
+            continue
+        max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
+        chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
+        result[i] = chosen
+        if chosen is not None:
+            anchor = _centroid_xy(chosen)
+            frames_since_confirmed = 1
+        else:
+            frames_since_confirmed += 1
+
+    anchor = seed_anchor
+    frames_since_confirmed = 1
+    for i in range(seed_idx - 1, lo_bound - 1, -1):
+        if frames_since_confirmed > MAX_GAP_FRAMES:
+            result[i] = None
+            frames_since_confirmed += 1
+            continue
+        max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
+        chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
+        result[i] = chosen
+        if chosen is not None:
+            anchor = _centroid_xy(chosen)
+            frames_since_confirmed = 1
+        else:
+            frames_since_confirmed += 1
+
+    return result
+
+
 def extract_video_landmarks(video_path: str, output_csv_path: str,
                              seed_point: tuple = None,
-                             seed_frame_index: int = 0) -> dict:
+                             seed_frame_index: int = 0,
+                             extra_seeds: list = None) -> dict:
     """
     Headless Perception Layer. Processes every frame sequentially without
     destructive cropping to ensure zero data loss.
@@ -190,98 +265,40 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         # standing close to the camera) becomes "the closest available
         # candidate" by default whenever the real tracked person isn't
         # detected that frame, and tracking silently snaps onto them.
-        # Verified on real footage: without this cap, seeded tracking
-        # still drifted onto a coach who was the sole detected person in
-        # most frames while the actual (smaller, more distant) bowler was
-        # only sporadically detected. The cap scales with how long it's
-        # been since a real match, since the true person could genuinely
-        # have moved further by the time detection resumes after a gap.
-        MAX_DIST_PER_SECOND = 0.6
+        # See _walk_from_seed for the distance/gap caps that guard
+        # against this — verified on real footage this still isn't
+        # airtight for a VERY long tracking loss (several seconds) in a
+        # scene with a confidently-detected bystander nearby, which is
+        # exactly what MULTIPLE seeds (below) are for: instead of asking
+        # one heuristic to survive an arbitrarily long gap, let the coach
+        # re-confirm identity at a second point later in the clip, and
+        # each seed only has to survive the (much shorter) gap to its
+        # nearest neighboring seed.
+        #
+        # MULTI-SEED: seed_point/seed_frame_index is always the primary
+        # seed; extra_seeds (optional) adds more (point, frame_index)
+        # anchors anywhere else in the clip. Seeds are sorted by frame
+        # index and each one only walks within its own zone — split at
+        # the midpoint to its neighboring seeds — so seeds never
+        # conflict over who "owns" a given frame, and a single seed
+        # never has to carry the whole clip if the coach has re-confirmed
+        # identity partway through.
+        seeds = [(seed_frame_index, seed_point)]
+        if extra_seeds:
+            seeds.extend(extra_seeds)
+        seeds = sorted(
+            ((max(0, min(int(idx), total_frames - 1)), pt) for idx, pt in seeds),
+            key=lambda s: s[0]
+        )
 
-        def pick_closest(cands, anchor_xy, max_dist):
-            best, best_dist = None, None
-            for cand in cands:
-                cx, cy = _centroid_xy(cand)
-                dist = ((cx - anchor_xy[0]) ** 2 + (cy - anchor_xy[1]) ** 2) ** 0.5
-                if best_dist is None or dist < best_dist:
-                    best, best_dist = cand, dist
-            if best is None or best_dist > max_dist:
-                return None
-            return best
-
-        seed_idx = max(0, min(seed_frame_index, total_frames - 1))
-        seed_xy = (seed_point[0] / frame_width, seed_point[1] / frame_height)
         seeded_chosen = [None] * total_frames
-
-        # The seed match needs its own, more generous tolerance — it's
-        # answering "which PERSON is this" (a click anywhere on their
-        # body vs. a computed torso centroid, which can genuinely differ
-        # by a lot: a head-click vs. a centroid averaging head+shoulders+
-        # hips), not "did this person move plausibly since last frame"
-        # like the tighter per-frame tolerance below. Still much smaller
-        # than the distance between two DIFFERENT people in a real scene.
-        SEED_MATCH_TOLERANCE = 0.2
-        chosen = pick_closest(frame_candidates[seed_idx], seed_xy, SEED_MATCH_TOLERANCE)
-        seeded_chosen[seed_idx] = chosen
-        seed_anchor = _centroid_xy(chosen) if chosen is not None else seed_xy
-
-        # Tolerance grows with elapsed gap (a real person could genuinely
-        # move further before detection resumes), but is capped rather
-        # than left to grow indefinitely.
-        MAX_DIST_CAP = 0.25
-
-        # BUG FIX: the comment above (and the one that used to be here)
-        # described "after roughly half a second with no confirmed match,
-        # a re-match is refused entirely" — but the code only ever capped
-        # the DISTANCE tolerance, never the GAP LENGTH itself, so it kept
-        # trying to reacquire no matter how long the gap ran. Verified on
-        # real footage: a 116-frame (~3.9s) gap with zero confirmed
-        # matches, then reacquisition locked onto a coach standing near
-        # the pitch instead of the actual bowler — the coach happened to
-        # be a confidently-detected, roughly-stationary person within
-        # reach once the capped tolerance had been sitting at its ceiling
-        # for that long. A real bowler could have moved a long way in
-        # 3.9 seconds; that's exactly why a stale anchor position is no
-        # longer a trustworthy reference for "who's nearby" after this
-        # long — the failure mode isn't a wrong DISTANCE calculation, it's
-        # that distance-from-a-3.9-second-old-position stops meaning
-        # anything. Past this ceiling, stop attempting to reacquire by
-        # position at all; those frames — and everything after, until a
-        # fresh seed — stay honestly untracked (N/A downstream) rather
-        # than confidently locking onto whoever's closest by chance.
-        MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
-
-        anchor = seed_anchor
-        frames_since_confirmed = 1
-        for i in range(seed_idx + 1, total_frames):
-            if frames_since_confirmed > MAX_GAP_FRAMES:
-                seeded_chosen[i] = None
-                frames_since_confirmed += 1
-                continue
-            max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
-            chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
-            seeded_chosen[i] = chosen
-            if chosen is not None:
-                anchor = _centroid_xy(chosen)
-                frames_since_confirmed = 1
-            else:
-                frames_since_confirmed += 1
-
-        anchor = seed_anchor
-        frames_since_confirmed = 1
-        for i in range(seed_idx - 1, -1, -1):
-            if frames_since_confirmed > MAX_GAP_FRAMES:
-                seeded_chosen[i] = None
-                frames_since_confirmed += 1
-                continue
-            max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
-            chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
-            seeded_chosen[i] = chosen
-            if chosen is not None:
-                anchor = _centroid_xy(chosen)
-                frames_since_confirmed = 1
-            else:
-                frames_since_confirmed += 1
+        for k, (s_idx, s_pt) in enumerate(seeds):
+            lo_bound = 0 if k == 0 else (seeds[k - 1][0] + s_idx) // 2 + 1
+            hi_bound = (total_frames - 1) if k == len(seeds) - 1 else (s_idx + seeds[k + 1][0]) // 2
+            s_xy = (s_pt[0] / frame_width, s_pt[1] / frame_height)
+            walk_result = _walk_from_seed(s_idx, s_xy, frame_candidates, fps, lo_bound, hi_bound)
+            for i, v in walk_result.items():
+                seeded_chosen[i] = v
 
         # MERGE: prefer single-pose's landmarks (better per-frame
         # completeness/quality) on any frame where they're validated by
