@@ -471,16 +471,31 @@ camera_mode = st.sidebar.radio(
 )
 
 st.sidebar.divider()
+# FIX: was defaulting to "Auto-detect (recommended)" — proven unreliable
+# twice on real footage in this project (most recently: silently locked
+# onto the WRONG arm for a left-arm bowler, producing a release-frame
+# detection deep in follow-through with a knee angle that matched exactly
+# what a coach saw on a garbage result). Auto-detect is kept as an
+# option for convenience, but it no longer pre-selects itself or claims
+# to be "recommended" — a coach must now actively choose Left or Right,
+# which is the one setting proven to make this pipeline reliable.
 bowling_arm_choice = st.sidebar.selectbox(
-    "🎯 Bowling Arm",
-    ["Auto-detect (recommended)", "Right-arm", "Left-arm"],
-    help="If auto-detection picks the wrong arm on a specific video, override it here before uploading."
+    "🎯 Bowling Arm (required)",
+    ["-- Select bowling arm --", "Right-arm", "Left-arm", "Auto-detect (unreliable)"],
+    help="Auto-detect has been wrong on real footage — always set this manually for a trustworthy result."
 )
 bowling_arm_override = {
-    "Auto-detect (recommended)": None,
+    "-- Select bowling arm --": None,
+    "Auto-detect (unreliable)": None,
     "Right-arm": "right",
     "Left-arm": "left",
 }[bowling_arm_choice]
+bowling_arm_selected = bowling_arm_choice in ("Right-arm", "Left-arm")
+if bowling_arm_choice == "Auto-detect (unreliable)":
+    st.sidebar.warning(
+        "⚠️ Auto-detect has produced wrong-arm results on real footage. "
+        "Set Right-arm or Left-arm explicitly for a result you can trust."
+    )
 st.sidebar.divider()
 st.sidebar.header("📁 Upload Video")
 uploaded_side = None
@@ -617,15 +632,18 @@ else:
     rear_seed_point, rear_seed_frame = render_bowler_seed_ui(uploaded_rear, "rear", "Rear-view video")
 
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
-                 and single_seed_point is not None)
+                 and single_seed_point is not None and bowling_arm_selected)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None
-              and side_seed_point is not None and rear_seed_point is not None)
+              and side_seed_point is not None and rear_seed_point is not None
+              and bowling_arm_selected)
 
 if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is None:
     st.sidebar.warning("👆 Click the bowler in the frame above to enable analysis.")
 elif camera_mode != "Single Camera" and uploaded_side is not None and uploaded_rear is not None and (side_seed_point is None or rear_seed_point is None):
     st.sidebar.warning("👆 Click the bowler in both frames above to enable analysis.")
+elif not bowling_arm_selected and (uploaded_single is not None or uploaded_side is not None):
+    st.sidebar.warning("👆 Select Right-arm or Left-arm above to enable analysis — auto-detect is not reliable enough to run on by default.")
 
 import usage_limits
 _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
