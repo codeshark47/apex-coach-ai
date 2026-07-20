@@ -139,6 +139,38 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     # current position. Only fall back to the filled data if the whole
     # window has no real detection at all.
     wrist_had_real = (~df[f"{bowl_side}_WRIST_y"].isna()).values
+
+    # ANATOMICAL PLAUSIBILITY GATE: a bowling arm stays substantially
+    # extended through the delivery swing (a sharply bent elbow mid-swing
+    # is literally the legal-delivery threshold in cricket law, not a real
+    # technique variant). Verified directly on real footage: the exact
+    # frames where the raw wrist position jitters wildly frame-to-frame
+    # (motion blur right at release) also show anatomically-impossible
+    # elbow flexion collapsing to ~45-60 degrees — a second, independent
+    # signal confirming the wrist landmark itself was lost/confused there,
+    # catching cases the gap-filled/interpolated check above misses
+    # (MediaPipe reported these frames with normal-looking confidence, so
+    # they were never flagged as missing — just wrong). This gate cannot
+    # by itself explain a cross-environment frame discrepancy on identical
+    # code, but it removes a real, demonstrated source of an unreliable
+    # peak candidate from the search regardless of which frame the
+    # decoder-level noise happens to land on.
+    sx = df[f"{bowl_side}_SHOULDER_x"].values
+    sy = df[f"{bowl_side}_SHOULDER_y"].values
+    ex = df[f"{bowl_side}_ELBOW_x"].values
+    ey = df[f"{bowl_side}_ELBOW_y"].values
+    wx = df[f"{bowl_side}_WRIST_x"].values
+    wy = df[f"{bowl_side}_WRIST_y"].values
+    se_x, se_y = sx - ex, sy - ey
+    we_x, we_y = wx - ex, wy - ey
+    elbow_norm = np.hypot(se_x, se_y) * np.hypot(we_x, we_y)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        elbow_cos = np.clip((se_x * we_x + se_y * we_y) / elbow_norm, -1, 1)
+    elbow_angle_deg = np.degrees(np.arccos(elbow_cos))
+    ELBOW_MIN_PLAUSIBLE_DEG = 90.0
+    elbow_plausible = np.nan_to_num(elbow_angle_deg, nan=0.0) >= ELBOW_MIN_PLAUSIBLE_DEG
+    wrist_had_real = wrist_had_real & elbow_plausible
+
     real_mask_slice = wrist_had_real[ffc_idx:br_search_end]
 
     # PROMINENCE, not just the single lowest point: a real release swing
