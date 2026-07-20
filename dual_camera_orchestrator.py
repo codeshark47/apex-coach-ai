@@ -117,7 +117,9 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         "time_indices": {
             "back_foot_contact_frame": int(side_events["BFC"]),
             "front_foot_contact_frame": int(side_events["FFC"]),
-            "ball_release_frame": int(side_events["BR"])
+            "ball_release_frame": int(side_events["BR"]),
+            "ball_release_confidence": side_events.get("BR_confidence", "high"),
+            "ball_release_plausible_fraction": side_events.get("BR_plausible_fraction", 1.0),
         },
         "biomechanical_metrics": {
             "trunk_lean": {
