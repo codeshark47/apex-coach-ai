@@ -196,7 +196,8 @@ def _corroborated_peak_speed_px_s(positions: dict, fps: float) -> Optional[float
 def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
                                frame_width: int, frame_height: int,
                                meters_per_pixel: Optional[float],
-                               video_path: Optional[str] = None) -> dict:
+                               video_path: Optional[str] = None,
+                               bowling_arm_override: Optional[str] = None) -> dict:
     """
     Returns:
       {"status": "not_calibrated"}   -- if meters_per_pixel is None
@@ -217,6 +218,12 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
     the already-smoothed df — see _extract_raw_wrist_window for why this
     matters. Falls back to the smoothed df if not given or if raw
     re-extraction fails for any reason, so this stays backward compatible.
+
+    bowling_arm_override: 'right' or 'left' — the arm already resolved by
+    orchestrator.py (manual selection or its own auto-detect). When given,
+    this is used directly instead of re-detecting from wrist speed, so the
+    speed number can never disagree with the arm the rest of the report
+    (event timing, release height, video overlay) is built on.
     """
     if meters_per_pixel is None:
         return {
@@ -232,7 +239,12 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
         if br_idx <= 0 or br_idx >= len(df):
             return {"status": "error", "message": "BR frame out of range."}
 
-        bowling_arm = _select_bowling_arm(df, br_idx, fps, frame_width, frame_height)
+        if bowling_arm_override in ("left", "right"):
+            bowling_arm = "RIGHT_WRIST" if bowling_arm_override == "right" else "LEFT_WRIST"
+            if f"{bowling_arm}_x" not in df.columns:
+                return {"status": "error", "message": f"No {bowling_arm} landmark data available."}
+        else:
+            bowling_arm = _select_bowling_arm(df, br_idx, fps, frame_width, frame_height)
         window = max(3, int(fps * 0.08))  # ~80ms either side of release
 
         peak_px_per_s = None

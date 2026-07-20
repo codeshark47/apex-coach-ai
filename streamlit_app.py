@@ -768,7 +768,8 @@ if st.session_state.get("pending_result_payload") is not None:
                 mpp = st.session_state.calibration.meters_per_pixel if st.session_state.calibration else None
                 speed_result = se.compute_release_arm_speed(
                     landmarks_df, events, fps, cap_w, cap_h, meters_per_pixel=mpp,
-                    video_path=video_path
+                    video_path=video_path,
+                    bowling_arm_override=metrics.get("bowling_arm_detected")
                 )
                 height_absolute_result = se.compute_release_height_absolute(
                     metrics.get("release_height", {}).get("debug_raw"), cap_h, meters_per_pixel=mpp
@@ -938,9 +939,10 @@ if st.session_state.get("pending_result_payload") is not None:
                 def ui_val(val):
                     return str(round(float(val), 4)) if val is not None else "N/A"
 
-                detected_arm = result_payload.get("bowling_arm_detected")
+                detected_arm = metrics.get("bowling_arm_detected")
                 if detected_arm:
-                    st.caption(f"🎯 Bowling arm auto-detected: **{detected_arm.title()}-arm**")
+                    arm_source = "manually selected" if bowling_arm_override else "auto-detected"
+                    st.caption(f"🎯 Bowling arm ({arm_source}): **{detected_arm.title()}-arm**")
 
                 m1, m2 = st.columns(2)
                 m1.metric("Lead Knee Bracing Angle", ui_deg(knee_deg),
