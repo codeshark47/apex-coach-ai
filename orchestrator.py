@@ -564,6 +564,20 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     BONE_CORE = (245, 245, 245)
     JOINT_OUTLINE = (255, 255, 255)
     JOINT_CORE = (235, 195, 50)
+
+    # RESOLUTION SCALE: every fixed pixel size below (joint radius, bone
+    # width) was tuned against a 1080x1920 test clip. Verified directly on
+    # a real, smaller 848x478 clip the founder submitted: those same fixed
+    # sizes made the joints so large relative to a more distant, smaller
+    # on-screen bowler that they physically overlapped into one solid
+    # blob, hiding his whole body. Scale every size by frame dimensions
+    # relative to that original tuning resolution instead of using it
+    # as-is, clamped so it neither vanishes on tiny clips nor balloons on
+    # huge ones.
+    render_scale = max(0.35, min(1.5, min(width, height) / 1080.0))
+
+    def _rs(px):
+        return max(1, int(round(px * render_scale)))
     # Kept for the release-badge accent color elsewhere (unchanged meaning,
     # just no longer used to color-code limbs in the skeleton itself).
     LEG_LINE_GLOW = BONE_SHADOW
@@ -710,8 +724,15 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     # ZONE_BAR sits below it — a static phase legend inspired directly by
     # the commercial reference sample, which has no live chart at all but
     # does have this clean bottom orientation strip.
-    ZONE_BAR_H = max(46, int(height * 0.045))
-    PANEL_H = max(120, int(height * 0.16))
+    # Floors LOWERED from 46/120 to 30/90: those were tuned as "don't go
+    # unreadably small" minimums against a 1920-tall test clip, but on a
+    # real, shorter 478px-tall clip they backfired — forcing the bottom
+    # overlay to ~35% of frame height instead of the intended ~20%,
+    # because the fixed floor overrode the percentage entirely. Still a
+    # legibility floor, just one that doesn't dominate genuinely small
+    # footage.
+    ZONE_BAR_H = max(30, int(height * 0.045))
+    PANEL_H = max(90, int(height * 0.16))
     ZONE_BAR_TOP = height - ZONE_BAR_H
     PANEL_TOP = ZONE_BAR_TOP - PANEL_H
     MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 55, 20, 24, 20
@@ -784,8 +805,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     yB = int(float(row[f"{partB}_y"]) * height)
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, 6, cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, 3, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs(6), cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs(3), cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -808,8 +829,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_CORE, 3, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), 9, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), 6, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _rs(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _rs(6), JOINT_CORE, -1, cv2.LINE_AA)
             except Exception:
                 pass
 
@@ -820,8 +841,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 9, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), 6, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs(6), JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -884,7 +905,15 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         zone_bounds = [0, events.get("BFC", 0), events.get("FFC", 0), events.get("BR", 0),
                        max(total_frames - 1, 1)]
         bar_x0, bar_x1 = MARGIN_L + 10, width - MARGIN_R - 10
-        bar_y = ZONE_BAR_TOP + ZONE_BAR_H // 2 + 6
+        # FIX: was ZONE_BAR_TOP + ZONE_BAR_H//2 + 6, then labels drawn
+        # BELOW that at +th+10 — on a shorter clip (lower ZONE_BAR_H,
+        # see the floor fix above) that pushed label text past the
+        # bottom edge of the frame entirely, clipping it off. Anchor the
+        # tick line near the TOP of the bar and the label baseline to a
+        # fixed offset from the frame's own bottom edge instead, which is
+        # correct by construction regardless of ZONE_BAR_H.
+        bar_y = ZONE_BAR_TOP + max(10, int(ZONE_BAR_H * 0.32))
+        label_baseline_y = height - 8
         # 5 boundary x-positions (matching the 5 zone_bounds frame indices)
         # for the marker to interpolate across 4 segments; labels are drawn
         # at each segment's MIDPOINT, since each label names a span (e.g.
@@ -904,12 +933,12 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         for i, (tx, label) in enumerate(zip(label_xs, zone_labels)):
             active = (i == phase_idx)
             tick_color = JOINT_CORE if active else (130, 130, 135)
-            cv2.circle(frame, (tx, bar_y), 5 if active else 3, tick_color, -1, cv2.LINE_AA)
-            font_scale = 0.42 if active else 0.38
+            cv2.circle(frame, (tx, bar_y), _rs(5) if active else _rs(3), tick_color, -1, cv2.LINE_AA)
+            font_scale = (0.42 if active else 0.38) * render_scale
             text_color = (245, 245, 245) if active else (150, 150, 150)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
             tx_centered = max(2, min(width - tw - 2, tx - tw // 2))
-            cv2.putText(frame, label, (tx_centered, bar_y + th + 10),
+            cv2.putText(frame, label, (tx_centered, label_baseline_y),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 1, cv2.LINE_AA)
 
         # Live marker: piecewise-linear position within the current phase's
@@ -919,8 +948,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         seg_frac = 0.0 if seg_hi <= seg_lo else (f_idx - seg_lo) / (seg_hi - seg_lo)
         seg_frac = max(0.0, min(1.0, seg_frac))
         marker_x = int(boundary_xs[phase_idx] + seg_frac * (boundary_xs[phase_idx + 1] - boundary_xs[phase_idx]))
-        cv2.circle(frame, (marker_x, bar_y), 7, JOINT_OUTLINE, -1, cv2.LINE_AA)
-        cv2.circle(frame, (marker_x, bar_y), 5, JOINT_CORE, -1, cv2.LINE_AA)
+        cv2.circle(frame, (marker_x, bar_y), _rs(7), JOINT_OUTLINE, -1, cv2.LINE_AA)
+        cv2.circle(frame, (marker_x, bar_y), _rs(5), JOINT_CORE, -1, cv2.LINE_AA)
         # Was plain text drawn straight onto the video with no background —
         # low contrast and hard to read against a bright sky, reading more
         # like a debug label than a broadcast lower-third. Same rounded
@@ -1012,8 +1041,19 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                         label = "Ball Release Height"
                         (label_w, label_h), _ = cv2.getTextSize(
                             label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-                        label_x = min(max(lx + 10, 0), width - label_w - 10)
-                        label_y = min(max(ly_wrist + (ly_ground - ly_wrist) // 2, label_h + 6), height - 6)
+                        # FIX: was centered on the line's vertical midpoint,
+                        # which sits right on the torso — verified on real
+                        # footage this landed the label directly over the
+                        # bowler's body. Place it beside the line at wrist
+                        # height instead (right if there's room, else left),
+                        # same "avoid the subject" logic already used for
+                        # the phase badge above.
+                        label_x_right = lx + 14
+                        if label_x_right + label_w + 10 < width:
+                            label_x = label_x_right
+                        else:
+                            label_x = max(6, lx - label_w - 14)
+                        label_y = min(max(ly_wrist + label_h // 2, label_h + 6), height - 6)
                         _draw_panel(frame, (label_x - 6, label_y - label_h - 6),
                                     (label_x + label_w + 6, label_y + 6),
                                     radius=6, shadow_offset=3)
