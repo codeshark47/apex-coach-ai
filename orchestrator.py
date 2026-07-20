@@ -165,7 +165,32 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
                 running_baseline[i] = current_max
         prominence = running_baseline - real_slice
         if np.any(~np.isnan(prominence)):
-            br_idx = ffc_idx + int(np.nanargmax(prominence))
+            peak_relative_idx = int(np.nanargmax(prominence))
+            # ONSET, not the deepest point of the swing: verified on real
+            # footage (a frame showing the actual ball still at the
+            # fingertips) that true release happens when the arm FIRST
+            # reaches near-full extension — the wrist continues rising
+            # slightly further afterward under its own follow-through
+            # momentum even though the ball has already left the hand, so
+            # the geometric deepest point can land several frames after
+            # the real release. Take the EARLIEST frame (proportional
+            # threshold, so it scales with each delivery's own swing
+            # size) that already reached most of the peak's own
+            # prominence — scanning forward from the window start rather
+            # than walking backward from the peak, since the swing can
+            # briefly dip back down mid-rise (a real "double-dip" in the
+            # wrist trajectory, not tracking noise) before its final
+            # deepest point, which would stop a backward walk short of
+            # the true, earlier onset.
+            peak_prominence = prominence[peak_relative_idx]
+            ONSET_FRACTION = 0.85
+            threshold = ONSET_FRACTION * peak_prominence
+            onset_idx = peak_relative_idx
+            for i in range(0, peak_relative_idx + 1):
+                if not np.isnan(prominence[i]) and prominence[i] >= threshold:
+                    onset_idx = i
+                    break
+            br_idx = ffc_idx + onset_idx
         else:
             br_idx = ffc_idx + int(np.argmin(br_slice))
     elif len(br_slice) > 0:
