@@ -343,11 +343,16 @@ st.sidebar.divider()
 # ---------------------------------------------------------------
 # CAMERA CALIBRATION — real two-point calibration, no assumed constants
 # ---------------------------------------------------------------
-st.sidebar.header("📏 Speed Calibration")
+# Rendered in the MAIN content area (not the sidebar), same fix and same
+# reason as the bowler-click picker: the sidebar is a narrow, fixed-width
+# column on desktop browsers, which made it hard to click precisely on
+# the top/bottom of a stump. The main area uses the full page width
+# (layout="wide" is set above).
+st.header("📏 Speed Calibration")
 if "calibration" not in st.session_state:
     st.session_state.calibration = None
 
-with st.sidebar.expander("Calibrate camera for speed (once per setup)", expanded=False):
+with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
     st.caption(
         "This is a ONE-TIME setup per fixed camera position — not per delivery. "
         "Upload any clip from that camera spot (can be a dedicated short clip of "
@@ -401,7 +406,10 @@ with st.sidebar.expander("Calibrate camera for speed (once per setup)", expanded
             else:
                 st.caption("✅ Both points selected — see below.")
 
-            click = streamlit_image_coordinates(display_img, key="calib_click_widget")
+            click = streamlit_image_coordinates(
+                display_img, key="calib_click_widget",
+                use_column_width="always"
+            )
 
             if click is not None and len(st.session_state.calib_points) < 2:
                 # The component may report coords relative to its rendered size,
@@ -450,8 +458,6 @@ with st.sidebar.expander("Calibrate camera for speed (once per setup)", expanded
                 f"{c.meters_per_pixel:.6f} m/px")
         if st.button("Clear calibration"):
             st.session_state.calibration = None
-
-st.sidebar.divider()
 
 st.sidebar.header("🎥 Camera Mode")
 camera_mode = st.sidebar.radio(
