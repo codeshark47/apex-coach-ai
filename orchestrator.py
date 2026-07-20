@@ -553,12 +553,23 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         method="linear", limit=draw_gap_fill_limit, limit_direction="both", limit_area="inside"
     )
 
-    LEG_LINE_GLOW   = (20, 100, 20)
-    LEG_LINE_CORE   = (60, 225, 90)
-    UPPER_LINE_GLOW = (70, 70, 70)
-    UPPER_LINE_CORE = (235, 235, 235)
-    JOINT_GLOW = (10, 140, 210)
-    JOINT_CORE = (0, 210, 255)
+    # UNIFIED BROADCAST PALETTE: one clean look across the whole skeleton
+    # (was: green legs, white upper body, orange joints — a color-by-limb
+    # scheme with no real informational purpose that read as a debug
+    # overlay rather than a broadcast graphic). Matches a commercial
+    # reference sample: bold white bones with a soft dark contact-shadow
+    # for legibility on any background, and cyan joints with a white
+    # outline ring so they read as clean dots rather than tiny smudges.
+    BONE_SHADOW = (25, 25, 25)
+    BONE_CORE = (245, 245, 245)
+    JOINT_OUTLINE = (255, 255, 255)
+    JOINT_CORE = (235, 195, 50)
+    # Kept for the release-badge accent color elsewhere (unchanged meaning,
+    # just no longer used to color-code limbs in the skeleton itself).
+    LEG_LINE_GLOW = BONE_SHADOW
+    LEG_LINE_CORE = BONE_CORE
+    UPPER_LINE_GLOW = BONE_SHADOW
+    UPPER_LINE_CORE = BONE_CORE
 
     LEG_CONNECTIONS = {
         ("LEFT_HIP", "LEFT_KNEE"), ("LEFT_KNEE", "LEFT_ANKLE"),
@@ -692,9 +703,18 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
     ANGLE_MIN, ANGLE_MAX = 0.0, 180.0
     ELITE_MIN = 165.0
-    PANEL_H = max(190, int(height * 0.38))
-    PANEL_TOP = height - PANEL_H
-    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 65, 20, 34, 26
+    # SHRUNK from 38% of frame height to a slim ~16% strip — the old chart
+    # dominated a third of the video, which read as a dashboard bolted onto
+    # footage rather than a broadcast graphic. The data itself (live knee
+    # angle) stays, just far less visually loud. A separate, even slimmer
+    # ZONE_BAR sits below it — a static phase legend inspired directly by
+    # the commercial reference sample, which has no live chart at all but
+    # does have this clean bottom orientation strip.
+    ZONE_BAR_H = max(46, int(height * 0.045))
+    PANEL_H = max(120, int(height * 0.16))
+    ZONE_BAR_TOP = height - ZONE_BAR_H
+    PANEL_TOP = ZONE_BAR_TOP - PANEL_H
+    MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 55, 20, 24, 20
 
     def x_to_px(fidx):
         span = max(total_frames - 1, 1)
@@ -706,20 +726,19 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         usable = PANEL_H - MARGIN_T - MARGIN_B
         return MARGIN_T + int((1 - frac) * usable)
 
-    chart_base = np.full((PANEL_H, width, 3), (18, 18, 18), dtype=np.uint8)
+    chart_base = np.full((PANEL_H, width, 3), (16, 16, 18), dtype=np.uint8)
     elite_y = y_to_px(ELITE_MIN)
     cv2.rectangle(chart_base, (MARGIN_L, MARGIN_T), (width - MARGIN_R, elite_y),
-                  (30, 70, 30), -1)
-    # The green band was an unexplained color with no label — a coach
-    # watching has no way to know it marks the elite/braced reference
-    # range without this.
-    cv2.putText(chart_base, f"ELITE ({ELITE_MIN:.0f}+ deg)", (MARGIN_L + 8, MARGIN_T + 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 220, 140), 1, cv2.LINE_AA)
-    for g in range(0, 181, 45):
+                  (28, 55, 28), -1)
+    cv2.putText(chart_base, f"ELITE {ELITE_MIN:.0f}+", (MARGIN_L + 8, MARGIN_T + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 205, 130), 1, cv2.LINE_AA)
+    # Fewer gridlines (was every 45deg incl. labels at each) — a compact
+    # panel doesn't have room for a dense axis without feeling cramped.
+    for g in (0, 90, 180):
         gy = y_to_px(g)
-        cv2.line(chart_base, (MARGIN_L, gy), (width - MARGIN_R, gy), (55, 55, 55), 1, cv2.LINE_AA)
-        cv2.putText(chart_base, f"{g}", (8, gy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (170, 170, 170), 1, cv2.LINE_AA)
+        cv2.line(chart_base, (MARGIN_L, gy), (width - MARGIN_R, gy), (48, 48, 50), 1, cv2.LINE_AA)
+        cv2.putText(chart_base, f"{g}", (6, gy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (150, 150, 150), 1, cv2.LINE_AA)
     prev_pt = None
     for fidx in range(total_frames):
         val = knee_arr[fidx] if fidx < len(knee_arr) else np.nan
@@ -728,10 +747,10 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             continue
         pt = (x_to_px(fidx), y_to_px(val))
         if prev_pt is not None:
-            cv2.line(chart_base, prev_pt, pt, (0, 210, 255), 2, cv2.LINE_AA)
+            cv2.line(chart_base, prev_pt, pt, JOINT_CORE, 2, cv2.LINE_AA)
         prev_pt = pt
-    cv2.putText(chart_base, "LEAD KNEE ANGLE", (MARGIN_L, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (235, 235, 235), 2, cv2.LINE_AA)
+    cv2.putText(chart_base, "LEAD KNEE ANGLE", (MARGIN_L, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (235, 235, 235), 1, cv2.LINE_AA)
 
     PHASE_BADGE_WINDOW = max(3, int(round(source_fps * 0.5)))
 
@@ -763,13 +782,10 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     yA = int(float(row[f"{partA}_y"]) * height)
                     xB = int(float(row[f"{partB}_x"]) * width)
                     yB = int(float(row[f"{partB}_y"]) * height)
-                    is_leg = (partA, partB) in LEG_CONNECTIONS or (partB, partA) in LEG_CONNECTIONS
-                    glow = LEG_LINE_GLOW if is_leg else UPPER_LINE_GLOW
-                    core = LEG_LINE_CORE if is_leg else UPPER_LINE_CORE
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), glow, 2, cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), core, 1, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, 6, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, 3, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -790,10 +806,10 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     sx1, sy1 = int(neck_x * width), int(neck_y * height)
                     sx2, sy2 = int(midhip_x * width), int(midhip_y * height)
                     if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
-                        cv2.line(frame, (sx1, sy1), (sx2, sy2), UPPER_LINE_GLOW, 2, cv2.LINE_AA)
-                        cv2.line(frame, (sx1, sy1), (sx2, sy2), UPPER_LINE_CORE, 1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), 3, JOINT_GLOW, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), 1, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
+                        cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_CORE, 3, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), 9, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), 6, JOINT_CORE, -1, cv2.LINE_AA)
             except Exception:
                 pass
 
@@ -804,8 +820,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), 3, JOINT_GLOW, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), 1, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 9, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), 6, JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -836,11 +852,11 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             px, py_rel = x_to_px(f_idx), y_to_px(cur_val)
             py = PANEL_TOP + py_rel
             cv2.line(frame, (px, PANEL_TOP + MARGIN_T), (px, PANEL_TOP + PANEL_H - MARGIN_B),
-                     (0, 210, 255), 1, cv2.LINE_AA)
-            cv2.circle(frame, (px, py), 6, (0, 140, 210), -1, cv2.LINE_AA)
-            cv2.circle(frame, (px, py), 3, (0, 230, 255), -1, cv2.LINE_AA)
-            cv2.putText(frame, f"{cur_val:.0f}deg", (width - 150, PANEL_TOP + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2, cv2.LINE_AA)
+                     JOINT_CORE, 1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 5, JOINT_OUTLINE, -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 3, JOINT_CORE, -1, cv2.LINE_AA)
+            cv2.putText(frame, f"{cur_val:.0f}deg", (width - 130, PANEL_TOP + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, JOINT_CORE, 2, cv2.LINE_AA)
 
         status_text = "RUN-UP"
         if f_idx >= events["BR"]:
@@ -849,6 +865,62 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             status_text = "BALL RELEASE"
         elif f_idx >= events["BFC"]:
             status_text = "DELIVERY STRIDE"
+
+        # ZONE PROGRESS BAR: a slim, mostly-static phase legend inspired by
+        # the commercial reference sample (which has no live chart at all,
+        # just this bottom strip) — but goes one step further by actually
+        # tracking a live position marker along it, since real BFC/FFC/BR
+        # boundaries are already known here and the reference apparently
+        # doesn't have that data to show. Tick x-positions are evenly
+        # spaced (matching the reference's even spacing, not scaled to each
+        # phase's actual duration) — this is a schematic orientation aid,
+        # not a second data chart.
+        zone_bg = frame[ZONE_BAR_TOP:ZONE_BAR_TOP + ZONE_BAR_H, 0:width].copy()
+        cv2.rectangle(zone_bg, (0, 0), (width, ZONE_BAR_H), (14, 14, 16), -1)
+        frame[ZONE_BAR_TOP:ZONE_BAR_TOP + ZONE_BAR_H, 0:width] = cv2.addWeighted(
+            frame[ZONE_BAR_TOP:ZONE_BAR_TOP + ZONE_BAR_H, 0:width], 0.25, zone_bg, 0.75, 0
+        )
+        zone_labels = ["RUN-UP", "STRIDE", "RELEASE", "FOLLOW-THROUGH"]
+        zone_bounds = [0, events.get("BFC", 0), events.get("FFC", 0), events.get("BR", 0),
+                       max(total_frames - 1, 1)]
+        bar_x0, bar_x1 = MARGIN_L + 10, width - MARGIN_R - 10
+        bar_y = ZONE_BAR_TOP + ZONE_BAR_H // 2 + 6
+        # 5 boundary x-positions (matching the 5 zone_bounds frame indices)
+        # for the marker to interpolate across 4 segments; labels are drawn
+        # at each segment's MIDPOINT, since each label names a span (e.g.
+        # "RELEASE" = the FFC-to-BR window), not a single instant.
+        boundary_xs = [int(bar_x0 + (bar_x1 - bar_x0) * i / 4) for i in range(5)]
+        label_xs = [(boundary_xs[i] + boundary_xs[i + 1]) // 2 for i in range(4)]
+        cv2.line(frame, (boundary_xs[0], bar_y), (boundary_xs[-1], bar_y), (90, 90, 95), 2, cv2.LINE_AA)
+
+        # Current phase index (0-3), used to highlight both the label and
+        # find where along its segment the live marker sits.
+        phase_idx = 0
+        for i in range(3):
+            if f_idx >= zone_bounds[i + 1]:
+                phase_idx = i + 1
+        phase_idx = min(phase_idx, 3)
+
+        for i, (tx, label) in enumerate(zip(label_xs, zone_labels)):
+            active = (i == phase_idx)
+            tick_color = JOINT_CORE if active else (130, 130, 135)
+            cv2.circle(frame, (tx, bar_y), 5 if active else 3, tick_color, -1, cv2.LINE_AA)
+            font_scale = 0.42 if active else 0.38
+            text_color = (245, 245, 245) if active else (150, 150, 150)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+            tx_centered = max(2, min(width - tw - 2, tx - tw // 2))
+            cv2.putText(frame, label, (tx_centered, bar_y + th + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 1, cv2.LINE_AA)
+
+        # Live marker: piecewise-linear position within the current phase's
+        # own frame span, mapped onto that segment's boundary-to-boundary
+        # x-range (not the label positions, which sit at segment midpoints).
+        seg_lo, seg_hi = zone_bounds[phase_idx], zone_bounds[phase_idx + 1]
+        seg_frac = 0.0 if seg_hi <= seg_lo else (f_idx - seg_lo) / (seg_hi - seg_lo)
+        seg_frac = max(0.0, min(1.0, seg_frac))
+        marker_x = int(boundary_xs[phase_idx] + seg_frac * (boundary_xs[phase_idx + 1] - boundary_xs[phase_idx]))
+        cv2.circle(frame, (marker_x, bar_y), 7, JOINT_OUTLINE, -1, cv2.LINE_AA)
+        cv2.circle(frame, (marker_x, bar_y), 5, JOINT_CORE, -1, cv2.LINE_AA)
         # Was plain text drawn straight onto the video with no background —
         # low contrast and hard to read against a bright sky, reading more
         # like a debug label than a broadcast lower-third. Same rounded
@@ -863,7 +935,7 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
         event_labels = [("BFC", "CONTACT", (60, 225, 90)),
                          ("FFC", "CONTACT", (60, 225, 90)),
-                         ("BR", "RELEASE", (0, 210, 255))]
+                         ("BR", "RELEASE", JOINT_CORE)]
         # Pick whichever event is actually CLOSEST to this frame, not just
         # the first one in the list that's within range. BFC/FFC/BR often
         # land within a few frames of each other for a real delivery, so
@@ -886,8 +958,11 @@ def generate_fail_safe_video(video_path: str, output_path: str,
             label, color, ev_frame = active_badge
             badge_val = knee_arr[ev_frame] if ev_frame < len(knee_arr) else np.nan
             is_release = (label == "RELEASE")
-            box_w = 340
-            box_h = 150 if is_release else 130
+            # SHRUNK from 340x150/130 — smaller, less boxy footprint, more
+            # in line with the reference sample's restraint, while keeping
+            # every number the old, larger version showed.
+            box_w = 290
+            box_h = 128 if is_release else 108
             # Default to the left (matches the old fixed behavior) unless
             # the bowler is known to be on the left half of frame, in
             # which case the badge moves to the right so it never sits
@@ -896,23 +971,23 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                 box_x = width - box_w - 20
             else:
                 box_x = 20
-            box_y = 50
+            box_y = 40
             _draw_panel(frame, (box_x, box_y), (box_x + box_w, box_y + box_h))
-            cv2.putText(frame, label, (box_x + 16, box_y + 42),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3, cv2.LINE_AA)
-            cv2.putText(frame, "KNEE", (box_x + 16, box_y + 78),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (210, 210, 210), 2, cv2.LINE_AA)
+            cv2.putText(frame, label, (box_x + 14, box_y + 34),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+            cv2.putText(frame, "KNEE", (box_x + 14, box_y + 64),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
             if not np.isnan(badge_val):
-                cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + 100, box_y + 88),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3, cv2.LINE_AA)
+                cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + 85, box_y + 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05, color, 2, cv2.LINE_AA)
             if is_release:
-                cv2.putText(frame, "RELEASE HEIGHT", (box_x + 16, box_y + 118),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+                cv2.putText(frame, "RELEASE HEIGHT", (box_x + 14, box_y + 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
                 if release_height_pct is not None:
-                    cv2.putText(frame, f"{release_height_pct:.0f}%", (box_x + 190, box_y + 122),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 210, 255), 2, cv2.LINE_AA)
+                    cv2.putText(frame, f"{release_height_pct:.0f}%", (box_x + 165, box_y + 104),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, JOINT_CORE, 2, cv2.LINE_AA)
                 else:
-                    cv2.putText(frame, "N/A", (box_x + 190, box_y + 122),
+                    cv2.putText(frame, "N/A", (box_x + 165, box_y + 104),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2, cv2.LINE_AA)
                 # ELBOW EXTENSION DISABLED — 2D-derived readings were producing
                 # false positives (e.g. 81deg on a visibly legal action).
