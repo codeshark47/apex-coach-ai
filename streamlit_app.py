@@ -749,6 +749,30 @@ if st.session_state.get("pending_result_payload") is not None:
                     f"this delivery** rather than acting on these results."
                 )
 
+            # --- RELEASE-FRAME CONFIDENCE GUARD ---
+            # Separate from the guard above: this clip can have all 5 metrics
+            # compute "successfully" and still have an unreliable release
+            # frame, because the arm moves fastest (and blurs most) at the
+            # exact instant it's trying to pinpoint. Verified directly: the
+            # SAME footage decoded by two different video libraries can each
+            # land on a different release frame, several frames apart — not
+            # a bug in the detection logic, a property of the source footage
+            # (motion blur right at release). No amount of algorithm tuning
+            # closes that gap when the underlying pixels are ambiguous, so
+            # the honest move is to disclose it rather than present a
+            # specific frame number with false confidence.
+            if frames.get("ball_release_confidence") == "low":
+                st.warning(
+                    "🎯 Release-frame timing has low confidence on this delivery "
+                    f"(only {frames.get('ball_release_plausible_fraction', 0)*100:.0f}% of "
+                    "the search window had clean tracking around release) — usually "
+                    "motion blur at the exact instant the arm is fastest. Ball Release "
+                    "Point may be off by a few frames, which would also shift Release "
+                    "Height and Release Arm Speed. For a delivery you need precise "
+                    "numbers on, re-shoot at a higher shutter speed or higher frame "
+                    "rate if your camera supports it."
+                )
+
             # --- PHASE TIMING (always available) ---
             phase_durations = None
             try:

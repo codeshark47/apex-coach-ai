@@ -173,6 +173,26 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
 
     real_mask_slice = wrist_had_real[ffc_idx:br_search_end]
 
+    # RELEASE-DETECTION CONFIDENCE: an honest, decode-independent signal
+    # for how much of the search window had usable wrist data (real
+    # detection AND anatomically plausible), regardless of which exact
+    # frame the peak search lands on. Verified directly against real
+    # footage with genuine motion blur at release: different video
+    # decoders (different OpenCV builds, or the same clip re-encoded)
+    # can each land on a DIFFERENT release frame for the same delivery,
+    # because the underlying wrist signal is genuinely ambiguous at the
+    # pixel level in that window — not because of a bug in this search.
+    # No amount of tuning the search logic itself closes that gap, since
+    # it's a property of the source footage (motion blur), not the
+    # algorithm. What the app CAN do honestly is detect and disclose it,
+    # rather than presenting a specific frame number with false
+    # confidence. Below BR_CONFIDENCE_FLOOR of the window being usable,
+    # flag low confidence so the UI can warn that release-frame-dependent
+    # numbers (release height, speed) may be off by a few frames here.
+    br_plausible_fraction = float(real_mask_slice.mean()) if len(real_mask_slice) > 0 else 0.0
+    BR_CONFIDENCE_FLOOR = 0.6
+    br_confidence = "high" if br_plausible_fraction >= BR_CONFIDENCE_FLOOR else "low"
+
     # PROMINENCE, not just the single lowest point: a real release swing
     # rises substantially from its own recent baseline (arm coming up
     # from a low, resting position). Verified on real footage this
@@ -246,7 +266,9 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     return {
         "BFC": int(max(1, bfc_idx)),
         "FFC": int(max(2, ffc_idx)),
-        "BR": int(min(br_idx, total_frames - 1))
+        "BR": int(min(br_idx, total_frames - 1)),
+        "BR_confidence": br_confidence,
+        "BR_plausible_fraction": round(br_plausible_fraction, 2),
     }
 
 
@@ -1146,7 +1168,9 @@ def run_complete_bowling_analysis(video_path: str,
         "time_indices": {
             "back_foot_contact_frame": events["BFC"],
             "front_foot_contact_frame": events["FFC"],
-            "ball_release_frame": events["BR"]
+            "ball_release_frame": events["BR"],
+            "ball_release_confidence": events.get("BR_confidence", "high"),
+            "ball_release_plausible_fraction": events.get("BR_plausible_fraction", 1.0),
         },
         "biomechanical_metrics": {
             "trunk_lean": {
