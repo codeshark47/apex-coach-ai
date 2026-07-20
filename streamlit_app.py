@@ -745,6 +745,7 @@ if st.session_state.get("pending_result_payload") is not None:
 
             # --- SPEED (only if calibrated) ---
             speed_result = None
+            height_absolute_result = None
             landmarks_csv = os.path.join("output", "landmarks.csv")
             if os.path.exists(landmarks_csv):
                 landmarks_df = pd.read_csv(landmarks_csv)
@@ -761,6 +762,9 @@ if st.session_state.get("pending_result_payload") is not None:
                 mpp = st.session_state.calibration.meters_per_pixel if st.session_state.calibration else None
                 speed_result = se.compute_release_arm_speed(
                     landmarks_df, events, fps, cap_w, cap_h, meters_per_pixel=mpp
+                )
+                height_absolute_result = se.compute_release_height_absolute(
+                    metrics.get("release_height", {}).get("debug_raw"), cap_h, meters_per_pixel=mpp
                 )
 
             # --- RUN-UP ANALYSIS (stride detection + rhythm + strike pattern) ---
@@ -954,6 +958,10 @@ if st.session_state.get("pending_result_payload") is not None:
                 m4.metric("Release Height Ratio", ui_pct(rel_ratio),
                            (metrics.get('release_height', {}).get('classification')
                             or metrics.get('release_height', {}).get('tier', 'N/A')))
+                if height_absolute_result and height_absolute_result.get("status") == "success":
+                    m4.caption(f"📏 {height_absolute_result['cm']} cm above ground (stump-calibrated)")
+                elif height_absolute_result and height_absolute_result.get("status") == "not_calibrated":
+                    m4.caption("📏 Calibrate camera (sidebar) for an absolute height in cm")
                 m5.metric("Head Stability Variance", ui_val(head_val),
                            (metrics.get('head_stability', {}).get('classification')
                             or metrics.get('head_stability', {}).get('tier', 'N/A')))

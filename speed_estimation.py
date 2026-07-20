@@ -154,3 +154,54 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def compute_release_height_absolute(release_height_debug: Optional[dict], frame_height: int,
+                                     meters_per_pixel: Optional[float]) -> dict:
+    """
+    Absolute vertical release height (bowling wrist above ground/ankle
+    level) in real-world units — a companion to the always-available
+    body-proportion ratio (release height as a % of the bowler's own
+    body height), computed from the exact same landmark data at the
+    exact same release-onset frame, just converted through a real-world
+    scale (e.g. stump height, 71.12cm / 28in, via calibration.py)
+    instead of expressed relative to body size.
+
+    release_height_debug: the "debug_raw" dict already returned by
+    calculate_release_height_ratio_safe (y_wrist, y_ankle, both
+    normalized 0-1) — reused rather than re-deriving the landmarks, so
+    this can never disagree with the ratio on WHICH points it measured.
+
+    Returns {"status": "not_calibrated"} if no calibration is set —
+    never invents a scale. Never returns a value further than 2.5m off
+    the ground, which is beyond any human's standing reach.
+    """
+    if meters_per_pixel is None:
+        return {
+            "status": "not_calibrated",
+            "message": (
+                "Camera not calibrated for this setup — calibrate using a "
+                "known real-world distance (e.g. stump height, 71.12cm) to "
+                "enable this."
+            ),
+        }
+    if not release_height_debug or "y_wrist" not in release_height_debug or "y_ankle" not in release_height_debug:
+        return {"status": "error", "message": "Release landmark data unavailable."}
+
+    try:
+        vertical_norm = abs(float(release_height_debug["y_ankle"]) - float(release_height_debug["y_wrist"]))
+        vertical_m = vertical_norm * frame_height * meters_per_pixel
+        vertical_cm = vertical_m * 100
+
+        if vertical_cm <= 0 or vertical_cm > 250:
+            return {
+                "status": "error",
+                "message": (
+                    f"Computed height ({vertical_cm:.0f}cm) is outside plausible "
+                    f"bounds — check calibration accuracy."
+                ),
+            }
+
+        return {"status": "success", "cm": round(vertical_cm, 1), "m": round(vertical_m, 3)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
