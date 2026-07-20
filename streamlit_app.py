@@ -722,9 +722,11 @@ if st.session_state.get("pending_result_payload") is not None:
             frames = result_payload["time_indices"]
             fps = result_payload["video_metadata"]["fps"]
             total_frames = result_payload["video_metadata"]["total_frames"]
+            import cv2 as _cv2_diag
             st.caption(
                 f"🔍 Decoded as {fps:.2f} FPS, {total_frames} total frames "
-                f"— source: {result_payload['video_metadata']['source_file']}"
+                f"— source: {result_payload['video_metadata']['source_file']} "
+                f"— OpenCV {_cv2_diag.__version__}"
             )
 
             events = {
