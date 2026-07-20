@@ -82,9 +82,121 @@ def _select_bowling_arm(df: pd.DataFrame, br_idx: int, fps: float,
     return max(speeds, key=speeds.get)
 
 
+def _extract_raw_wrist_window(video_path: str, wrist_name: str, br_idx: int,
+                               fps: float, window_frames: int) -> dict:
+    """
+    Re-extracts RAW (unsmoothed) pixel positions for one wrist landmark,
+    directly from the source video, for a window around br_idx.
+
+    Why this exists: the saved landmarks CSV has already been through
+    Hampel-filter outlier rejection AND a 5-frame rolling-mean smoothing
+    pass — exactly right for a stable-looking skeleton and reliable event
+    timing, but verified on real footage that it also DILUTES the true
+    peak instantaneous velocity of a fast, brief motion like a bowling
+    release swing (a smoothed 5-frame average of a sharp spike is,
+    definitionally, much lower than the spike itself). Re-extracting raw
+    positions just for this small window avoids that dilution.
+
+    Processes every frame from 0 up to the window end (not just the
+    window itself) to preserve VIDEO mode's real temporal continuity —
+    only the window's positions are kept, but detection needs the earlier
+    frames to have "warmed up" properly.
+
+    Returns {frame_index: (x_px, y_px, visibility)}.
+    """
+    import os
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    model_path = os.path.join("models", "pose_landmarker_full.task")
+    landmark_index = 16 if wrist_name == "RIGHT_WRIST" else 15
+
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        output_segmentation_masks=False,
+        num_poses=1,
+        min_pose_detection_confidence=0.3,
+        min_pose_presence_confidence=0.3,
+        min_tracking_confidence=0.4,
+    )
+    landmarker = vision.PoseLandmarker.create_from_options(options)
+    cap = cv2.VideoCapture(video_path)
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    ms_per_frame = 1000.0 / fps
+    window_end = br_idx + window_frames
+
+    positions = {}
+    idx = 0
+    last_ts = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok or idx > window_end:
+            break
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        ts = int(round(idx * ms_per_frame))
+        if ts <= last_ts:
+            ts = last_ts + 1
+        last_ts = ts
+        res = landmarker.detect_for_video(img, ts)
+        if idx >= br_idx - window_frames and res.pose_landmarks:
+            lm = res.pose_landmarks[0][landmark_index]
+            positions[idx] = (lm.x * frame_w, lm.y * frame_h, lm.visibility)
+        idx += 1
+    cap.release()
+    landmarker.close()
+    return positions
+
+
+def _corroborated_peak_speed_px_s(positions: dict, fps: float) -> Optional[float]:
+    """
+    Peak frame-to-frame speed (px/s) from raw positions, rejecting
+    ISOLATED single-frame spikes that at least one adjacent frame-pair
+    doesn't corroborate. Verified on real footage this matters: raw
+    (unsmoothed) tracking during a fast, motion-blurred swing showed both
+    genuine sustained bursts (several consecutive frames all elevated)
+    AND isolated one-frame jumps that snapped straight back on the very
+    next frame — a classic signature of a tracking glitch, not real
+    motion. Trusting the single fastest raw frame without this check
+    would risk reporting a number built on a glitch, not a delivery.
+    """
+    frames = sorted(positions.keys())
+    speeds = {}
+    for i in range(len(frames) - 1):
+        f0, f1 = frames[i], frames[i + 1]
+        if f1 - f0 != 1:
+            continue
+        x0, y0, _ = positions[f0]
+        x1, y1, _ = positions[f1]
+        speeds[f0] = math.hypot(x1 - x0, y1 - y0) * fps
+
+    if not speeds:
+        return None
+
+    keys = sorted(speeds.keys())
+    CORROBORATION_FRACTION = 0.5
+    corroborated = []
+    for i, k in enumerate(keys):
+        neighbors = []
+        if i > 0:
+            neighbors.append(speeds[keys[i - 1]])
+        if i < len(keys) - 1:
+            neighbors.append(speeds[keys[i + 1]])
+        if any(n >= speeds[k] * CORROBORATION_FRACTION for n in neighbors):
+            corroborated.append(speeds[k])
+
+    return max(corroborated) if corroborated else max(speeds.values())
+
+
 def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
                                frame_width: int, frame_height: int,
-                               meters_per_pixel: Optional[float]) -> dict:
+                               meters_per_pixel: Optional[float],
+                               video_path: Optional[str] = None) -> dict:
     """
     Returns:
       {"status": "not_calibrated"}   -- if meters_per_pixel is None
@@ -99,6 +211,12 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
     underestimate speed by several-fold. Peak instantaneous velocity
     between consecutive frames is the physically correct quantity for
     "how fast was the hand moving at release."
+
+    video_path: when given, re-extracts RAW (unsmoothed) positions for
+    the velocity window directly from the source video instead of using
+    the already-smoothed df — see _extract_raw_wrist_window for why this
+    matters. Falls back to the smoothed df if not given or if raw
+    re-extraction fails for any reason, so this stays backward compatible.
     """
     if meters_per_pixel is None:
         return {
@@ -115,21 +233,31 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
             return {"status": "error", "message": "BR frame out of range."}
 
         bowling_arm = _select_bowling_arm(df, br_idx, fps, frame_width, frame_height)
-        x, y = _wrist_pixel_series(df, bowling_arm, frame_width, frame_height)
-
         window = max(3, int(fps * 0.08))  # ~80ms either side of release
-        lo = max(0, br_idx - window)
-        hi = min(len(df) - 1, br_idx + window)
-        if hi - lo < 2:
-            return {"status": "error", "message": "Insufficient frames around BR for a velocity estimate."}
 
-        dt_frame = 1.0 / fps
-        frame_speeds_px_s = []
-        for i in range(lo, hi):
-            d = math.hypot(x[i + 1] - x[i], y[i + 1] - y[i])
-            frame_speeds_px_s.append(d / dt_frame)
+        peak_px_per_s = None
+        used_raw = False
+        if video_path:
+            try:
+                raw_positions = _extract_raw_wrist_window(video_path, bowling_arm, br_idx, fps, window)
+                peak_px_per_s = _corroborated_peak_speed_px_s(raw_positions, fps)
+                used_raw = peak_px_per_s is not None
+            except Exception:
+                peak_px_per_s = None
 
-        peak_px_per_s = max(frame_speeds_px_s)
+        if peak_px_per_s is None:
+            x, y = _wrist_pixel_series(df, bowling_arm, frame_width, frame_height)
+            lo = max(0, br_idx - window)
+            hi = min(len(df) - 1, br_idx + window)
+            if hi - lo < 2:
+                return {"status": "error", "message": "Insufficient frames around BR for a velocity estimate."}
+            dt_frame = 1.0 / fps
+            frame_speeds_px_s = []
+            for i in range(lo, hi):
+                d = math.hypot(x[i + 1] - x[i], y[i + 1] - y[i])
+                frame_speeds_px_s.append(d / dt_frame)
+            peak_px_per_s = max(frame_speeds_px_s)
+
         mps = peak_px_per_s * meters_per_pixel
         kmh = mps * 3.6
 
@@ -150,7 +278,7 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
             "kmh": round(kmh, 1),
             "mps": round(mps, 2),
             "bowling_arm": bowling_arm,
-            "window_seconds": round((hi - lo) * dt_frame, 4),
+            "used_raw_reextraction": used_raw,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}

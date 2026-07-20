@@ -767,7 +767,8 @@ if st.session_state.get("pending_result_payload") is not None:
 
                 mpp = st.session_state.calibration.meters_per_pixel if st.session_state.calibration else None
                 speed_result = se.compute_release_arm_speed(
-                    landmarks_df, events, fps, cap_w, cap_h, meters_per_pixel=mpp
+                    landmarks_df, events, fps, cap_w, cap_h, meters_per_pixel=mpp,
+                    video_path=video_path
                 )
                 height_absolute_result = se.compute_release_height_absolute(
                     metrics.get("release_height", {}).get("debug_raw"), cap_h, meters_per_pixel=mpp
