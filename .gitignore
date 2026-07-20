@@ -25,4 +25,8 @@ __pycache__/
 
 # OS files
 .DS_Store
-Thumbs.dbmodels/
+Thumbs.db
+
+# MediaPipe pose model — auto-downloaded at runtime by main.py on first
+# use (see model_url), ~9MB binary that doesn't need to live in git
+models/
