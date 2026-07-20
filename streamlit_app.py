@@ -721,6 +721,11 @@ if st.session_state.get("pending_result_payload") is not None:
             metrics = result_payload["biomechanical_metrics"]
             frames = result_payload["time_indices"]
             fps = result_payload["video_metadata"]["fps"]
+            total_frames = result_payload["video_metadata"]["total_frames"]
+            st.caption(
+                f"🔍 Decoded as {fps:.2f} FPS, {total_frames} total frames "
+                f"— source: {result_payload['video_metadata']['source_file']}"
+            )
 
             events = {
                 "BFC": frames["back_foot_contact_frame"],
