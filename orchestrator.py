@@ -112,7 +112,21 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     # BALL RELEASE (BR): the bowling wrist's highest point, searched ONLY
     # in a realistic window after front-foot plant — never before it,
     # since release always follows the plant.
-    br_search_window = max(2, int(round(fps * 0.4)))
+    #
+    # WIDENED from 0.4s: verified on real rear-view footage where the
+    # front-ankle "sustained stillness" plant-detector locked onto an
+    # intermediate running stride instead of the true final plant (a
+    # multi-stride run-up can show several strides that briefly look
+    # "stable" the same way a genuine plant does) — FFC landed ~1 full
+    # second early. The true release was still a single, clean, entirely
+    # unambiguous global minimum in the wrist trajectory (no competing
+    # arm-raise anywhere else in the clip), it just fell outside the old
+    # narrow window. A wider window tolerates FFC being somewhat off
+    # without reintroducing the original bug this window exists to
+    # prevent — that bug was an arm-raise during the gather/jump, which
+    # happens BEFORE BFC/FFC chronologically, so it's structurally
+    # unreachable by widening a window that only searches FORWARD from FFC.
+    br_search_window = max(2, int(round(fps * 1.2)))
     br_search_end = min(total_frames, ffc_idx + br_search_window)
     br_slice = wrist_y[ffc_idx:br_search_end]
 
@@ -126,9 +140,34 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     # window has no real detection at all.
     wrist_had_real = (~df[f"{bowl_side}_WRIST_y"].isna()).values
     real_mask_slice = wrist_had_real[ffc_idx:br_search_end]
+
+    # PROMINENCE, not just the single lowest point: a real release swing
+    # rises substantially from its own recent baseline (arm coming up
+    # from a low, resting position). Verified on real footage this
+    # matters once the window above was widened to tolerate FFC timing
+    # error — the wider window could otherwise catch a shallow,
+    # insignificant dip later on where tracking had briefly drifted onto
+    # a bystander doing something unrelated (no real arm-raise dynamics,
+    # just a flat, low-amplitude trace with a technically-lower point).
+    # For each frame, baseline = the highest real wrist_y (lowest arm
+    # position) seen so far since the window started; prominence = how
+    # far the current point has risen above that running baseline. The
+    # frame with the GREATEST prominence is the real swing-up, not
+    # necessarily the frame with the single lowest absolute value.
     if len(br_slice) > 0 and real_mask_slice.any():
-        candidate_slice = np.where(real_mask_slice, br_slice, np.inf)
-        br_idx = ffc_idx + int(np.argmin(candidate_slice))
+        real_slice = np.where(real_mask_slice, br_slice, np.nan)
+        running_baseline = np.full(len(real_slice), np.nan)
+        current_max = -np.inf
+        for i, v in enumerate(real_slice):
+            if not np.isnan(v):
+                current_max = max(current_max, v)
+            if current_max > -np.inf:
+                running_baseline[i] = current_max
+        prominence = running_baseline - real_slice
+        if np.any(~np.isnan(prominence)):
+            br_idx = ffc_idx + int(np.nanargmax(prominence))
+        else:
+            br_idx = ffc_idx + int(np.argmin(br_slice))
     elif len(br_slice) > 0:
         br_idx = ffc_idx + int(np.argmin(br_slice))
     else:
