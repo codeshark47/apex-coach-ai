@@ -227,17 +227,37 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
 
         # Tolerance grows with elapsed gap (a real person could genuinely
         # move further before detection resumes), but is capped rather
-        # than left to grow indefinitely — after roughly half a second
-        # with no confirmed match, a re-match is refused entirely and
-        # those frames stay honestly untracked (N/A downstream) instead
-        # of eventually accepting a wrong-but-by-then-"plausible"
-        # bystander. Matches the app's broader principle of showing
-        # nothing rather than a number built on a bad assumption.
+        # than left to grow indefinitely.
         MAX_DIST_CAP = 0.25
+
+        # BUG FIX: the comment above (and the one that used to be here)
+        # described "after roughly half a second with no confirmed match,
+        # a re-match is refused entirely" — but the code only ever capped
+        # the DISTANCE tolerance, never the GAP LENGTH itself, so it kept
+        # trying to reacquire no matter how long the gap ran. Verified on
+        # real footage: a 116-frame (~3.9s) gap with zero confirmed
+        # matches, then reacquisition locked onto a coach standing near
+        # the pitch instead of the actual bowler — the coach happened to
+        # be a confidently-detected, roughly-stationary person within
+        # reach once the capped tolerance had been sitting at its ceiling
+        # for that long. A real bowler could have moved a long way in
+        # 3.9 seconds; that's exactly why a stale anchor position is no
+        # longer a trustworthy reference for "who's nearby" after this
+        # long — the failure mode isn't a wrong DISTANCE calculation, it's
+        # that distance-from-a-3.9-second-old-position stops meaning
+        # anything. Past this ceiling, stop attempting to reacquire by
+        # position at all; those frames — and everything after, until a
+        # fresh seed — stay honestly untracked (N/A downstream) rather
+        # than confidently locking onto whoever's closest by chance.
+        MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
 
         anchor = seed_anchor
         frames_since_confirmed = 1
         for i in range(seed_idx + 1, total_frames):
+            if frames_since_confirmed > MAX_GAP_FRAMES:
+                seeded_chosen[i] = None
+                frames_since_confirmed += 1
+                continue
             max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
             chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
             seeded_chosen[i] = chosen
@@ -250,6 +270,10 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         anchor = seed_anchor
         frames_since_confirmed = 1
         for i in range(seed_idx - 1, -1, -1):
+            if frames_since_confirmed > MAX_GAP_FRAMES:
+                seeded_chosen[i] = None
+                frames_since_confirmed += 1
+                continue
             max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
             chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
             seeded_chosen[i] = chosen
