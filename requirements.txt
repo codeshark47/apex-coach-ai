@@ -1,5 +1,5 @@
 streamlit>=1.35.0
-opencv-contrib-python-headless
+opencv-contrib-python-headless==5.0.0.93
 google-genai
 google-generativeai
 numpy
