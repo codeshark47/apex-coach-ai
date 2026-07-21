@@ -92,16 +92,44 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
         window=plateau_window, center=False, min_periods=plateau_window
     ).min().astype(bool).values
     is_stable = is_stable & window_all_real
-    plant_end_candidates = np.where(is_stable)[0]
+    # Group is_stable into contiguous runs, not just "the last True index".
+    # Verified directly against real footage (Abu Bakar clip, 120 frames):
+    # any raw video that keeps rolling after the delivery — which is normal,
+    # nobody stops recording mid-follow-through — contains a bowler running/
+    # decelerating down the pitch afterward. That motion routinely produces
+    # its own brief, coincidental 3-frame stretch where the ankle position
+    # barely changes (a natural mid-stride pause), which satisfies the exact
+    # same rolling-std stability test as a genuine plant. Because "take the
+    # LAST stable stretch" has no concept of run length, that spurious blip
+    # — sometimes just one 3-frame window wide — was winning over the real
+    # plant simply for coming later in the clip, dragging FFC (and BR,
+    # searched forward from FFC) to the wrong end of the video entirely.
+    # A genuine plant holds for the whole grounded-contact duration of the
+    # delivery stride (~150ms+, confirmed 10 consecutive frames at 29fps on
+    # the real test clip) — long enough to distinguish from a one-window
+    # coincidence. Requiring a minimum sustained run length before a stretch
+    # is even eligible to be picked fixes this without reintroducing the
+    # percentile-threshold problems already ruled out above.
+    MIN_PLANT_FRAMES = max(2 * plateau_window, int(round(fps * 0.15)))
+    stable_runs = []
+    run_start = None
+    for i, s in enumerate(is_stable):
+        if s and run_start is None:
+            run_start = i
+        elif not s and run_start is not None:
+            stable_runs.append((run_start, i - 1))
+            run_start = None
+    if run_start is not None:
+        stable_runs.append((run_start, len(is_stable) - 1))
 
-    if len(plant_end_candidates) > 0:
-        # Walk back from the end of the LAST stable stretch to where it
-        # started — that start is the moment the foot actually touched
-        # down and stopped moving.
-        ffc_idx = int(plant_end_candidates[-1])
-        while ffc_idx > 0 and is_stable[ffc_idx - 1]:
-            ffc_idx -= 1
-        ffc_idx = max(0, ffc_idx - plateau_window + 1)
+    qualifying_runs = [r for r in stable_runs if (r[1] - r[0] + 1) >= MIN_PLANT_FRAMES]
+
+    if qualifying_runs or stable_runs:
+        # Prefer the last run that's a genuine sustained hold; only fall
+        # back to a short/noisy one if literally nothing else was found,
+        # so a short but real clip doesn't lose the signal entirely.
+        run_start, _ = (qualifying_runs or stable_runs)[-1]
+        ffc_idx = max(0, run_start - plateau_window + 1)
     else:
         # No clear plateau found (short/noisy clip) — fall back to the
         # single-frame peak, restricted to the back half of the clip to
