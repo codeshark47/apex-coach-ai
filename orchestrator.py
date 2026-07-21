@@ -660,16 +660,46 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     JOINT_OUTLINE = (255, 255, 255)
     JOINT_CORE = (235, 195, 50)
 
-    # RESOLUTION SCALE: every fixed pixel size below (joint radius, bone
-    # width) was tuned against a 1080x1920 test clip. Verified directly on
-    # a real, smaller 848x478 clip the founder submitted: those same fixed
-    # sizes made the joints so large relative to a more distant, smaller
-    # on-screen bowler that they physically overlapped into one solid
-    # blob, hiding his whole body. Scale every size by frame dimensions
-    # relative to that original tuning resolution instead of using it
-    # as-is, clamped so it neither vanishes on tiny clips nor balloons on
-    # huge ones.
-    render_scale = max(0.35, min(1.5, min(width, height) / 1080.0))
+    # SUBJECT-SIZE SCALE: every fixed pixel size below (joint radius, bone
+    # width) was tuned against a 1080x1920 test clip. A prior fix scaled
+    # this by frame RESOLUTION alone — but verified directly on three real
+    # clips at similar frame heights (462-832px), the bowler's actual
+    # on-screen size ranged from 67px to 170px tall depending on how wide
+    # or zoomed the shot was, unrelated to frame resolution itself. A wide
+    # shot capturing a full run-up (bowler small, lots of empty field
+    # around him) got the exact same joint size as a tighter shot under
+    # the resolution-only formula, which is why the wide clip's joints
+    # physically overlapped into a blob while the tighter one looked fine
+    # at the identical frame size. What actually matters is how big the
+    # TRACKED PERSON is on screen. Reference constant (400px) is an
+    # engineering calibration against the clip a working render was
+    # already confirmed on, not a cited standard — documented as such so
+    # it isn't mistaken for validated science.
+    def _estimate_body_height_px(reference_row):
+        if reference_row is None:
+            return None
+        try:
+            y_nose = reference_row.get("NOSE_y")
+            ankle_vals = [v for v in (reference_row.get("LEFT_ANKLE_y"), reference_row.get("RIGHT_ANKLE_y"))
+                          if v is not None and not pd.isna(v)]
+            if y_nose is None or pd.isna(y_nose) or not ankle_vals:
+                return None
+            return abs(float(max(ankle_vals)) - float(y_nose)) * height
+        except Exception:
+            return None
+
+    scale_ref_rows = df[df["frame"] == events.get("FFC")]
+    scale_ref_row = scale_ref_rows.iloc[0] if not scale_ref_rows.empty else None
+    body_height_px = _estimate_body_height_px(scale_ref_row)
+
+    REFERENCE_BODY_HEIGHT_PX = 400.0
+    MIN_RENDER_SCALE, MAX_RENDER_SCALE = 0.18, 1.5
+    if body_height_px and body_height_px > 10:
+        render_scale = max(MIN_RENDER_SCALE, min(MAX_RENDER_SCALE, body_height_px / REFERENCE_BODY_HEIGHT_PX))
+    else:
+        # Bowler not measurable at FFC (missing landmarks) — fall back to
+        # the old resolution-only estimate rather than guessing further.
+        render_scale = max(MIN_RENDER_SCALE, min(MAX_RENDER_SCALE, min(width, height) / 1080.0))
 
     def _rs(px):
         return max(1, int(round(px * render_scale)))
