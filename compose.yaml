@@ -1,0 +1,13 @@
+services:
+  server:
+    build:
+      context: .
+    ports:
+      - 8501:8501
+    env_file:
+      - .env
+    # Live-mount source so code edits show up on container restart without
+    # a full rebuild; input/output/models stay container-local (see
+    # .gitignore — they're large, disposable, athlete-video content).
+    volumes:
+      - ./:/app

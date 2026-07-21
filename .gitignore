@@ -12,6 +12,11 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Virtual environments (local testing only, never committed)
+.venv/
+.venv312/
+venv/
+
 # Video files
 *.mp4
 *.avi
