@@ -10,6 +10,7 @@ from kinematics import (
     calculate_trunk_lean,
     calculate_head_stability
 )
+import camera_angle_detection as cad
 
 
 def detect_bowling_arm(df: pd.DataFrame) -> str:
@@ -31,12 +32,19 @@ def detect_bowling_arm(df: pd.DataFrame) -> str:
         return "right"
 
 
-def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right") -> dict:
+def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right",
+                            camera_angle: str = None) -> dict:
     """
     Robust physical milestone detection using velocity windows.
     bowling_arm: 'right' or 'left' — determines which wrist is used for
     release detection and which ankle is front/back foot. The lead (front)
     foot is always the ankle OPPOSITE the bowling arm.
+
+    camera_angle: optional, from camera_angle_detection.estimate_camera_angle
+    ("side_on" | "front_or_rear" | "uncertain" | "unavailable" | None). Only
+    used to gate the elbow-plausibility check below — see that comment for
+    why. Defaults to None (behaves as side_on) so existing callers that
+    don't pass this are unaffected.
     """
     total_frames = len(df)
 
@@ -195,9 +203,23 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     with np.errstate(invalid="ignore", divide="ignore"):
         elbow_cos = np.clip((se_x * we_x + se_y * we_y) / elbow_norm, -1, 1)
     elbow_angle_deg = np.degrees(np.arccos(elbow_cos))
+    # CAMERA-ANGLE GATE on the check above: the 2D angle computed here only
+    # faithfully reflects real elbow flexion when the arm swings ACROSS the
+    # image plane (side-on filming). Verified directly on real rear-view
+    # footage: the same genuinely-tracked, correctly-extending arm produced
+    # a wildly oscillating 2D angle (4° -> 174° -> 23° -> 177° within one
+    # continuous swing) purely from viewing-angle projection, not real
+    # elbow motion — because in front-on/rear-on footage the arm moves
+    # mostly toward/away from the camera, which this 2D-only formula can't
+    # distinguish from bending. That doesn't just weaken the signal, it can
+    # actively exclude genuine release-window frames, so it's only applied
+    # when we have positive geometric evidence this is a side-on shot;
+    # "uncertain"/"unavailable"/None keep the previous (side-on) behavior
+    # rather than guessing.
     ELBOW_MIN_PLAUSIBLE_DEG = 90.0
     elbow_plausible = np.nan_to_num(elbow_angle_deg, nan=0.0) >= ELBOW_MIN_PLAUSIBLE_DEG
-    wrist_had_real = wrist_had_real & elbow_plausible
+    if camera_angle != "front_or_rear":
+        wrist_had_real = wrist_had_real & elbow_plausible
 
     real_mask_slice = wrist_had_real[ffc_idx:br_search_end]
 
@@ -245,7 +267,36 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
                 running_baseline[i] = current_max
         prominence = running_baseline - real_slice
         if np.any(~np.isnan(prominence)):
-            peak_relative_idx = int(np.nanargmax(prominence))
+            # EARLIEST significant swing, not necessarily the single
+            # highest-prominence one anywhere in the window. Verified
+            # directly against real footage (a rear-view leaping delivery):
+            # after the true release, the arm's own follow-through/recovery
+            # motion can produce a SECOND rise-from-baseline that happens to
+            # score marginally higher raw prominence than the first, genuine
+            # release swing (measured on real data: 0.0367 vs 0.0303 — only
+            # ~18% apart) purely because of incidental timing, not because
+            # it's a more real swing. Taking the global max picked that
+            # later, wrong swing. A real delivery has exactly one release
+            # event; anything after it is follow-through/recovery, so the
+            # first swing that's clearly a real rise (not noise) — not
+            # whichever one wins by a few percent — is the physically
+            # correct one to trust.
+            global_max_prominence = float(np.nanmax(prominence))
+            SIGNIFICANCE_FRACTION = 0.5
+            sig_threshold = SIGNIFICANCE_FRACTION * global_max_prominence
+            peak_relative_idx = None
+            n = len(prominence)
+            for i in range(n):
+                p = prominence[i]
+                if np.isnan(p) or p < sig_threshold:
+                    continue
+                prev_p = prominence[i - 1] if i > 0 and not np.isnan(prominence[i - 1]) else -np.inf
+                next_p = prominence[i + 1] if i < n - 1 and not np.isnan(prominence[i + 1]) else -np.inf
+                if p >= prev_p and p >= next_p:
+                    peak_relative_idx = i
+                    break
+            if peak_relative_idx is None:
+                peak_relative_idx = int(np.nanargmax(prominence))
             # ONSET, not the deepest point of the swing: verified on real
             # footage (a frame showing the actual ball still at the
             # fingertips) that true release happens when the arm FIRST
@@ -369,16 +420,32 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
         }
 
 
-def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right") -> dict:
+def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right",
+                                         reference_row: pd.Series = None) -> dict:
     """
     Calculates release height leverage ratio with expanded real-world tolerances.
     Prevents N/A dropouts on high-arm actions or varied camera distances.
     bowling_arm: 'right' or 'left' — determines which wrist measures release.
+
+    reference_row: optional row (typically the FFC/front-foot-plant frame)
+    used for the ankle+head "body height" measurement instead of br_row.
+    Verified directly on real footage: bowlers with a leaping/jumping
+    release are legitimately airborne at the BR frame itself, so their
+    ankle sits well off the ground at that exact instant — using that
+    frame for "body height" measures a compressed, mid-air span that has
+    nothing to do with their real standing height, inflating the ratio
+    past the physical-plausibility bound below and producing a false N/A
+    on an otherwise perfectly well-tracked delivery. FFC is a physically
+    grounded reference (that's what front-foot-CONTACT means) regardless
+    of whether this bowler's release style is grounded or airborne.
+    Defaults to None (uses br_row, prior behavior) for backward
+    compatibility with any caller not yet passing it.
     """
     try:
         bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
         y_wrist = br_row.get(f"{bowl_side}_WRIST_y")
-        y_head = br_row.get("NOSE_y")
+        height_row = reference_row if reference_row is not None else br_row
+        y_head = height_row.get("NOSE_y")
 
         # Use the FRONT/LEAD ankle (opposite the bowling arm) — that's the
         # foot planted on the ground at release, same "lead_side" convention
@@ -390,8 +457,8 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         # be grounded" rule below was flagging normal motion as an error.
         lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
         trail_side = "RIGHT" if lead_side == "LEFT" else "LEFT"
-        y_ankle_lead = br_row.get(f"{lead_side}_ANKLE_y")
-        y_ankle_trail = br_row.get(f"{trail_side}_ANKLE_y")
+        y_ankle_lead = height_row.get(f"{lead_side}_ANKLE_y")
+        y_ankle_trail = height_row.get(f"{trail_side}_ANKLE_y")
         if y_ankle_lead is not None and not pd.isna(y_ankle_lead):
             y_ankle, ankle_side = y_ankle_lead, lead_side
         elif y_ankle_trail is not None and not pd.isna(y_ankle_trail):
@@ -442,8 +509,8 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         # holds regardless of camera distance/framing, unlike a raw span
         # cutoff, so it catches an actual mistracked ankle without punishing
         # videos filmed wider or further away.
-        y_knee = br_row.get(f"{ankle_side}_KNEE_y")
-        y_hip = br_row.get(f"{ankle_side}_HIP_y")
+        y_knee = height_row.get(f"{ankle_side}_KNEE_y")
+        y_hip = height_row.get(f"{ankle_side}_HIP_y")
         if y_knee is not None and not pd.isna(y_knee) and y_hip is not None and not pd.isna(y_hip):
             if float(y_ankle) < float(y_knee) or float(y_ankle) < float(y_hip):
                 return {
@@ -689,7 +756,10 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         br_rows = df[df["frame"] == br_frame]
         if not br_rows.empty:
             br_row_for_release = br_rows.iloc[0]
-            rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm)
+            ffc_rows_for_release = df[df["frame"] == events.get("FFC")]
+            ffc_row_for_release = ffc_rows_for_release.iloc[0] if not ffc_rows_for_release.empty else None
+            rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm,
+                                                      reference_row=ffc_row_for_release)
             if rh.get("ratio") is not None:
                 release_height_pct = rh["ratio"] * 100
                 dbg = rh.get("debug_raw") or {}
@@ -1223,7 +1293,18 @@ def run_complete_bowling_analysis(video_path: str,
         bowling_arm = bowling_arm_override
     else:
         bowling_arm = detect_bowling_arm(df)
-    events = detect_delivery_events(df, fps, bowling_arm=bowling_arm)
+
+    # Camera angle feeds the elbow-plausibility gate inside event detection
+    # (see detect_delivery_events) — computed here so it's used automatically
+    # on every run, not just when the UI separately happens to check it.
+    cap_probe = cv2.VideoCapture(video_path)
+    probe_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+    probe_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+    cap_probe.release()
+    angle_estimate = cad.estimate_camera_angle(df, len(df) // 2, probe_w, probe_h)
+
+    events = detect_delivery_events(df, fps, bowling_arm=bowling_arm,
+                                     camera_angle=angle_estimate.angle)
 
     # STAGE 3 — FRAME VALIDATION
     ffc_rows = df[df["frame"] == events["FFC"]]
@@ -1254,7 +1335,8 @@ def run_complete_bowling_analysis(video_path: str,
     lean_analysis = calculate_trunk_lean(br_row)
     head_stability = calculate_head_stability(df, events["BFC"], events["BR"])
     hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
-    release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm)
+    release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm,
+                                                           reference_row=ffc_row)
 
     # FFC-to-Release knee angle delta ("yielding knee" check flagged in
     # external biomechanical audit): a static single-frame knee angle at

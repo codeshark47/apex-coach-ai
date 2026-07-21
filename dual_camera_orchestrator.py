@@ -56,7 +56,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         bowling_arm = detect_bowling_arm(side_df)
     lead_side = "left" if bowling_arm == "right" else "right"
 
-    side_events = embedded_detect_events(side_df, fps=side_fps, bowling_arm=bowling_arm)
+    side_events = embedded_detect_events(side_df, fps=side_fps, bowling_arm=bowling_arm,
+                                         camera_angle="side_on")
 
     side_ffc_rows = side_df[side_df["frame"] == side_events["FFC"]]
     side_br_rows  = side_df[side_df["frame"] == side_events["BR"]]
@@ -67,7 +68,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     knee_analysis     = calculate_knee_bracing(side_ffc_rows.iloc[0], lead_side=lead_side)
     knee_at_release   = calculate_knee_bracing(side_br_rows.iloc[0], lead_side=lead_side)
     lean_analysis     = calculate_trunk_lean(side_br_rows.iloc[0])
-    release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm)
+    release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm,
+                                                              reference_row=side_ffc_rows.iloc[0])
 
     # FFC-to-Release knee angle delta ("yielding knee" check from external
     # biomechanical audit) — same logic as Single Camera mode.
@@ -88,7 +90,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
 
     rear_df  = pd.read_csv(rear_csv)
     rear_fps = rear_extraction["fps"]
-    rear_events = embedded_detect_events(rear_df, fps=rear_fps, bowling_arm=bowling_arm)
+    rear_events = embedded_detect_events(rear_df, fps=rear_fps, bowling_arm=bowling_arm,
+                                         camera_angle="front_or_rear")
 
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
     head_stability = calculate_head_stability(rear_df, rear_events["BFC"], rear_events["BR"])
