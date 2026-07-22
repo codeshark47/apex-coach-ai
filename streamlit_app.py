@@ -496,6 +496,26 @@ if bowling_arm_choice == "Auto-detect (unreliable)":
         "⚠️ Auto-detect has produced wrong-arm results on real footage. "
         "Set Right-arm or Left-arm explicitly for a result you can trust."
     )
+
+# CAMERA ANGLE (optional manual override) — the geometry-based auto-detect
+# (shoulder-width/height ratio) has been verified to misclassify some real
+# footage: the same genuinely side-on setup produced ratios ranging from
+# clearly-side-on to clearly-front-or-rear across different frames of the
+# SAME clip, depending on the bowler's incidental running pose. That
+# misclassification silently disables a release-detection check that only
+# applies to side-on footage, producing a release frame deep in the wrong
+# part of the delivery. If you know the filming angle, set it here rather
+# than trusting auto-detect.
+camera_angle_choice = st.sidebar.selectbox(
+    "📐 Filming Angle",
+    ["Auto-detect", "Side-on", "Rear-view / Front-on"],
+    help="Auto-detect can misjudge this on some footage — set it manually if you know the angle."
+)
+camera_angle_override = {
+    "Auto-detect": None,
+    "Side-on": "side_on",
+    "Rear-view / Front-on": "front_or_rear",
+}[camera_angle_choice]
 st.sidebar.divider()
 st.sidebar.header("📁 Upload Video")
 uploaded_side = None
@@ -732,6 +752,7 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     video_path, bowling_arm_override=bowling_arm_override,
                     seed_point=single_seed_point, seed_frame_index=single_seed_frame,
                     extra_seeds=single_extra_seeds,
+                    camera_angle_override=camera_angle_override,
                 )
                 active_camera_mode = "Single Camera"
 

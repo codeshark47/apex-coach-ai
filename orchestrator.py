@@ -13,6 +13,32 @@ from kinematics import (
 import camera_angle_detection as cad
 
 
+def _nearest_complete_row(df: pd.DataFrame, frame_idx: int, required_cols: list, max_search: int = 10):
+    """
+    Returns the row at frame_idx if all required_cols are real there;
+    otherwise searches outward (closest frame first) up to max_search
+    frames for the nearest one where they are. Verified directly on real
+    footage: a reference frame chosen for being part of a stable, grounded
+    stretch (e.g. front-foot-plant) can still have a brief single-landmark
+    tracking dropout at that EXACT frame (here: NOSE_y missing while both
+    ankles were present), even though the body position barely changes
+    across the handful of neighboring frames in that same stable window —
+    using one of those instead is a safe substitute specifically because
+    the reference frame's whole purpose is representing "a grounded,
+    stable position," not that exact instant. Returns None if nothing
+    within range is complete (a genuinely longer dropout, not brief noise).
+    """
+    rows = df[df["frame"] == frame_idx]
+    if not rows.empty and not any(pd.isna(rows.iloc[0].get(c)) for c in required_cols):
+        return rows.iloc[0]
+    for offset in range(1, max_search + 1):
+        for candidate in (frame_idx - offset, frame_idx + offset):
+            rows = df[df["frame"] == candidate]
+            if not rows.empty and not any(pd.isna(rows.iloc[0].get(c)) for c in required_cols):
+                return rows.iloc[0]
+    return None
+
+
 def detect_bowling_arm(df: pd.DataFrame) -> str:
     """
     Auto-detects which arm is the bowling arm by comparing vertical
@@ -130,7 +156,21 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     if run_start is not None:
         stable_runs.append((run_start, len(is_stable) - 1))
 
-    qualifying_runs = [r for r in stable_runs if (r[1] - r[0] + 1) >= MIN_PLANT_FRAMES]
+    # SPAN check, not just local variance: a SLOW, CONTINUOUS drift (e.g.
+    # decelerating after follow-through, never actually planted) can still
+    # pass the per-window rolling-std check above — each individual
+    # plateau_window is nearly flat frame-to-frame even while the value
+    # cumulatively slides a long way over 20-30 frames. A genuine grounded
+    # plant holds its OVERALL position, not just its frame-to-frame delta.
+    RUN_SPAN_MAX_FRACTION = 0.15
+    span_floor = max(ankle_range * RUN_SPAN_MAX_FRACTION, 1e-6)
+
+    def _run_span(r):
+        seg = lead_ankle_y[r[0]:r[1] + 1]
+        return float(np.nanmax(seg) - np.nanmin(seg))
+
+    qualifying_runs = [r for r in stable_runs
+                       if (r[1] - r[0] + 1) >= MIN_PLANT_FRAMES and _run_span(r) <= span_floor]
 
     if qualifying_runs or stable_runs:
         # Prefer the last run that's a genuine sustained hold; only fall
@@ -243,6 +283,77 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     BR_CONFIDENCE_FLOOR = 0.6
     br_confidence = "high" if br_plausible_fraction >= BR_CONFIDENCE_FLOOR else "low"
 
+    # STRICTER extension gate for identifying release CANDIDATES
+    # specifically — separate from the looser 90-degree "plausible
+    # tracking" gate above, which stays as-is for the confidence number.
+    # Verified directly on real side-on footage: a bowler's gather/
+    # back-lift arm-raise before the final delivery stride can itself
+    # reach a bent-but-plausible elbow angle (measured ~118 degrees) with
+    # a LARGER raw wrist-height rise than the true release swing itself —
+    # the arm doesn't have as far left to travel to reach extension once
+    # already partly raised — so amplitude alone (even after widening the
+    # window and preferring the earliest significant rise) still picked
+    # the gather motion over the real release. The true release
+    # consistently showed near-full extension (~168-177 degrees on the
+    # same clip) where the gather did not (~62-118 degrees). Gating
+    # candidate peaks on this stricter bar rules out the gather motion
+    # regardless of how large its raw amplitude is. Same camera-angle
+    # caveat as the looser gate above: only trustworthy for side-on
+    # footage, so front/rear stays on the original (unstricter) mask.
+    RELEASE_ELBOW_MIN_DEG = 150.0
+    if camera_angle != "front_or_rear":
+        release_ready_slice = np.nan_to_num(elbow_angle_deg, nan=0.0)[ffc_idx:br_search_end] >= RELEASE_ELBOW_MIN_DEG
+        # SUSTAINED extension only, not a single-frame crossing: verified
+        # directly on real footage that normal running-arm-swing motion
+        # during the run-up can briefly (a few frames) swing through an
+        # angle that also happens to clear this bar, purely by chance timing
+        # — not because the bowler is anywhere near release. That brief
+        # false crossing seeded the running-baseline early, making the
+        # REAL, sustained extension later in the window look like a smaller
+        # secondary rise instead of the main event. A genuine release-arm
+        # extension holds for several consecutive frames, not one.
+        MIN_EXTENSION_FRAMES = max(6, int(round(fps * 0.2)))
+        # Fill brief gaps before applying the duration filter: verified on
+        # real footage that the true release itself can show a short 2-3
+        # frame dip in this same angle right around/after the fastest part
+        # of the swing (motion blur), which otherwise splits one genuine,
+        # long extension into two pieces each too short to qualify alone.
+        # A short tolerance bridges real blur without rescuing the
+        # genuinely brief, unrelated running-arm-swing crossings seen
+        # elsewhere (those gaps run much longer than this tolerance).
+        GAP_FILL_TOLERANCE = 3
+        filled = release_ready_slice.copy()
+        gap_start = None
+        for i, s in enumerate(filled):
+            if not s and gap_start is None:
+                gap_start = i
+            elif s and gap_start is not None:
+                if gap_start > 0 and (i - gap_start) <= GAP_FILL_TOLERANCE:
+                    filled[gap_start:i] = True
+                gap_start = None
+        release_ready_slice = filled
+
+        release_ready = np.zeros_like(release_ready_slice, dtype=bool)
+        run_start_r = None
+        for i, s in enumerate(release_ready_slice):
+            if s and run_start_r is None:
+                run_start_r = i
+            elif not s and run_start_r is not None:
+                if i - run_start_r >= MIN_EXTENSION_FRAMES:
+                    release_ready[run_start_r:i] = True
+                run_start_r = None
+        if run_start_r is not None and len(release_ready_slice) - run_start_r >= MIN_EXTENSION_FRAMES:
+            release_ready[run_start_r:] = True
+
+        release_candidate_mask = real_mask_slice & release_ready
+        if not release_candidate_mask.any():
+            # No frame in the window meets the stricter bar (e.g. camera
+            # angle/action style genuinely doesn't show a clean extension) —
+            # fall back to the looser mask rather than finding nothing.
+            release_candidate_mask = real_mask_slice
+    else:
+        release_candidate_mask = real_mask_slice
+
     # PROMINENCE, not just the single lowest point: a real release swing
     # rises substantially from its own recent baseline (arm coming up
     # from a low, resting position). Verified on real footage this
@@ -256,8 +367,8 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     # far the current point has risen above that running baseline. The
     # frame with the GREATEST prominence is the real swing-up, not
     # necessarily the frame with the single lowest absolute value.
-    if len(br_slice) > 0 and real_mask_slice.any():
-        real_slice = np.where(real_mask_slice, br_slice, np.nan)
+    if len(br_slice) > 0 and release_candidate_mask.any():
+        real_slice = np.where(release_candidate_mask, br_slice, np.nan)
         running_baseline = np.full(len(real_slice), np.nan)
         current_max = -np.inf
         for i, v in enumerate(real_slice):
@@ -786,8 +897,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         br_rows = df[df["frame"] == br_frame]
         if not br_rows.empty:
             br_row_for_release = br_rows.iloc[0]
-            ffc_rows_for_release = df[df["frame"] == events.get("FFC")]
-            ffc_row_for_release = ffc_rows_for_release.iloc[0] if not ffc_rows_for_release.empty else None
+            ffc_row_for_release = _nearest_complete_row(
+                df, events.get("FFC"), ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+            )
             rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm,
                                                       reference_row=ffc_row_for_release)
             if rh.get("ratio") is not None:
@@ -1281,7 +1393,8 @@ def run_complete_bowling_analysis(video_path: str,
                                    bowling_arm_override: str = None,
                                    seed_point: tuple = None,
                                    seed_frame_index: int = 0,
-                                   extra_seeds: list = None) -> dict:
+                                   extra_seeds: list = None,
+                                   camera_angle_override: str = None) -> dict:
     """
     Core orchestration loop.
     Extracts landmarks, detects events, calculates all 5 biomechanical
@@ -1298,6 +1411,16 @@ def run_complete_bowling_analysis(video_path: str,
     seed only has to survive the gap to its nearest neighboring seed
     instead of one seed carrying the whole video — see
     main._walk_from_seed for how zones are split between seeds.
+
+    camera_angle_override: 'side_on' | 'front_or_rear' | 'uncertain',
+    when the coach has manually confirmed the filming angle up front.
+    Verified directly on real footage that the geometry-based auto-detect
+    (shoulder-width/height ratio) can be unstable for some bowlers' running
+    styles — the same genuinely side-on setup produced ratios swinging
+    from clearly-side-on to clearly-front-or-rear across different frames
+    of the same clip, misclassifying it and disabling a real-fix release
+    check that only applies to side-on footage. A human confirmation
+    should win over that shaky auto-guess. None (default) uses auto-detect.
     """
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, "landmarks.csv")
@@ -1327,14 +1450,40 @@ def run_complete_bowling_analysis(video_path: str,
     # Camera angle feeds the elbow-plausibility gate inside event detection
     # (see detect_delivery_events) — computed here so it's used automatically
     # on every run, not just when the UI separately happens to check it.
-    cap_probe = cv2.VideoCapture(video_path)
-    probe_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-    probe_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-    cap_probe.release()
-    angle_estimate = cad.estimate_camera_angle(df, len(df) // 2, probe_w, probe_h)
+    #
+    # SAMPLED across several frames, not a single midpoint: verified
+    # directly on real footage that one arbitrary frame (e.g. the clip's
+    # exact midpoint, likely still mid-run-up) can show a misleadingly
+    # rotated torso — a genuinely side-on camera setup got classified as
+    # "front_or_rear" because that one frame's body pose, not the camera
+    # position, happened to have a wide projected shoulder width. Sampling
+    # several frames across the back half of the clip (closer to the
+    # actual delivery, away from early run-up where he's also smaller/
+    # more distant) and taking the majority vote is robust to any single
+    # frame's incidental pose.
+    if camera_angle_override in ("side_on", "front_or_rear", "uncertain"):
+        camera_angle = camera_angle_override
+    else:
+        cap_probe = cv2.VideoCapture(video_path)
+        probe_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+        probe_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        cap_probe.release()
+        sample_fracs = (0.5, 0.6, 0.7, 0.8, 0.9)
+        votes = {}
+        ratios = []
+        for frac in sample_fracs:
+            est = cad.estimate_camera_angle(df, int(len(df) * frac), probe_w, probe_h)
+            if est.angle not in ("unavailable",):
+                votes[est.angle] = votes.get(est.angle, 0) + 1
+            if est.ratio is not None:
+                ratios.append(est.ratio)
+        if votes:
+            camera_angle = max(votes, key=votes.get)
+        else:
+            camera_angle = "uncertain"
 
     events = detect_delivery_events(df, fps, bowling_arm=bowling_arm,
-                                     camera_angle=angle_estimate.angle)
+                                     camera_angle=camera_angle)
 
     # STAGE 3 — FRAME VALIDATION
     ffc_rows = df[df["frame"] == events["FFC"]]
@@ -1365,8 +1514,11 @@ def run_complete_bowling_analysis(video_path: str,
     lean_analysis = calculate_trunk_lean(br_row)
     head_stability = calculate_head_stability(df, events["BFC"], events["BR"])
     hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
+    ffc_row_for_height = _nearest_complete_row(
+        df, events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+    )
     release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm,
-                                                           reference_row=ffc_row)
+                                                           reference_row=ffc_row_for_height)
 
     # FFC-to-Release knee angle delta ("yielding knee" check flagged in
     # external biomechanical audit): a static single-frame knee angle at
