@@ -27,6 +27,7 @@ venv/
 
 # Streamlit
 .streamlit/secrets.toml
+streamlit_cloud_secrets.toml
 
 # OS files
 .DS_Store
