@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 
 from orchestrator import run_complete_bowling_analysis
+import orchestrator as o
 from coaching_agent import generate_biomechanical_coaching_report
 
 from reportlab.lib.pagesizes import letter
@@ -690,6 +691,88 @@ else:
     if rear_seed_point is not None:
         rear_extra_seeds = render_extra_seed_ui(uploaded_rear, "rear", "Rear-view video")
 
+# CAMERA ANGLE — confirmed UPFRONT, before Execute, not after the analysis
+# has already run with a guess. Only for Single Camera: Dual Camera already
+# knows its two streams' angles by construction (side-on + rear/front),
+# no ambiguity to resolve.
+confirmed_angle_functional = None   # "side_on" | "front_or_rear" — feeds the actual computation
+confirmed_angle_label = None        # "side_on" | "front" | "rear" | "unknown" — for captions + logging
+
+if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None:
+    if camera_angle_override is not None:
+        # Coach already told us via the sidebar — trust that over any guess.
+        confirmed_angle_functional = camera_angle_override
+        confirmed_angle_label = "side_on" if camera_angle_override == "side_on" else "unknown"
+    else:
+        single_ref_path = st.session_state.get("single_seed_ref_path")
+        # Includes bowling-arm and seed choices, not just the filename —
+        # any of these changing (coach corrects the arm, adds a second
+        # seed) means the extraction/events below are stale and must
+        # rerun, not just be reused because the file itself is unchanged.
+        single_file_identity = (
+            f"{uploaded_single.name}_{uploaded_single.size}_{bowling_arm_override}"
+            f"_{single_seed_point}_{single_seed_frame}_{single_extra_seeds}"
+        )
+
+        # Runs the REAL extraction+event-detection stage now (cached per
+        # file — this is real work, not free) instead of a cheap isolated-
+        # frame heuristic. Verified directly that a lightweight shortcut
+        # here (single-frame detection, or sampling early run-up frames)
+        # is unreliable on real footage: isolated frames often fail to
+        # detect a small/distant bowler at all, and early run-up frames
+        # can show a misleadingly rotated torso if the bowler curves into
+        # his approach. The full extraction already needs to run before
+        # Execute's metrics/rendering stage anyway — doing it here just
+        # means the angle question gets asked right after THIS (cheaper)
+        # stage instead of after the full pipeline including video
+        # rendering has already run once with a guess.
+        if st.session_state.get("_stage12_identity") != single_file_identity:
+            with st.spinner("📐 Extracting tracking data and checking filming angle..."):
+                st.session_state["_stage12_result"] = o.extract_and_detect_events(
+                    single_ref_path, output_dir="output",
+                    bowling_arm_override=bowling_arm_override,
+                    seed_point=single_seed_point, seed_frame_index=single_seed_frame,
+                    extra_seeds=single_extra_seeds,
+                )
+            st.session_state["_stage12_identity"] = single_file_identity
+            st.session_state["_angle_confirmed_choice"] = None
+
+        stage12_result = st.session_state.get("_stage12_result")
+        angle_estimate = stage12_result.get("angle_estimate") if stage12_result and stage12_result.get("status") == "success" else None
+
+        choice_labels = ["Side-on", "Rear-view (behind bowler)", "Front-on (facing bowler)", "Not sure"]
+        default_idx = 3
+        if angle_estimate is not None and angle_estimate.angle == "side_on":
+            default_idx = 0
+
+        with st.expander("📐 Filming Angle Check",
+                          expanded=st.session_state.get("_angle_confirmed_choice") is None):
+            if stage12_result is None or stage12_result.get("status") != "success":
+                st.error(stage12_result.get("message", "Tracking extraction failed.") if stage12_result else "Tracking extraction failed.")
+            elif angle_estimate is None or angle_estimate.angle == "unavailable":
+                st.info("Couldn't auto-detect the filming angle from this clip — please confirm below. "
+                        "This changes what Trunk Lean and Head Stability actually measure.")
+            elif angle_estimate.angle == "side_on":
+                st.success(f"Detected: **side-on** (shoulder ratio {angle_estimate.ratio}) — "
+                           f"the best-supported angle for all 5 metrics. Confirm or correct below.")
+            else:
+                st.warning(f"📐 {angle_estimate.confidence_note} (shoulder-width ratio: {angle_estimate.ratio}) "
+                           f"— front and rear look nearly identical from pose data alone, so please "
+                           f"confirm which one this actually is.")
+
+            angle_choice = st.radio(
+                "Confirm the filming angle for this video",
+                choice_labels, index=default_idx,
+                key="angle_confirm_radio_upfront", horizontal=True
+            )
+            st.session_state["_angle_confirmed_choice"] = angle_choice
+
+        confirmed_angle_label = {
+            "Side-on": "side_on", "Rear-view (behind bowler)": "rear",
+            "Front-on (facing bowler)": "front", "Not sure": "unknown",
+        }[st.session_state["_angle_confirmed_choice"]]
+        confirmed_angle_functional = "side_on" if confirmed_angle_label == "side_on" else "front_or_rear"
+
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
                  and single_seed_point is not None and bowling_arm_selected)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
@@ -748,13 +831,26 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                 )
                 active_camera_mode = "Dual Camera"
             else:
+                # Reuse the extraction/events already computed for the
+                # angle-check step ONLY if the coach's confirmed angle
+                # matches what that step assumed — if they corrected the
+                # auto-guess (e.g. it said front/rear, they confirmed
+                # side-on), the cached events were built on the wrong
+                # elbow-plausibility gating and must be redone, not reused.
+                _stage12 = st.session_state.get("_stage12_result")
+                _reuse = (
+                    _stage12 is not None and _stage12.get("status") == "success"
+                    and _stage12.get("camera_angle") == confirmed_angle_functional
+                )
                 result_payload = run_complete_bowling_analysis(
                     video_path, bowling_arm_override=bowling_arm_override,
                     seed_point=single_seed_point, seed_frame_index=single_seed_frame,
                     extra_seeds=single_extra_seeds,
-                    camera_angle_override=camera_angle_override,
+                    camera_angle_override=confirmed_angle_functional,
+                    precomputed=_stage12 if _reuse else None,
                 )
                 active_camera_mode = "Single Camera"
+                st.session_state.pending_angle_label = confirmed_angle_label
 
         # Persist across reruns: Streamlit reruns the ENTIRE script on every
         # widget interaction (including the angle-confirmation radio button
@@ -770,7 +866,6 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
         st.session_state.ai_insights_cache = None       # force regeneration for this NEW result
         st.session_state.history_saved_for_run = False  # allow exactly one history save for this NEW result
         st.session_state.usage_recorded_for_run = False  # allow exactly one usage-count increment for this NEW result
-        st.session_state.pop("angle_confirm_radio", None)  # don't inherit the previous video's angle answer
 
 # Render results from session_state (not directly gated on this rerun's
 # button click) so any later widget interaction on this page — like the
@@ -900,37 +995,13 @@ if st.session_state.get("pending_result_payload") is not None:
                     )
                     strike_summary = rua.summarize_strike_patterns(annotated_contacts)
 
-            # --- CAMERA ANGLE DETECTION (auto side-on vs not, ask only when ambiguous) ---
-            angle_estimate = None
-            if os.path.exists(landmarks_csv):
-                angle_estimate = cad.estimate_camera_angle(
-                    landmarks_df, reference_frame_idx=events["BFC"],
-                    frame_width=cap_w, frame_height=cap_h
-                )
-
-            resolved_angle = "side_on"  # default assumption if detection unavailable
-            if angle_estimate is not None:
-                if angle_estimate.angle == "side_on":
-                    resolved_angle = "side_on"
-                elif angle_estimate.angle in ("front_or_rear", "uncertain"):
-                    st.warning(
-                        f"📐 Camera angle check: {angle_estimate.confidence_note} "
-                        f"(shoulder-width ratio: {angle_estimate.ratio})"
-                    )
-                    angle_choice = st.radio(
-                        "Which angle was this filmed from? This changes what Trunk Lean "
-                        "and Head Stability actually measure.",
-                        ["Side-on", "Rear-view (behind bowler)", "Front-on (facing bowler)", "Not sure"],
-                        key="angle_confirm_radio", horizontal=True
-                    )
-                    resolved_angle = {
-                        "Side-on": "side_on",
-                        "Rear-view (behind bowler)": "rear",
-                        "Front-on (facing bowler)": "front",
-                        "Not sure": "unknown",
-                    }[angle_choice]
-                else:
-                    resolved_angle = "unknown"
+            # CAMERA ANGLE: already confirmed UPFRONT (before Execute) for Single
+            # Camera mode — see the "Filming Angle Check" step. No longer asked
+            # again here after the analysis has already run with a guess. Dual
+            # Camera has no ambiguity to resolve (its two streams' angles are
+            # known by construction), so it keeps the side-on-interpretation
+            # default it always had.
+            resolved_angle = st.session_state.get("pending_angle_label") or "side_on"
 
             # TIMELINE
             st.header("⏱️ Kinematic Sequence Timeline")
@@ -1212,6 +1283,10 @@ if st.session_state.get("pending_result_payload") is not None:
                         **metrics,
                         "_data_quality": quality,
                         "_run_up": {"analysis": run_up_result, "strike_summary": strike_summary},
+                        # Coach-confirmed camera angle, not a guess — real labeled
+                        # data for a future trained angle classifier (Phase 2),
+                        # collected for free as a side effect of normal use.
+                        "_camera_angle_confirmed": resolved_angle,
                     }
                     store.save_session(
                         athlete_id=athlete_id,

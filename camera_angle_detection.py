@@ -84,7 +84,10 @@ def estimate_camera_angle(df: pd.DataFrame, reference_frame_idx: int,
     shoulder_width_px = shoulder_width_norm * frame_width
     body_height_px = body_height_norm * frame_height
     ratio = round(shoulder_width_px / body_height_px, 4)
+    return _classify_ratio(ratio)
 
+
+def _classify_ratio(ratio: float) -> AngleEstimate:
     if ratio <= SIDE_ON_MAX_RATIO:
         return AngleEstimate("side_on", ratio,
                               "Shoulders nearly edge-on to camera — consistent with side-on filming.")
@@ -96,3 +99,5 @@ def estimate_camera_angle(df: pd.DataFrame, reference_frame_idx: int,
         return AngleEstimate("uncertain", ratio,
                               "Shoulder-width ratio is in an ambiguous range — could be a partial/"
                               "oblique angle. Please confirm the filming angle manually.")
+
+

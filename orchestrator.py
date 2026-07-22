@@ -1388,13 +1388,116 @@ def transcode_to_h264(input_path: str) -> str:
     return input_path
 
 
+def extract_and_detect_events(video_path: str,
+                               output_dir: str = "output",
+                               bowling_arm_override: str = None,
+                               seed_point: tuple = None,
+                               seed_frame_index: int = 0,
+                               extra_seeds: list = None,
+                               camera_angle_override: str = None) -> dict:
+    """
+    STAGE 1+2 split out on its own: landmark extraction, bowling-arm
+    detection, camera-angle estimate, and event detection — everything
+    needed to show the coach a confirmable camera-angle guess BEFORE
+    paying for the more expensive metrics+video-rendering stage below.
+
+    Split out specifically so the UI can ask "is this side-on/front/rear?"
+    right after this (relatively fast) stage instead of after the full
+    pipeline (including ffmpeg transcoding) has already run once with a
+    guess. See run_complete_bowling_analysis, which calls this internally
+    and continues with the rest for callers that don't need the two-step
+    UI flow (dual-camera, CLI use, etc).
+
+    Returns {"status": "success", "df": DataFrame, "csv_path": str,
+    "fps": float, "bowling_arm": str, "events": dict,
+    "angle_estimate": AngleEstimate} or {"status": "failed", ...}.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "landmarks.csv")
+
+    extraction = extract_video_landmarks(video_path, csv_path,
+                                          seed_point=seed_point,
+                                          seed_frame_index=seed_frame_index,
+                                          extra_seeds=extra_seeds)
+
+    if extraction["status"] == "error":
+        return {
+            "status": "failed",
+            "stage": "perception",
+            "message": extraction["error_message"]
+        }
+
+    df = pd.read_csv(csv_path)
+    fps = extraction["fps"]
+
+    if bowling_arm_override in ("left", "right"):
+        bowling_arm = bowling_arm_override
+    else:
+        bowling_arm = detect_bowling_arm(df)
+
+    # Camera angle feeds the elbow-plausibility gate inside event detection
+    # (see detect_delivery_events).
+    #
+    # SAMPLED across several frames, not a single midpoint: verified
+    # directly on real footage that one arbitrary frame (e.g. the clip's
+    # exact midpoint, likely still mid-run-up) can show a misleadingly
+    # rotated torso — a genuinely side-on camera setup got classified as
+    # "front_or_rear" because that one frame's body pose, not the camera
+    # position, happened to have a wide projected shoulder width. Sampling
+    # several frames across the back half of the clip (closer to the
+    # actual delivery, away from early run-up where he's also smaller/
+    # more distant) and taking the majority vote is robust to any single
+    # frame's incidental pose.
+    angle_estimate = None
+    if camera_angle_override in ("side_on", "front_or_rear", "uncertain"):
+        camera_angle = camera_angle_override
+    else:
+        cap_probe = cv2.VideoCapture(video_path)
+        probe_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+        probe_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        cap_probe.release()
+        sample_fracs = (0.5, 0.6, 0.7, 0.8, 0.9)
+        votes = {}
+        ratios = []
+        for frac in sample_fracs:
+            est = cad.estimate_camera_angle(df, int(len(df) * frac), probe_w, probe_h)
+            if est.angle not in ("unavailable",):
+                votes[est.angle] = votes.get(est.angle, 0) + 1
+            if est.ratio is not None:
+                ratios.append(est.ratio)
+        if votes:
+            camera_angle = max(votes, key=votes.get)
+            angle_estimate = cad.AngleEstimate(
+                camera_angle, (ratios[len(ratios) // 2] if ratios else None),
+                f"Auto-detected from {len(votes)} frame(s) sampled through the delivery half of the clip."
+            )
+        else:
+            camera_angle = "uncertain"
+            angle_estimate = cad.AngleEstimate("uncertain", None, "Could not confidently sample any frame.")
+
+    events = detect_delivery_events(df, fps, bowling_arm=bowling_arm,
+                                     camera_angle=camera_angle)
+
+    return {
+        "status": "success",
+        "df": df,
+        "csv_path": csv_path,
+        "fps": fps,
+        "bowling_arm": bowling_arm,
+        "camera_angle": camera_angle,
+        "angle_estimate": angle_estimate,
+        "events": events,
+    }
+
+
 def run_complete_bowling_analysis(video_path: str,
                                    output_dir: str = "output",
                                    bowling_arm_override: str = None,
                                    seed_point: tuple = None,
                                    seed_frame_index: int = 0,
                                    extra_seeds: list = None,
-                                   camera_angle_override: str = None) -> dict:
+                                   camera_angle_override: str = None,
+                                   precomputed: dict = None) -> dict:
     """
     Core orchestration loop.
     Extracts landmarks, detects events, calculates all 5 biomechanical
@@ -1421,69 +1524,28 @@ def run_complete_bowling_analysis(video_path: str,
     of the same clip, misclassifying it and disabling a real-fix release
     check that only applies to side-on footage. A human confirmation
     should win over that shaky auto-guess. None (default) uses auto-detect.
+
+    precomputed: optional result dict already returned by
+    extract_and_detect_events — reuses it instead of re-running extraction,
+    for callers (the Streamlit UI) that already ran that stage to show the
+    camera-angle confirmation before this function is called.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    csv_path = os.path.join(output_dir, "landmarks.csv")
-
-    # STAGE 1 — LANDMARK EXTRACTION
-    extraction = extract_video_landmarks(video_path, csv_path,
-                                          seed_point=seed_point,
-                                          seed_frame_index=seed_frame_index,
-                                          extra_seeds=extra_seeds)
-
-    if extraction["status"] == "error":
-        return {
-            "status": "failed",
-            "stage": "perception",
-            "message": extraction["error_message"]
-        }
-
-    df = pd.read_csv(csv_path)
-    fps = extraction["fps"]
-
-    # STAGE 2 — BOWLING ARM DETECTION + EVENT DETECTION
-    if bowling_arm_override in ("left", "right"):
-        bowling_arm = bowling_arm_override
+    if precomputed is not None and precomputed.get("status") == "success":
+        stage12 = precomputed
     else:
-        bowling_arm = detect_bowling_arm(df)
+        stage12 = extract_and_detect_events(
+            video_path, output_dir=output_dir,
+            bowling_arm_override=bowling_arm_override,
+            seed_point=seed_point, seed_frame_index=seed_frame_index,
+            extra_seeds=extra_seeds, camera_angle_override=camera_angle_override,
+        )
+    if stage12["status"] != "success":
+        return stage12
 
-    # Camera angle feeds the elbow-plausibility gate inside event detection
-    # (see detect_delivery_events) — computed here so it's used automatically
-    # on every run, not just when the UI separately happens to check it.
-    #
-    # SAMPLED across several frames, not a single midpoint: verified
-    # directly on real footage that one arbitrary frame (e.g. the clip's
-    # exact midpoint, likely still mid-run-up) can show a misleadingly
-    # rotated torso — a genuinely side-on camera setup got classified as
-    # "front_or_rear" because that one frame's body pose, not the camera
-    # position, happened to have a wide projected shoulder width. Sampling
-    # several frames across the back half of the clip (closer to the
-    # actual delivery, away from early run-up where he's also smaller/
-    # more distant) and taking the majority vote is robust to any single
-    # frame's incidental pose.
-    if camera_angle_override in ("side_on", "front_or_rear", "uncertain"):
-        camera_angle = camera_angle_override
-    else:
-        cap_probe = cv2.VideoCapture(video_path)
-        probe_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-        probe_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-        cap_probe.release()
-        sample_fracs = (0.5, 0.6, 0.7, 0.8, 0.9)
-        votes = {}
-        ratios = []
-        for frac in sample_fracs:
-            est = cad.estimate_camera_angle(df, int(len(df) * frac), probe_w, probe_h)
-            if est.angle not in ("unavailable",):
-                votes[est.angle] = votes.get(est.angle, 0) + 1
-            if est.ratio is not None:
-                ratios.append(est.ratio)
-        if votes:
-            camera_angle = max(votes, key=votes.get)
-        else:
-            camera_angle = "uncertain"
-
-    events = detect_delivery_events(df, fps, bowling_arm=bowling_arm,
-                                     camera_angle=camera_angle)
+    df = stage12["df"]
+    fps = stage12["fps"]
+    bowling_arm = stage12["bowling_arm"]
+    events = stage12["events"]
 
     # STAGE 3 — FRAME VALIDATION
     ffc_rows = df[df["frame"] == events["FFC"]]
