@@ -87,15 +87,27 @@ RANGES = {
     "release_height": MetricRange(
         label="Release Height",
         unit="%",
-        kind="band",
-        green=(0.85, 1.05),
-        amber=(0.75, 0.85),          # lower bound: under-extension
-        amber_high=(1.05, 1.15),     # upper bound: over-extension/lunge
-        # NOTE: the 1.05-1.15 amber / >1.15 red upper thresholds are an
-        # engineering default (symmetric margin to the lower bound), not a
-        # cited clinical/biomechanics source. Replace with a real reference
-        # if one becomes available. Do not describe this as validated.
-        display_optimal="85–105%",
+        # BUG FIX (was kind="band"): a low release ratio is a real coaching
+        # concern (a "low-sling" action releasing well below head height,
+        # losing the leverage a higher release gives), but a HIGH ratio is
+        # not the symmetric opposite fault — it's not an established
+        # biomechanics concern at all. Tall bowlers and bowlers with a
+        # pronounced leap/jump in their action (verified directly on a real
+        # session: a genuinely excellent, athletic leaping delivery)
+        # routinely and legitimately release well above head height —
+        # that's a documented trait of some elite fast bowlers, not a
+        # fault. "band" was flagging that as "Critical" purely from an
+        # unjustified symmetric margin around the lower bound (the
+        # previous NOTE here already admitted this wasn't from any cited
+        # source). A separate, genuine implausibility ceiling already
+        # exists elsewhere (calculate_release_height_ratio_safe rejects
+        # anything above 1.30 as a likely tracking/geometry error before
+        # it ever reaches this classification) — that's the right place
+        # for a hard limit, not a "technique fault" label at 115%.
+        kind="higher_better",
+        green=(0.85, 1.30),
+        amber=(0.75, 0.85),          # genuine concern: under-extension/low-sling
+        display_optimal="85%+",
     ),
     "head_stability": MetricRange(
         label="Head Stability",
