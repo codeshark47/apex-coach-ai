@@ -905,11 +905,24 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
     total_frames = int(df["frame"].max()) + 1 if len(df) else 0
 
+    # BUG FIX: this was hardcoded to always measure the LEFT knee,
+    # regardless of bowling_arm — for a left-arm bowler the real lead
+    # (front, bracing) leg is the RIGHT leg, so every left-arm session's
+    # video overlay (chart + RELEASE/CONTACT badge KNEE value) was
+    # displaying the TRAILING leg's angle instead, silently disagreeing
+    # with the correct lead-side-aware number already used in the actual
+    # report/PDF (calculate_knee_bracing, which was never affected by
+    # this — only this chart-drawing duplicate of the calculation was).
+    # Verified directly: on a real left-arm rear-view session, the
+    # burned-in badge showed 173deg while the correct lead-knee value at
+    # that exact frame was ~152deg.
+    _chart_lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+
     def _row_knee_angle(r):
         try:
-            h = np.array([float(r["LEFT_HIP_x"]), float(r["LEFT_HIP_y"])])
-            k = np.array([float(r["LEFT_KNEE_x"]), float(r["LEFT_KNEE_y"])])
-            a = np.array([float(r["LEFT_ANKLE_x"]), float(r["LEFT_ANKLE_y"])])
+            h = np.array([float(r[f"{_chart_lead_side}_HIP_x"]), float(r[f"{_chart_lead_side}_HIP_y"])])
+            k = np.array([float(r[f"{_chart_lead_side}_KNEE_x"]), float(r[f"{_chart_lead_side}_KNEE_y"])])
+            a = np.array([float(r[f"{_chart_lead_side}_ANKLE_x"]), float(r[f"{_chart_lead_side}_ANKLE_y"])])
             kh, ka = h - k, a - k
             denom = np.linalg.norm(kh) * np.linalg.norm(ka)
             if denom == 0 or np.isnan(denom):
