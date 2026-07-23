@@ -699,52 +699,57 @@ confirmed_angle_functional = None   # "side_on" | "front_or_rear" — feeds the 
 confirmed_angle_label = None        # "side_on" | "front" | "rear" | "unknown" — for captions + logging
 
 if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None:
+    single_ref_path = st.session_state.get("single_seed_ref_path")
+    # Includes bowling-arm, seed choices, AND the sidebar angle override —
+    # any of these changing (coach corrects the arm, adds a second seed,
+    # flips the angle dropdown) means the extraction/events below are
+    # stale and must rerun, not just be reused because the file itself
+    # is unchanged.
+    single_file_identity = (
+        f"{uploaded_single.name}_{uploaded_single.size}_{bowling_arm_override}"
+        f"_{single_seed_point}_{single_seed_frame}_{single_extra_seeds}_{camera_angle_override}"
+    )
+
+    # Runs the REAL extraction+event-detection stage now (cached per
+    # file — this is real work, not free) instead of a cheap isolated-
+    # frame heuristic. Verified directly that a lightweight shortcut
+    # here (single-frame detection, or sampling early run-up frames)
+    # is unreliable on real footage: isolated frames often fail to
+    # detect a small/distant bowler at all, and early run-up frames
+    # can show a misleadingly rotated torso if the bowler curves into
+    # his approach. The full extraction already needs to run before
+    # Execute's metrics/rendering stage anyway — doing it here just
+    # means the angle/release-frame questions get asked right after THIS
+    # (cheaper) stage instead of after the full pipeline including video
+    # rendering has already run once with a guess. Runs UNCONDITIONALLY
+    # now (previously skipped entirely when the coach set a manual angle
+    # override in the sidebar) — BUG FIX: the release-frame confirmation
+    # below needs stage12_result/single_ref_path regardless of which
+    # angle path is taken; skipping this for the manual-override branch
+    # left those referenced before assignment, crashing with a NameError
+    # the moment a coach used the sidebar override on real (Streamlit
+    # Cloud) traffic.
+    if st.session_state.get("_stage12_identity") != single_file_identity:
+        with st.spinner("📐 Extracting tracking data and checking filming angle..."):
+            st.session_state["_stage12_result"] = o.extract_and_detect_events(
+                single_ref_path, output_dir="output",
+                bowling_arm_override=bowling_arm_override,
+                seed_point=single_seed_point, seed_frame_index=single_seed_frame,
+                extra_seeds=single_extra_seeds,
+                camera_angle_override=camera_angle_override,
+            )
+        st.session_state["_stage12_identity"] = single_file_identity
+        st.session_state["_angle_confirmed_choice"] = None
+
+    stage12_result = st.session_state.get("_stage12_result")
+
     if camera_angle_override is not None:
         # Coach already told us via the sidebar — trust that over any guess.
-        # BUG FIX: this used to label the "front_or_rear" override as
-        # "unknown" (same as a genuinely unresolved "Not sure" choice) —
-        # harmless before angle_resolved existed as a hard gate below, but
-        # would have wrongly blocked a coach who explicitly, confidently
-        # picked "Rear-view / Front-on" in the sidebar. Only a real "Not
-        # sure" (no override given, and the upfront radio left unconfirmed)
-        # should count as unresolved.
+        # Only a real "Not sure" (no override given, and the upfront radio
+        # left unconfirmed) should count as unresolved.
         confirmed_angle_functional = camera_angle_override
         confirmed_angle_label = "side_on" if camera_angle_override == "side_on" else "front_or_rear_manual"
     else:
-        single_ref_path = st.session_state.get("single_seed_ref_path")
-        # Includes bowling-arm and seed choices, not just the filename —
-        # any of these changing (coach corrects the arm, adds a second
-        # seed) means the extraction/events below are stale and must
-        # rerun, not just be reused because the file itself is unchanged.
-        single_file_identity = (
-            f"{uploaded_single.name}_{uploaded_single.size}_{bowling_arm_override}"
-            f"_{single_seed_point}_{single_seed_frame}_{single_extra_seeds}"
-        )
-
-        # Runs the REAL extraction+event-detection stage now (cached per
-        # file — this is real work, not free) instead of a cheap isolated-
-        # frame heuristic. Verified directly that a lightweight shortcut
-        # here (single-frame detection, or sampling early run-up frames)
-        # is unreliable on real footage: isolated frames often fail to
-        # detect a small/distant bowler at all, and early run-up frames
-        # can show a misleadingly rotated torso if the bowler curves into
-        # his approach. The full extraction already needs to run before
-        # Execute's metrics/rendering stage anyway — doing it here just
-        # means the angle question gets asked right after THIS (cheaper)
-        # stage instead of after the full pipeline including video
-        # rendering has already run once with a guess.
-        if st.session_state.get("_stage12_identity") != single_file_identity:
-            with st.spinner("📐 Extracting tracking data and checking filming angle..."):
-                st.session_state["_stage12_result"] = o.extract_and_detect_events(
-                    single_ref_path, output_dir="output",
-                    bowling_arm_override=bowling_arm_override,
-                    seed_point=single_seed_point, seed_frame_index=single_seed_frame,
-                    extra_seeds=single_extra_seeds,
-                )
-            st.session_state["_stage12_identity"] = single_file_identity
-            st.session_state["_angle_confirmed_choice"] = None
-
-        stage12_result = st.session_state.get("_stage12_result")
         angle_estimate = stage12_result.get("angle_estimate") if stage12_result and stage12_result.get("status") == "success" else None
 
         choice_labels = ["Side-on", "Rear-view (behind bowler)", "Front-on (facing bowler)", "Not sure"]
