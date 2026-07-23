@@ -39,6 +39,52 @@ def _nearest_complete_row(df: pd.DataFrame, frame_idx: int, required_cols: list,
     return None
 
 
+def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm: str,
+                                   max_search: int = 90):
+    """
+    Searches outward from frame_idx (closest frame first) for the nearest
+    frame where the lead ankle is genuinely grounded — below both the
+    knee and hip in the frame, same plausibility check already used
+    inside calculate_release_height_ratio_safe — to use as the "body
+    height" reference for that function, instead of relying on a
+    separately-timed front-foot-plant detection.
+
+    WHY THIS EXISTS: verified directly on real footage (a leaping
+    delivery filmed rear-view) that front-foot-plant TIMING detection
+    can fail outright for bowlers who are airborne through release —
+    there's no clean "foot stops moving" moment to find at all, so
+    whatever frame that detector picks can be an ordinary mid-run-up
+    running stride, which is not a grounded reference. But we don't
+    actually need to know WHEN he planted — we only need ANY nearby
+    frame where he's plausibly standing upright, to measure his real
+    body height. That's a much easier, more robust question, especially
+    once frame_idx itself is a coach-CONFIRMED release frame rather
+    than an auto-detected guess: searching close to a verified anchor
+    is far more trustworthy than searching near an unverified one.
+
+    Returns a pd.Series (the row) or None if nothing within range
+    qualifies (a genuinely unusual clip, not a bug in the search).
+    """
+    lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+    required = ["NOSE_y", f"{lead_side}_ANKLE_y", f"{lead_side}_KNEE_y", f"{lead_side}_HIP_y"]
+
+    def _is_grounded(row) -> bool:
+        if any(pd.isna(row.get(c)) for c in required):
+            return False
+        return float(row[f"{lead_side}_ANKLE_y"]) >= float(row[f"{lead_side}_KNEE_y"]) and \
+            float(row[f"{lead_side}_ANKLE_y"]) >= float(row[f"{lead_side}_HIP_y"])
+
+    rows = df[df["frame"] == frame_idx]
+    if not rows.empty and _is_grounded(rows.iloc[0]):
+        return rows.iloc[0]
+    for offset in range(1, max_search + 1):
+        for candidate in (frame_idx - offset, frame_idx + offset):
+            rows = df[df["frame"] == candidate]
+            if not rows.empty and _is_grounded(rows.iloc[0]):
+                return rows.iloc[0]
+    return None
+
+
 def detect_bowling_arm(df: pd.DataFrame) -> str:
     """
     Auto-detects which arm is the bowling arm by comparing vertical
@@ -897,11 +943,13 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         br_rows = df[df["frame"] == br_frame]
         if not br_rows.empty:
             br_row_for_release = br_rows.iloc[0]
-            ffc_row_for_release = _nearest_complete_row(
-                df, events.get("FFC"), ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
-            )
+            height_ref_for_release = _find_grounded_reference_near(df, br_frame, bowling_arm)
+            if height_ref_for_release is None:
+                height_ref_for_release = _nearest_complete_row(
+                    df, events.get("FFC"), ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+                )
             rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm,
-                                                      reference_row=ffc_row_for_release)
+                                                      reference_row=height_ref_for_release)
             if rh.get("ratio") is not None:
                 release_height_pct = rh["ratio"] * 100
                 dbg = rh.get("debug_raw") or {}
@@ -1576,11 +1624,23 @@ def run_complete_bowling_analysis(video_path: str,
     lean_analysis = calculate_trunk_lean(br_row)
     head_stability = calculate_head_stability(df, events["BFC"], events["BR"])
     hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
-    ffc_row_for_height = _nearest_complete_row(
-        df, events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
-    )
+    # Anchored on BR (the release frame — coach-confirmable, see the
+    # Streamlit release-frame-confirmation step), not FFC. FFC's own
+    # detected TIMING can be wrong for leaping bowlers (see
+    # _find_grounded_reference_near's docstring) — but we don't actually
+    # need FFC's timing to be right for this, we just need any nearby
+    # frame where he's plausibly grounded, and searching near a verified
+    # release frame is far more trustworthy than near an unverified one.
+    height_reference_row = _find_grounded_reference_near(df, events["BR"], bowling_arm)
+    if height_reference_row is None:
+        # Genuinely nothing grounded nearby (e.g. he's airborne the whole
+        # window) — fall back to the old FFC-based search rather than
+        # silently having no reference at all.
+        height_reference_row = _nearest_complete_row(
+            df, events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+        )
     release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm,
-                                                           reference_row=ffc_row_for_height)
+                                                           reference_row=height_reference_row)
 
     # FFC-to-Release knee angle delta ("yielding knee" check flagged in
     # external biomechanical audit): a static single-frame knee angle at
@@ -1650,6 +1710,12 @@ def run_complete_bowling_analysis(video_path: str,
             "ball_release_frame": events["BR"],
             "ball_release_confidence": events.get("BR_confidence", "high"),
             "ball_release_plausible_fraction": events.get("BR_plausible_fraction", 1.0),
+            # Present only when the Streamlit UI overrode the auto-detected
+            # BR with a coach-confirmed frame — real (auto, confirmed) label
+            # pairs for Phase 2 training, not present for callers (CLI,
+            # dual-camera) that don't run that confirmation step.
+            "ball_release_frame_auto_detected": events.get("BR_auto_detected"),
+            "ball_release_auto_confidence": events.get("BR_auto_confidence"),
         },
         "biomechanical_metrics": {
             "trunk_lean": {

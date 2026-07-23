@@ -780,6 +780,61 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
         }[st.session_state["_angle_confirmed_choice"]]
         confirmed_angle_functional = "side_on" if confirmed_angle_label == "side_on" else "front_or_rear"
 
+    # BALL RELEASE FRAME — CONFIRMED BY THE COACH, ALWAYS, not just when
+    # confidence looks low. Verified directly on real footage (a leaping
+    # delivery filmed rear-view): the auto-detector reported "high"
+    # confidence (1.0 plausible fraction) while landing 38 frames early,
+    # on an ordinary running stride instead of the real release swing —
+    # every frame it looked at really was genuinely tracked, just from
+    # the wrong part of the delivery, which is exactly the kind of error
+    # this confidence score cannot see. Since it's proven unreliable as a
+    # signal for when to skip confirmation, this step is never skipped:
+    # a human directly watching the footage cannot make that mistake.
+    # This also fixes release height's dependence on separately-timed
+    # front-foot-plant detection (see _find_grounded_reference_near) —
+    # once release is a verified anchor, the "grounded reference" search
+    # centers on it instead of an independently-guessed plant frame.
+    if st.session_state.get("_br_confirmed_identity") != single_file_identity:
+        st.session_state["_br_confirmed_frame"] = None
+        st.session_state["_br_confirmed_identity"] = single_file_identity
+
+    br_auto = None
+    br_confidence = None
+    if stage12_result is not None and stage12_result.get("status") == "success":
+        br_auto = stage12_result["events"].get("BR")
+        br_confidence = stage12_result["events"].get("BR_confidence")
+
+    with st.expander("🎯 Confirm Ball Release Frame",
+                      expanded=st.session_state.get("_br_confirmed_frame") is None):
+        if br_auto is None:
+            st.error("Couldn't detect a release frame at all — check tracking above.")
+        else:
+            conf_note = {"high": "high confidence", "low": "low confidence"}.get(br_confidence, "unknown confidence")
+            st.info(
+                f"Algorithm's best guess: **frame {br_auto}** ({conf_note}). Scrub to the exact "
+                f"frame where the ball actually leaves the hand and confirm — this feeds Release "
+                f"Height, and every metric that depends on it, directly. Auto-detection can be "
+                f"wrong even when it reports high confidence, so this step always runs."
+            )
+            total_frames_single = cal.get_frame_count(single_ref_path)
+            br_slider_val = st.slider(
+                "Scrub to the true ball-release frame",
+                min_value=0, max_value=max(total_frames_single - 1, 0),
+                value=min(max(br_auto, 0), max(total_frames_single - 1, 0)),
+                key="br_confirm_slider"
+            )
+            br_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=br_slider_val)
+            if br_frame_img is not None:
+                st.image(br_frame_img, use_column_width=True,
+                          caption=f"Frame {br_slider_val} — is the ball leaving the hand here?")
+            if st.button("✅ Confirm this is the release frame", key="confirm_br_button"):
+                st.session_state["_br_confirmed_frame"] = br_slider_val
+                st.rerun()
+            if st.session_state.get("_br_confirmed_frame") is not None:
+                st.success(f"Confirmed: release at frame {st.session_state['_br_confirmed_frame']}.")
+
+br_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_br_confirmed_frame") is not None)
+
 # Angle must be genuinely resolved (not left on "Not sure") before running —
 # matches the same hard-gate already applied to bowling arm above. Dual
 # Camera doesn't need this: each stream's angle is known by construction.
@@ -788,7 +843,8 @@ angle_resolved = (camera_mode != "Single Camera") or (
 )
 
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
-                 and single_seed_point is not None and bowling_arm_selected and angle_resolved)
+                 and single_seed_point is not None and bowling_arm_selected and angle_resolved
+                 and br_resolved)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None
               and side_seed_point is not None and rear_seed_point is not None
@@ -804,6 +860,10 @@ elif (camera_mode == "Single Camera" and uploaded_single is not None and single_
       and bowling_arm_selected and not angle_resolved):
     st.sidebar.warning("👆 Confirm the filming angle above (not \"Not sure\") to enable analysis — "
                         "this changes what several metrics actually measure.")
+elif (camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None
+      and bowling_arm_selected and angle_resolved and not br_resolved):
+    st.sidebar.warning("👆 Confirm the ball release frame above to enable analysis — "
+                        "this feeds Release Height and every metric that depends on it.")
 
 import usage_limits
 _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
@@ -860,12 +920,35 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     _stage12 is not None and _stage12.get("status") == "success"
                     and _stage12.get("camera_angle") == confirmed_angle_functional
                 )
+                if not _reuse:
+                    _stage12 = o.extract_and_detect_events(
+                        video_path, output_dir="output", bowling_arm_override=bowling_arm_override,
+                        seed_point=single_seed_point, seed_frame_index=single_seed_frame,
+                        extra_seeds=single_extra_seeds, camera_angle_override=confirmed_angle_functional,
+                    )
+
+                # Coach-confirmed release frame OVERRIDES the auto-detected
+                # one here, before metrics/rendering run — see "Confirm Ball
+                # Release Frame" above for why this is never skipped. The
+                # original auto guess is kept alongside (not discarded) so
+                # it can be logged for Phase 2 training data: every session
+                # becomes a real (auto_guess, coach_confirmed) label pair.
+                _br_confirmed = st.session_state.get("_br_confirmed_frame")
+                if _stage12 is not None and _stage12.get("status") == "success" and _br_confirmed is not None:
+                    _stage12 = dict(_stage12)
+                    _stage12["events"] = dict(_stage12["events"])
+                    _stage12["events"]["BR_auto_detected"] = _stage12["events"].get("BR")
+                    _stage12["events"]["BR_auto_confidence"] = _stage12["events"].get("BR_confidence")
+                    _stage12["events"]["BR"] = _br_confirmed
+                    _stage12["events"]["BR_confidence"] = "coach_confirmed"
+                    _stage12["events"]["BR_plausible_fraction"] = 1.0
+
                 result_payload = run_complete_bowling_analysis(
                     video_path, bowling_arm_override=bowling_arm_override,
                     seed_point=single_seed_point, seed_frame_index=single_seed_frame,
                     extra_seeds=single_extra_seeds,
                     camera_angle_override=confirmed_angle_functional,
-                    precomputed=_stage12 if _reuse else None,
+                    precomputed=_stage12,
                 )
                 active_camera_mode = "Single Camera"
                 st.session_state.pending_angle_label = confirmed_angle_label
@@ -1305,6 +1388,15 @@ if st.session_state.get("pending_result_payload") is not None:
                         # data for a future trained angle classifier (Phase 2),
                         # collected for free as a side effect of normal use.
                         "_camera_angle_confirmed": resolved_angle,
+                        # Same idea for release-frame timing: real (auto-guess,
+                        # coach-confirmed) label pairs, logged whenever the
+                        # single-camera confirmation step ran. Only present for
+                        # Single Camera — see run_complete_bowling_analysis.
+                        "_release_frame_confirmed": {
+                            "auto_detected": frames.get("ball_release_frame_auto_detected"),
+                            "auto_confidence": frames.get("ball_release_auto_confidence"),
+                            "coach_confirmed": frames.get("ball_release_frame"),
+                        } if frames.get("ball_release_frame_auto_detected") is not None else None,
                     }
                     store.save_session(
                         athlete_id=athlete_id,

@@ -9,6 +9,7 @@ from orchestrator import (
     transcode_to_h264,
     detect_bowling_arm,
     _nearest_complete_row,
+    _find_grounded_reference_near,
 )
 from main import extract_video_landmarks
 from kinematics import calculate_knee_bracing, calculate_trunk_lean, calculate_head_stability
@@ -69,11 +70,13 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     knee_analysis     = calculate_knee_bracing(side_ffc_rows.iloc[0], lead_side=lead_side)
     knee_at_release   = calculate_knee_bracing(side_br_rows.iloc[0], lead_side=lead_side)
     lean_analysis     = calculate_trunk_lean(side_br_rows.iloc[0])
-    side_ffc_row_for_height = _nearest_complete_row(
-        side_df, side_events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
-    )
+    side_height_ref = _find_grounded_reference_near(side_df, side_events["BR"], bowling_arm)
+    if side_height_ref is None:
+        side_height_ref = _nearest_complete_row(
+            side_df, side_events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+        )
     release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm,
-                                                              reference_row=side_ffc_row_for_height)
+                                                              reference_row=side_height_ref)
 
     # FFC-to-Release knee angle delta ("yielding knee" check from external
     # biomechanical audit) — same logic as Single Camera mode.
