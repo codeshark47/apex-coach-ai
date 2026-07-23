@@ -61,6 +61,7 @@ def detect_ball_candidates(
     min_circularity: float = 0.55,
     history: int = 120,
     var_threshold: float = 40.0,
+    roi: Optional[tuple] = None,
     debug_output_path: Optional[str] = None,
 ) -> dict:
     """
@@ -77,6 +78,17 @@ def detect_ball_candidates(
     starting bounds, not calibrated values. Expect to need per-setup
     tuning once real footage is available, same as calibration.py
     already requires for real-world distance.
+
+    roi: optional (x1, y1, x2, y2) in pixels — restricts detection to
+    this region. Verified directly on real footage: with no ROI, the
+    dominant source of false positives wasn't the players at all, it was
+    wind-moved trees and background clutter far behind the pitch, which
+    a fixed camera still picks up as "foreground motion" just like a real
+    moving ball. Since the ball physically cannot leave the pitch
+    corridor in a fixed behind-the-stumps or side-on shot, restricting
+    to that region removes this category of false positive entirely
+    instead of trying to filter it out after the fact. Per-camera-setup,
+    not a universal constant — must be set per video framing.
 
     debug_output_path: if given, writes an annotated video with every
     surviving candidate circled — the actual way to evaluate this
@@ -120,6 +132,12 @@ def detect_ball_candidates(
         # own design, not a bug here.
         _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+        if roi is not None:
+            x1, y1, x2, y2 = roi
+            roi_mask = np.zeros_like(fg_mask)
+            roi_mask[y1:y2, x1:x2] = 255
+            fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
 
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         frame_candidates = []
