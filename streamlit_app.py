@@ -701,8 +701,15 @@ confirmed_angle_label = None        # "side_on" | "front" | "rear" | "unknown" �
 if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None:
     if camera_angle_override is not None:
         # Coach already told us via the sidebar — trust that over any guess.
+        # BUG FIX: this used to label the "front_or_rear" override as
+        # "unknown" (same as a genuinely unresolved "Not sure" choice) —
+        # harmless before angle_resolved existed as a hard gate below, but
+        # would have wrongly blocked a coach who explicitly, confidently
+        # picked "Rear-view / Front-on" in the sidebar. Only a real "Not
+        # sure" (no override given, and the upfront radio left unconfirmed)
+        # should count as unresolved.
         confirmed_angle_functional = camera_angle_override
-        confirmed_angle_label = "side_on" if camera_angle_override == "side_on" else "unknown"
+        confirmed_angle_label = "side_on" if camera_angle_override == "side_on" else "front_or_rear_manual"
     else:
         single_ref_path = st.session_state.get("single_seed_ref_path")
         # Includes bowling-arm and seed choices, not just the filename —
@@ -773,8 +780,15 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
         }[st.session_state["_angle_confirmed_choice"]]
         confirmed_angle_functional = "side_on" if confirmed_angle_label == "side_on" else "front_or_rear"
 
+# Angle must be genuinely resolved (not left on "Not sure") before running —
+# matches the same hard-gate already applied to bowling arm above. Dual
+# Camera doesn't need this: each stream's angle is known by construction.
+angle_resolved = (camera_mode != "Single Camera") or (
+    confirmed_angle_label is not None and confirmed_angle_label != "unknown"
+)
+
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
-                 and single_seed_point is not None and bowling_arm_selected)
+                 and single_seed_point is not None and bowling_arm_selected and angle_resolved)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None
               and side_seed_point is not None and rear_seed_point is not None
@@ -786,6 +800,10 @@ elif camera_mode != "Single Camera" and uploaded_side is not None and uploaded_r
     st.sidebar.warning("👆 Click the bowler in both frames above to enable analysis.")
 elif not bowling_arm_selected and (uploaded_single is not None or uploaded_side is not None):
     st.sidebar.warning("👆 Select Right-arm or Left-arm above to enable analysis — auto-detect is not reliable enough to run on by default.")
+elif (camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None
+      and bowling_arm_selected and not angle_resolved):
+    st.sidebar.warning("👆 Confirm the filming angle above (not \"Not sure\") to enable analysis — "
+                        "this changes what several metrics actually measure.")
 
 import usage_limits
 _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
