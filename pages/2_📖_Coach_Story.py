@@ -9,7 +9,13 @@ st.markdown("""
 h1, h2, h3 { color: #00B4D8 !important; }
 .story-card {
     background: linear-gradient(145deg, #121824, #1A2333);
-    border: 1px solid #1E3A5F; border-radius: 12px; padding: 24px; margin-bottom: 16px;
+    border: 1px solid #1E3A5F; border-radius: 12px; padding: 28px 32px; margin-bottom: 18px;
+}
+.story-card p { line-height: 1.7; font-size: 1.02rem; }
+.story-tag {
+    display: inline-block; background: #0F2A44; color: #4FD1E8 !important;
+    border: 1px solid #1E3A5F; border-radius: 999px; padding: 4px 14px;
+    font-size: 0.82rem; margin: 4px 8px 4px 0;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -17,40 +23,40 @@ h1, h2, h3 { color: #00B4D8 !important; }
 st.markdown("<h1 style='text-align:center;'>📖 The Story Behind Apex Coach AI</h1>", unsafe_allow_html=True)
 st.divider()
 
-# ============================================================
-# EDIT THIS SECTION — everything below is placeholder structure.
-# I don't have any real details about your actual background,
-# coaching history, or the specific reason you built this — filling
-# that in with invented achievements/years/credentials would be
-# dishonest to present to real visitors. Replace the bracketed
-# text with your real story.
-# ============================================================
-
 st.markdown("""
 <div class="story-card">
 
-### [Shoaib Nazar], Founder
+### Shoaib Nazar — Founder
 
-**[Most professionals spend their entire lives choosing a single lane. Shoaib Nazar never did—because both the competitive drive of elite sports and the ruthless execution of the corporate boardroom chose him. The corporate world sharpened his operational management; the cricket pitch defined his technical identity. Together, they built an executive who looks at athletic performance through a clinical, data-driven lens.]**
+<span class="story-tag">ICC Level 2 Certified Coach</span>
+<span class="story-tag">Founder, Strikers Den Sports Academy</span>
+<span class="story-tag">18 years in international business</span>
 
-**[Part I: The Cricketer’s Soul
-Before the corporate titles, there was the game. Growing up on the hyper-competitive pitches of Karachi, cricket was not a weekend hobby—it was an absolute classroom. As an opening batsman with a microscopic eye for technique, Shoaib was selected to captain Zone 6 at the Under-15, Under-17, and Under-19 levels, moving into regional and district brackets. He lived and breathed the mechanics of the crease—the physics of a front-leg brace, the exact timing of hip-shoulder separation, and the psychology of staring down an express fast bowler.
+Shoaib's path to Apex Coach AI runs through two very different worlds: competitive
+cricket and corporate operations — and it's the collision of the two that shaped
+how this app was built.
 
-While financial realities eventually pivoted his career path from professional playing to international business, the game never truly left his system. It was simply waiting for the right moment to scale.]**
+**The cricketer.** Growing up playing on Karachi's competitive club circuit, Shoaib
+captained his zone at Under-15, Under-17, and Under-19 level as an opening batsman.
+Years spent facing fast bowling built a close, practical feel for the mechanics of
+the crease — front-leg brace, hip-shoulder timing, the split-second decisions a
+batsman makes under pace. Cricket didn't stay a full-time path, but it never left.
 
-**👔 Part II: The Corporate Fire
-The same competitive instinct that made Shoaib a zone captain made him a lethal asset in business. Entering the corporate floor in 2008 as a telesales executive at Meritocracy, he out-paced the floor to become the top performer within three months and was instantly promoted to supervisor.
+**The operator.** Over an 18-year career spanning Pakistan, the UAE, and Singapore,
+Shoaib worked across telesales, real estate consulting, and technology, eventually
+founding a digital agency (AOS Formula), co-building the event platform Oyee.pk,
+and serving as Assistant Vice President at Riztech Pvt Ltd — running brand,
+engineering, and digital operations end to end. That stretch built a habit of
+demanding measurable, verifiable results instead of taking things on faith.
 
-That initial hunger sparked a 18-year international career spanning three countries—Pakistan, the UAE, and Singapore—and five distinct industries. From navigating international real estate sales as a RERA-certified consultant in Dubai, to moving into high-level technology frameworks in Singapore, he developed a cross-border operational mindset.
-
-Upon returning to Pakistan, he took his seat as an entrepreneur and executive. He founded AOS Formula, a full-service digital agency, co-built the digital event platform Oyee.pk, and served as Assistant Vice President at Riztech Pvt Ltd, where he maintained full-department accountability across brand management, engineering pipelines, SEO infrastructure, and digital rollout strategies.Part III: The Convergence (The Birth of Apex Coach AI)
-The ultimate payoff occurred when Shoaib brought his 25 years of corporate, tech, and digital execution completely back to the sport he loved.
-
-Returning to cricket as an ICC Level 2 Certified Coach, he founded Strikers Den Sports Academy and rapidly scaled up to become the Head of Sports across six private school campuses. During this expansion, he authored two comprehensive athletic frameworks: Built to Win (a Cambridge PE curriculum for Grades 3–10) and Built to Perform (an elite cricket coaching manual).
-
-It was on these training tracks that the elite coach met the tech executive. Shoaib saw that traditional cricket coaching was fundamentally unscientific, relying entirely on raw, subjective human guesswork to analyze high-velocity athletic movements.
-
-He realized the ecosystem didn't need more opinions; it needed clinical mathematical truths. Merging his digital infrastructure expertise with deep kinetic analysis, he founded Apex Coach AI—a technical sports analysis application engineered to track biomechanical milestones, erase baseline tracking dropouts, and deliver unbiased, computer-vision data straight to coaches and academy bowlers.]**
+**The convergence.** Returning to cricket as an ICC Level 2 Certified Coach, Shoaib
+founded Strikers Den Sports Academy and went on to lead sport across six private
+school campuses, authoring two coaching frameworks along the way — *Built to Win*,
+a Cambridge PE curriculum for Grades 3–10, and *Built to Perform*, an elite cricket
+coaching manual. Coaching at that scale exposed a real gap: technique assessment in
+cricket still runs almost entirely on the coach's eye — valuable, but subjective,
+and hard to track consistently over months of training. Apex Coach AI exists to put
+real, repeatable numbers behind that judgment, not replace it.
 
 </div>
 """, unsafe_allow_html=True)
@@ -60,19 +66,15 @@ st.markdown("""
 
 ### Why This Matters
 
-**[Replace with your real coaching philosophy — e.g. why you believe measurable
-biomechanics data changes how bowlers improve, what you've personally observed
-that convinced you of this.]**
+Coaching by eye doesn't scale, and it doesn't leave a trail — two coaches can watch
+the same delivery and disagree, and neither can easily show a bowler exactly how
+this month compares to last month. Apex Coach AI was built to close that gap:
+measure what can genuinely be measured, say "not confident" when tracking quality
+doesn't support a claim, and never dress up a guess as a fact. The coaching
+judgment still comes from the coach — this just gives it something solid to stand on.
 
 </div>
 """, unsafe_allow_html=True)
-
-st.info(
-    "📝 This page is a template — replace the bracketed placeholder text above "
-    "with your real story before this goes live to real visitors. Specific, true "
-    "details (actual coaching experience, real turning points) will always land "
-    "better than generic claims."
-)
 
 st.divider()
 st.caption("Apex Coach AI — Autonomous Biomechanical Performance Hub")
