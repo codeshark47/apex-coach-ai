@@ -358,9 +358,44 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
         "This is a ONE-TIME setup per fixed camera position — not per delivery. "
         "Upload any clip from that camera spot (can be a dedicated short clip of "
         "just the stumps, doesn't need to be an actual delivery), scrub to a frame "
-        "where two points of known distance are visible (e.g. the two stumps, "
-        "0.2286m apart), then click both points directly on the image below."
+        "where your reference points are visible, then click both directly on the "
+        "image below."
     )
+
+    # PRESET REFERENCE DISTANCES — guided, foolproof calibration instead of a
+    # generic "click two points" prompt. Modeled on a competitor's calibration
+    # screen (two labeled stump-alignment guides), adapted for this app's
+    # pre-recorded-video workflow rather than a live camera feed. The full-
+    # pitch preset also matters for more than just guidance: calibrating
+    # against the popping-crease-to-popping-crease distance (a known 20.12m)
+    # uses a MUCH longer pixel baseline than a single stump's 0.2286m width,
+    # which is inherently more precise (small pixel-click error matters far
+    # less as a fraction of a longer real-world distance) — and it's the
+    # same full-pitch calibration Phase 2 ball-tracking will eventually need
+    # for pitch mapping, so setting it up now is not wasted effort.
+    CALIBRATION_PRESETS = {
+        "Stump width (0.2286m) — single stump set close-up": {
+            "distance_m": 0.2286, "label": "stump width",
+            "point1_prompt": "one edge of the stumps",
+            "point2_prompt": "the other edge of the stumps",
+        },
+        "Popping crease to popping crease (20.12m) — full pitch in frame": {
+            "distance_m": 20.12, "label": "popping crease to popping crease",
+            "point1_prompt": "the STRIKER END stumps",
+            "point2_prompt": "the NON-STRIKER END stumps",
+        },
+        "Custom distance": {
+            "distance_m": None, "label": "custom",
+            "point1_prompt": "the first reference point",
+            "point2_prompt": "the second reference point",
+        },
+    }
+    calib_preset_choice = st.selectbox(
+        "What are you calibrating against?", list(CALIBRATION_PRESETS.keys()),
+        key="calib_preset_choice"
+    )
+    calib_preset = CALIBRATION_PRESETS[calib_preset_choice]
+
     calib_video = st.file_uploader("Reference video/frame source (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="calib_video")
 
     if "calib_points" not in st.session_state:
@@ -388,6 +423,16 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
             st.session_state.calib_points = []
             st.session_state["_calib_last_frame_idx"] = frame_idx
 
+        # Widgets keyed "cal_dist"/"cal_label" keep whatever value the coach
+        # last set, even across reruns — changing the preset selector alone
+        # wouldn't update the pre-filled number/label unless that stored
+        # state is cleared here, the same reset pattern used above for a
+        # changed frame.
+        if st.session_state.get("_calib_last_preset") != calib_preset_choice:
+            st.session_state.pop("cal_dist", None)
+            st.session_state.pop("cal_label", None)
+            st.session_state["_calib_last_preset"] = calib_preset_choice
+
         if frame is not None:
             from PIL import Image, ImageDraw
             from streamlit_image_coordinates import streamlit_image_coordinates
@@ -403,7 +448,9 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
                 draw.text((px + r + 4, py - r - 4), str(i + 1), fill="red")
 
             if len(st.session_state.calib_points) < 2:
-                st.caption(f"📍 Click point {len(st.session_state.calib_points) + 1} of 2 on the image below.")
+                which_point = (calib_preset["point1_prompt"] if len(st.session_state.calib_points) == 0
+                               else calib_preset["point2_prompt"])
+                st.caption(f"📍 Click **{which_point}** on the image below.")
             else:
                 st.caption("✅ Both points selected — see below.")
 
@@ -431,13 +478,14 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
                 st.rerun()
 
             if len(st.session_state.calib_points) == 2:
+                default_dist = calib_preset["distance_m"] if calib_preset["distance_m"] is not None else 0.2286
                 real_dist = st.number_input(
                     "Real-world distance between the two points you clicked (meters)",
-                    min_value=0.0, value=0.2286, step=0.01, key="cal_dist",
-                    help="Stump width = 0.2286m is the easiest reference if stumps are visible."
+                    min_value=0.0, value=default_dist, step=0.01, key="cal_dist",
+                    help="Pre-filled from your selection above — adjust if you clicked a different reference."
                 )
                 ref_label = st.text_input("Reference label (e.g. 'stump width')",
-                                           value="stump width", key="cal_label")
+                                           value=calib_preset["label"], key="cal_label")
                 if st.button("Compute calibration"):
                     try:
                         calibration = cal.compute_scale(
