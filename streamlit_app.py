@@ -838,7 +838,103 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             if st.session_state.get("_br_confirmed_frame") is not None:
                 st.success(f"Confirmed: release at frame {st.session_state['_br_confirmed_frame']}.")
 
+    # FRONT FOOT CONTACT FRAME — same reasoning, same mandatory pattern,
+    # for a real, separate bug: Hip-Shoulder Separation and the FFC-frame
+    # Knee Bracing value are measured AT front-foot-plant specifically
+    # (a genuinely different, earlier moment than release, with its own
+    # coaching meaning — how much rotation has been built up BEFORE
+    # release, not at it) — so confirming release alone doesn't fix
+    # them. Verified directly on real footage (this same leaping
+    # rear-view delivery): auto-detection landed FFC at frame 87, an
+    # ordinary mid-run-up running stride, nowhere near the crease —
+    # the coach's own frame-by-frame review placed the real plant at
+    # 147-148, just 2-3 frames before release. For a bowler with no
+    # clean "foot stops moving" moment (see the FFC/BR docstrings
+    # elsewhere), auto-detection can miss this by a huge margin, and a
+    # human watching the footage cannot make that mistake.
+    if st.session_state.get("_ffc_confirmed_identity") != single_file_identity:
+        st.session_state["_ffc_confirmed_frame"] = None
+        st.session_state["_ffc_confirmed_identity"] = single_file_identity
+
+    ffc_auto = None
+    if stage12_result is not None and stage12_result.get("status") == "success":
+        ffc_auto = stage12_result["events"].get("FFC")
+
+    with st.expander("🦶 Confirm Front Foot Contact Frame",
+                      expanded=st.session_state.get("_ffc_confirmed_frame") is None):
+        if ffc_auto is None:
+            st.error("Couldn't detect a front-foot-contact frame at all — check tracking above.")
+        else:
+            st.info(
+                f"Algorithm's best guess: **frame {ffc_auto}**. Scrub to the exact frame where "
+                f"the front (lead) foot first plants on the ground and confirm — this feeds Hip-"
+                f"Shoulder Separation and the pre-release Knee Bracing reading directly. This is "
+                f"usually shortly BEFORE the release frame you just confirmed, not necessarily "
+                f"far earlier in the run-up."
+            )
+            total_frames_ffc = cal.get_frame_count(single_ref_path)
+            ffc_slider_val = st.slider(
+                "Scrub to the true front-foot-contact frame",
+                min_value=0, max_value=max(total_frames_ffc - 1, 0),
+                value=min(max(ffc_auto, 0), max(total_frames_ffc - 1, 0)),
+                key="ffc_confirm_slider"
+            )
+            ffc_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=ffc_slider_val)
+            if ffc_frame_img is not None:
+                st.image(ffc_frame_img, use_column_width=True,
+                          caption=f"Frame {ffc_slider_val} — has the front foot just planted here?")
+            if st.button("✅ Confirm this is the front-foot-contact frame", key="confirm_ffc_button"):
+                st.session_state["_ffc_confirmed_frame"] = ffc_slider_val
+                st.rerun()
+            if st.session_state.get("_ffc_confirmed_frame") is not None:
+                st.success(f"Confirmed: front-foot contact at frame {st.session_state['_ffc_confirmed_frame']}.")
+
+    # BACK FOOT CONTACT FRAME — completes the set. Only feeds Head
+    # Stability's measurement window (BFC to BR) — a smaller blast radius
+    # than FFC/BR, but the same failure mode was confirmed on this exact
+    # clip: auto-detection landed BFC at frame 73, while he's still near
+    # his mark starting the run-up, not anywhere close to the real back-
+    # foot-contact of the delivery stride (which should land shortly
+    # before the confirmed FFC, not 70+ frames earlier).
+    if st.session_state.get("_bfc_confirmed_identity") != single_file_identity:
+        st.session_state["_bfc_confirmed_frame"] = None
+        st.session_state["_bfc_confirmed_identity"] = single_file_identity
+
+    bfc_auto = None
+    if stage12_result is not None and stage12_result.get("status") == "success":
+        bfc_auto = stage12_result["events"].get("BFC")
+
+    with st.expander("👟 Confirm Back Foot Contact Frame",
+                      expanded=st.session_state.get("_bfc_confirmed_frame") is None):
+        if bfc_auto is None:
+            st.error("Couldn't detect a back-foot-contact frame at all — check tracking above.")
+        else:
+            st.info(
+                f"Algorithm's best guess: **frame {bfc_auto}**. Scrub to the frame where the back "
+                f"(rear) foot plants just before the final delivery stride — this feeds Head "
+                f"Stability's measurement window. Usually just a few frames before the front-foot "
+                f"contact you just confirmed, not far back in the run-up."
+            )
+            total_frames_bfc = cal.get_frame_count(single_ref_path)
+            bfc_slider_val = st.slider(
+                "Scrub to the true back-foot-contact frame",
+                min_value=0, max_value=max(total_frames_bfc - 1, 0),
+                value=min(max(bfc_auto, 0), max(total_frames_bfc - 1, 0)),
+                key="bfc_confirm_slider"
+            )
+            bfc_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=bfc_slider_val)
+            if bfc_frame_img is not None:
+                st.image(bfc_frame_img, use_column_width=True,
+                          caption=f"Frame {bfc_slider_val} — has the back foot just planted here?")
+            if st.button("✅ Confirm this is the back-foot-contact frame", key="confirm_bfc_button"):
+                st.session_state["_bfc_confirmed_frame"] = bfc_slider_val
+                st.rerun()
+            if st.session_state.get("_bfc_confirmed_frame") is not None:
+                st.success(f"Confirmed: back-foot contact at frame {st.session_state['_bfc_confirmed_frame']}.")
+
 br_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_br_confirmed_frame") is not None)
+ffc_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_ffc_confirmed_frame") is not None)
+bfc_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_bfc_confirmed_frame") is not None)
 
 # Angle must be genuinely resolved (not left on "Not sure") before running —
 # matches the same hard-gate already applied to bowling arm above. Dual
@@ -849,7 +945,7 @@ angle_resolved = (camera_mode != "Single Camera") or (
 
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
                  and single_seed_point is not None and bowling_arm_selected and angle_resolved
-                 and br_resolved)
+                 and br_resolved and ffc_resolved and bfc_resolved)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None
               and side_seed_point is not None and rear_seed_point is not None
@@ -869,6 +965,14 @@ elif (camera_mode == "Single Camera" and uploaded_single is not None and single_
       and bowling_arm_selected and angle_resolved and not br_resolved):
     st.sidebar.warning("👆 Confirm the ball release frame above to enable analysis — "
                         "this feeds Release Height and every metric that depends on it.")
+elif (camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None
+      and bowling_arm_selected and angle_resolved and br_resolved and not ffc_resolved):
+    st.sidebar.warning("👆 Confirm the front-foot-contact frame above to enable analysis — "
+                        "this feeds Hip-Shoulder Separation and pre-release Knee Bracing.")
+elif (camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None
+      and bowling_arm_selected and angle_resolved and br_resolved and ffc_resolved and not bfc_resolved):
+    st.sidebar.warning("👆 Confirm the back-foot-contact frame above to enable analysis — "
+                        "this feeds Head Stability's measurement window.")
 
 import usage_limits
 _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
@@ -947,6 +1051,27 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     _stage12["events"]["BR"] = _br_confirmed
                     _stage12["events"]["BR_confidence"] = "coach_confirmed"
                     _stage12["events"]["BR_plausible_fraction"] = 1.0
+
+                # Same for front-foot-contact — see "Confirm Front Foot
+                # Contact Frame" above. Hip-Shoulder Separation and the
+                # FFC-frame Knee Bracing value read events["FFC"] directly,
+                # so overriding it here is enough to fix both.
+                _ffc_confirmed = st.session_state.get("_ffc_confirmed_frame")
+                if _stage12 is not None and _stage12.get("status") == "success" and _ffc_confirmed is not None:
+                    _stage12 = dict(_stage12)
+                    _stage12["events"] = dict(_stage12["events"])
+                    _stage12["events"]["FFC_auto_detected"] = _stage12["events"].get("FFC")
+                    _stage12["events"]["FFC"] = _ffc_confirmed
+
+                # Same for back-foot-contact — see "Confirm Back Foot
+                # Contact Frame" above. Only Head Stability's window reads
+                # events["BFC"].
+                _bfc_confirmed = st.session_state.get("_bfc_confirmed_frame")
+                if _stage12 is not None and _stage12.get("status") == "success" and _bfc_confirmed is not None:
+                    _stage12 = dict(_stage12)
+                    _stage12["events"] = dict(_stage12["events"])
+                    _stage12["events"]["BFC_auto_detected"] = _stage12["events"].get("BFC")
+                    _stage12["events"]["BFC"] = _bfc_confirmed
 
                 result_payload = run_complete_bowling_analysis(
                     video_path, bowling_arm_override=bowling_arm_override,
@@ -1402,6 +1527,16 @@ if st.session_state.get("pending_result_payload") is not None:
                             "auto_confidence": frames.get("ball_release_auto_confidence"),
                             "coach_confirmed": frames.get("ball_release_frame"),
                         } if frames.get("ball_release_frame_auto_detected") is not None else None,
+                        # Same idea for front-foot-contact timing.
+                        "_ffc_frame_confirmed": {
+                            "auto_detected": frames.get("front_foot_contact_frame_auto_detected"),
+                            "coach_confirmed": frames.get("front_foot_contact_frame"),
+                        } if frames.get("front_foot_contact_frame_auto_detected") is not None else None,
+                        # Same idea for back-foot-contact timing.
+                        "_bfc_frame_confirmed": {
+                            "auto_detected": frames.get("back_foot_contact_frame_auto_detected"),
+                            "coach_confirmed": frames.get("back_foot_contact_frame"),
+                        } if frames.get("back_foot_contact_frame_auto_detected") is not None else None,
                     }
                     store.save_session(
                         athlete_id=athlete_id,

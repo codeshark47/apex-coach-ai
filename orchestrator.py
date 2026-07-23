@@ -1729,6 +1729,8 @@ def run_complete_bowling_analysis(video_path: str,
             # dual-camera) that don't run that confirmation step.
             "ball_release_frame_auto_detected": events.get("BR_auto_detected"),
             "ball_release_auto_confidence": events.get("BR_auto_confidence"),
+            "front_foot_contact_frame_auto_detected": events.get("FFC_auto_detected"),
+            "back_foot_contact_frame_auto_detected": events.get("BFC_auto_detected"),
         },
         "biomechanical_metrics": {
             "trunk_lean": {
