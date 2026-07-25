@@ -578,7 +578,8 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
 
 
 def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right",
-                                         reference_row: pd.Series = None) -> dict:
+                                         reference_row: pd.Series = None,
+                                         wrist_override_norm: tuple = None) -> dict:
     """
     Calculates release height leverage ratio with expanded real-world tolerances.
     Prevents N/A dropouts on high-arm actions or varied camera distances.
@@ -597,10 +598,26 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
     of whether this bowler's release style is grounded or airborne.
     Defaults to None (uses br_row, prior behavior) for backward
     compatibility with any caller not yet passing it.
+
+    wrist_override_norm: optional (x, y) normalized (0-1) coach-confirmed
+    wrist/ball position, overriding the tracked landmark entirely. Verified
+    directly on real footage: MediaPipe can systematically under-track how
+    far the hand extends during a fast, motion-blurred release swing — not
+    a single-frame glitch catchable by an outlier filter, but a sustained
+    mistracking across the whole swing (shoulder-to-wrist distance grows
+    smoothly frame to frame right through the bad reading, so there's no
+    anomalous jump to detect automatically). Only a human directly marking
+    the real ball position on the frame reliably fixes this, same reasoning
+    as the mandatory BFC/FFC/BR frame confirmation elsewhere. Only the y
+    (height) component is actually used, but both are accepted since the
+    coach clicks a single point in the UI.
     """
     try:
         bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
-        y_wrist = br_row.get(f"{bowl_side}_WRIST_y")
+        if wrist_override_norm is not None:
+            y_wrist = wrist_override_norm[1]
+        else:
+            y_wrist = br_row.get(f"{bowl_side}_WRIST_y")
         height_row = reference_row if reference_row is not None else br_row
         y_head = height_row.get("NOSE_y")
 
@@ -961,13 +978,28 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                 height_ref_for_release = _nearest_complete_row(
                     df, events.get("FFC"), ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
                 )
+            # Coach-confirmed wrist/ball position, when given, overrides the
+            # tracked landmark entirely — see calculate_release_height_ratio_safe's
+            # docstring for why (verified real MediaPipe mistracking during
+            # fast, blurred release swings that a plausibility filter can't
+            # catch automatically).
+            wrist_override_x = events.get("wrist_override_x")
+            wrist_override_y = events.get("wrist_override_y")
+            wrist_override_norm = (
+                (wrist_override_x, wrist_override_y)
+                if wrist_override_x is not None and wrist_override_y is not None else None
+            )
             rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm,
-                                                      reference_row=height_ref_for_release)
+                                                      reference_row=height_ref_for_release,
+                                                      wrist_override_norm=wrist_override_norm)
             if rh.get("ratio") is not None:
                 release_height_pct = rh["ratio"] * 100
                 dbg = rh.get("debug_raw") or {}
                 bowl_side = dbg.get("bowl_side_used")
-                wrist_x = br_row_for_release.get(f"{bowl_side}_WRIST_x") if bowl_side else None
+                if wrist_override_norm is not None:
+                    wrist_x = wrist_override_norm[0]
+                else:
+                    wrist_x = br_row_for_release.get(f"{bowl_side}_WRIST_x") if bowl_side else None
                 if (wrist_x is not None and not pd.isna(wrist_x)
                         and "y_wrist" in dbg and "y_ankle" in dbg):
                     release_line_pts = {
@@ -1652,8 +1684,20 @@ def run_complete_bowling_analysis(video_path: str,
         height_reference_row = _nearest_complete_row(
             df, events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
         )
+    # Coach-confirmed wrist/ball position, when given, overrides the
+    # tracked landmark entirely — see calculate_release_height_ratio_safe's
+    # docstring for why (verified real, sustained MediaPipe mistracking
+    # during a fast, blurred release swing that no automatic plausibility
+    # filter could catch).
+    wrist_override_x = events.get("wrist_override_x")
+    wrist_override_y = events.get("wrist_override_y")
+    wrist_override_norm = (
+        (wrist_override_x, wrist_override_y)
+        if wrist_override_x is not None and wrist_override_y is not None else None
+    )
     release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm,
-                                                           reference_row=height_reference_row)
+                                                           reference_row=height_reference_row,
+                                                           wrist_override_norm=wrist_override_norm)
 
     # FFC-to-Release knee angle delta ("yielding knee" check flagged in
     # external biomechanical audit): a static single-frame knee angle at

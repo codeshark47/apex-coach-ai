@@ -886,6 +886,83 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             if st.session_state.get("_br_confirmed_frame") is not None:
                 st.success(f"Confirmed: release at frame {st.session_state['_br_confirmed_frame']}.")
 
+    # RELEASE POINT (wrist/ball position) — optional correction, separate
+    # from WHICH FRAME is release. Verified directly on real footage: even
+    # on the correct frame, MediaPipe can systematically under-track how
+    # far the hand extends during a fast, blurred swing — not a one-frame
+    # glitch (shoulder-to-wrist distance grew smoothly right through the
+    # bad reading, no anomaly for a filter to catch), so no automatic check
+    # can fix it. This is optional (not gated into single_ready) since most
+    # deliveries track the wrist fine — only needed when the drawn "Ball
+    # Release Height" line visibly doesn't reach the real hand position.
+    confirmed_br_frame = st.session_state.get("_br_confirmed_frame")
+    if confirmed_br_frame is not None:
+        wrist_identity = f"{single_file_identity}_{confirmed_br_frame}"
+        if st.session_state.get("_wrist_identity") != wrist_identity:
+            st.session_state["_wrist_confirmed_point"] = None
+            st.session_state["_wrist_identity"] = wrist_identity
+
+        with st.expander("🖐️ Correct Release Point (optional)", expanded=False):
+            st.caption(
+                "The yellow marker is the auto-tracked ball/hand position at your "
+                "confirmed release frame. If it doesn't sit on the real ball/hand — "
+                "common during fast, motion-blurred swings — click the real position "
+                "to correct it. This feeds Release Height directly."
+            )
+            wrist_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=confirmed_br_frame)
+            if wrist_frame_img is not None:
+                from PIL import Image, ImageDraw
+                from streamlit_image_coordinates import streamlit_image_coordinates
+
+                pil_img = Image.fromarray(wrist_frame_img)
+                orig_w, orig_h = pil_img.size
+
+                auto_point = None
+                stage12_df = stage12_result.get("df") if stage12_result else None
+                bowl_side_for_wrist = "RIGHT" if bowling_arm_override == "right" else "LEFT"
+                if stage12_df is not None:
+                    wrist_rows = stage12_df[stage12_df["frame"] == confirmed_br_frame]
+                    if not wrist_rows.empty:
+                        wx = wrist_rows.iloc[0].get(f"{bowl_side_for_wrist}_WRIST_x")
+                        wy = wrist_rows.iloc[0].get(f"{bowl_side_for_wrist}_WRIST_y")
+                        if wx is not None and wy is not None and not pd.isna(wx) and not pd.isna(wy):
+                            auto_point = (round(wx * orig_w), round(wy * orig_h))
+
+                corrected_point = st.session_state.get("_wrist_confirmed_point")
+                display_point = corrected_point or auto_point
+
+                display_img = pil_img.copy()
+                if display_point is not None:
+                    draw = ImageDraw.Draw(display_img)
+                    r = max(5, orig_w // 100)
+                    px, py = display_point
+                    color = "lime" if corrected_point is not None else "yellow"
+                    draw.ellipse((px - r, py - r, px + r, py + r), outline=color, width=4)
+
+                if corrected_point is None:
+                    st.caption("🟡 Auto-tracked position shown. Click the image below to correct it if wrong.")
+                else:
+                    st.caption("✅ Corrected — click again to move the marker, or reset below.")
+
+                wrist_click = streamlit_image_coordinates(
+                    display_img, key="wrist_click_widget",
+                    use_column_width="always"
+                )
+
+                if wrist_click is not None:
+                    rendered_w = wrist_click.get("width") or orig_w
+                    rendered_h = wrist_click.get("height") or orig_h
+                    scale_x = orig_w / rendered_w
+                    scale_y = orig_h / rendered_h
+                    new_point = (round(wrist_click["x"] * scale_x), round(wrist_click["y"] * scale_y))
+                    if st.session_state.get("_wrist_confirmed_point") != new_point:
+                        st.session_state["_wrist_confirmed_point"] = new_point
+                        st.rerun()
+
+                if corrected_point is not None and st.button("↺ Reset to auto-tracked position", key="reset_wrist_point"):
+                    st.session_state["_wrist_confirmed_point"] = None
+                    st.rerun()
+
     # FRONT FOOT CONTACT FRAME — same reasoning, same mandatory pattern,
     # for a real, separate bug: Hip-Shoulder Separation and the FFC-frame
     # Knee Bracing value are measured AT front-foot-plant specifically
@@ -1120,6 +1197,23 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     _stage12["events"] = dict(_stage12["events"])
                     _stage12["events"]["BFC_auto_detected"] = _stage12["events"].get("BFC")
                     _stage12["events"]["BFC"] = _bfc_confirmed
+
+                # Coach-corrected release POINT (wrist/ball position) — see
+                # "Correct Release Point" above. Stored in pixel coords from
+                # the click widget; normalize against this exact frame's real
+                # dimensions before handing off, since orchestrator.py's
+                # calculations all work in 0-1 normalized landmark space.
+                _wrist_confirmed = st.session_state.get("_wrist_confirmed_point")
+                _wrist_br_frame = st.session_state.get("_br_confirmed_frame")
+                if (_stage12 is not None and _stage12.get("status") == "success"
+                        and _wrist_confirmed is not None and _wrist_br_frame is not None):
+                    _wrist_frame_for_norm = cal.extract_reference_frame(video_path, frame_index=_wrist_br_frame)
+                    if _wrist_frame_for_norm is not None:
+                        _wf_h, _wf_w = _wrist_frame_for_norm.shape[:2]
+                        _stage12 = dict(_stage12)
+                        _stage12["events"] = dict(_stage12["events"])
+                        _stage12["events"]["wrist_override_x"] = _wrist_confirmed[0] / _wf_w
+                        _stage12["events"]["wrist_override_y"] = _wrist_confirmed[1] / _wf_h
 
                 result_payload = run_complete_bowling_analysis(
                     video_path, bowling_arm_override=bowling_arm_override,
@@ -1585,6 +1679,12 @@ if st.session_state.get("pending_result_payload") is not None:
                             "auto_detected": frames.get("back_foot_contact_frame_auto_detected"),
                             "coach_confirmed": frames.get("back_foot_contact_frame"),
                         } if frames.get("back_foot_contact_frame_auto_detected") is not None else None,
+                        # Whether the coach had to manually correct the
+                        # auto-tracked wrist/ball position — real signal for
+                        # how often MediaPipe's release-point tracking needs
+                        # a human fix, same data-collection reasoning as the
+                        # frame confirmations above.
+                        "_wrist_point_corrected": st.session_state.get("_wrist_confirmed_point"),
                     }
                     store.save_session(
                         athlete_id=athlete_id,
