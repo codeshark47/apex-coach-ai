@@ -3,15 +3,21 @@ profile_store.py
 
 Athlete profile + session history persistence, backed by Supabase (Postgres).
 
-SECURITY: every function that touches athlete/session data now requires an
+SECURITY: every function that touches athlete/session data requires an
 explicit coach_user_id and filters by it in the query itself. This is the
 PRIMARY access control — not Row Level Security — because this module
 intentionally uses SUPABASE_KEY (the secret/service key) to bypass RLS for
 legitimate server-side operations. The service key bypasses RLS entirely,
-always, regardless of any policies defined in Postgres. RLS policies added
-alongside this are defense-in-depth only, for a future scenario where the
-anon key might be used against these tables directly — they are not what
-prevents one coach from reading another's data today.
+always, regardless of any policies defined in Postgres — RLS is not what
+prevents one coach from reading another's data today, this scoping is.
+
+RLS policies (add_rls_policies.sql) are real defense-in-depth on top of
+that, for a scenario where the anon key is ever used against these tables
+directly (it currently isn't — auth.py only uses it for sign-in/sign-up).
+A previous version of this docstring claimed such policies already existed
+"alongside this" — verified false during a full app audit (no RLS policy
+existed anywhere in this repo's SQL). add_rls_policies.sql actually adds
+them now; run it if you haven't.
 
 Design choices, deliberately:
   - No local fallback store. If Supabase isn't configured, functions raise
@@ -24,7 +30,11 @@ Design choices, deliberately:
 
 Setup (one-time):
   1. Create a free Supabase project.
-  2. Run supabase_schema.sql, then add_coach_scoping.sql in its SQL editor.
+  2. Run supabase_schema.sql, then add_coach_scoping.sql, then
+     add_rls_policies.sql in its SQL editor (add_coach_scoping.sql was
+     applied directly via Supabase's SQL editor in this project and isn't
+     committed here — it adds the athletes.coach_user_id column these
+     RLS policies and every query in this module depend on).
   3. Add to .streamlit/secrets.toml (or Streamlit Cloud's secrets panel):
        SUPABASE_URL = "https://xxxx.supabase.co"
        SUPABASE_KEY = "your-anon-or-service-key"
