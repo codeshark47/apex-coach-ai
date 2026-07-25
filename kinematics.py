@@ -18,17 +18,22 @@ def calculate_knee_bracing(row: pd.Series, lead_side: str = "left") -> dict:
         kh, ka = h - k, a - k
         denom = np.linalg.norm(kh) * np.linalg.norm(ka)
         if denom == 0 or np.isnan(denom):
-            return {"degrees": 0.0, "tier": "Tracking Drop", "status": "error"}
-            
+            # None, not 0.0 — a fabricated 0-degree reading here would fold
+            # into the "Critical" band and read as a real (terrible) result
+            # instead of "we couldn't measure this." Same reasoning as the
+            # trunk_lean/head_stability fix below: a placeholder number must
+            # never look like a genuine measurement to classify()/data_quality.
+            return {"degrees": None, "tier": "Tracking Drop", "status": "error"}
+
         cos_theta = np.dot(kh, ka) / denom
         angle = round(float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))), 1)
-        
+
         if angle >= 165.0: tier = "Elite Rigid Extension"
         elif angle >= 145.0: tier = "Moderate Flexion"
         else: tier = "Collapsing Knee Joint"
         return {"degrees": angle, "tier": tier, "status": "success"}
     except Exception:
-        return {"degrees": 0.0, "tier": "Data Deficit", "status": "error"}
+        return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 def calculate_trunk_lean(row: pd.Series) -> dict:
     """Measures dynamic lateral deviation of the spinal column away from vertical orientation."""
@@ -43,7 +48,15 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
         
         angle = round(float(np.degrees(np.arctan2(np.abs(dx), dy))), 1)
         if np.isnan(angle):
-            return {"degrees": 0.0, "tier": "Tracking Drop", "status": "error"}
+            # BUG FIX: was returning 0.0 here — indistinguishable from a
+            # genuinely perfect 0-degree upright posture (the actual best
+            # possible score for this metric). A real tracking failure was
+            # silently being reported to the coach as an ideal result, and
+            # data_quality.py's missing-metric check (which only looks for
+            # None) couldn't catch it either since 0.0 isn't None. Verified
+            # directly against a real low-confidence session where this
+            # exact path fired and produced a fake "Optimal Upright Posture."
+            return {"degrees": None, "tier": "Tracking Drop", "status": "error"}
 
         # FIX: a value above 90 degrees is physically nonsensical for "lean
         # from vertical" (it would mean the torso axis is pointing more
@@ -57,23 +70,27 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
         tier = "Optimal Upright Posture" if angle <= 8.0 else "Excessive Lateral Flexion"
         return {"degrees": angle, "tier": tier, "status": "success"}
     except Exception:
-        return {"degrees": 0.0, "tier": "Data Deficit", "status": "error"}
+        return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 def calculate_head_stability(df: pd.DataFrame, start_frame: int, end_frame: int) -> dict:
     """Tracks absolute trajectory path deviation of the head cluster during the delivery stride."""
     try:
         window = df[(df["frame"] >= start_frame) & (df["frame"] <= end_frame)]
         if window.empty:
-            return {"deviation_index": "0.00", "tier": "Window Missing", "status": "error"}
-            
+            # None, not "0.00" — same fix as trunk_lean above: "0.00" sits
+            # right inside this metric's own "Elite Fixed Gaze Focus" band,
+            # so a tracking failure was silently reporting as a perfect
+            # result instead of "unavailable."
+            return {"deviation_index": None, "tier": "Window Missing", "status": "error"}
+
         nose_x = window["NOSE_x"].dropna().values
         if len(nose_x) < 2:
-            return {"deviation_index": "0.00", "tier": "Tracking Limited", "status": "error"}
-            
+            return {"deviation_index": None, "tier": "Tracking Limited", "status": "error"}
+
         # Standard deviation calculates absolute displacement variance across frames
         std_dev = round(float(np.std(nose_x)), 4)
-        
+
         tier = "Elite Fixed Gaze Focus" if std_dev <= 0.015 else "Erratic Lateral Head Drift"
         return {"deviation_index": f"{std_dev}", "tier": tier, "status": "success"}
     except Exception:
-        return {"deviation_index": "0.00", "tier": "Data Deficit", "status": "error"}
+        return {"deviation_index": None, "tier": "Data Deficit", "status": "error"}

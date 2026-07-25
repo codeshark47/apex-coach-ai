@@ -547,6 +547,19 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
             row["LEFT_HIP_x"] - row["RIGHT_HIP_x"]
         ))
 
+        # BUG FIX: a NaN landmark (tracking dropout at the FFC frame)
+        # propagated silently through arctan2 without raising. Every
+        # tier comparison below is a "separation >= X" check, and NaN
+        # compares False against everything in Python — so a NaN result
+        # fell through to the final `else` and was confidently labeled
+        # "Blocked rotation" (a real coaching claim) instead of being
+        # flagged as a tracking failure. Verified against a real session
+        # where this path fired: status came back "success" with a NaN
+        # degrees value that _sanitize_for_json later silently turned
+        # into null right before saving, hiding the real cause.
+        if np.isnan(shoulder_angle) or np.isnan(hip_angle):
+            return {"degrees": None, "tier": "Tracking Drop", "status": "error"}
+
         raw_diff = shoulder_angle - hip_angle
         wrapped_diff = (raw_diff + 180) % 360 - 180  # safely in (-180, 180]
         separation = abs(wrapped_diff)                # safely in [0, 180]
@@ -703,7 +716,21 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
 
         ratio = round(abs(float(y_ankle) - float(y_wrist)) / body_height, 4)
 
-        if ratio > 1.30 or ratio < 0.30:
+        # BUG FIX: this ceiling exists to catch a MISTRACKED wrist (the
+        # tracker's guess is implausible, so don't trust it) — but it was
+        # applying even when wrist_override_norm is set, i.e. even when a
+        # COACH directly clicked the real ball/hand position on the frame.
+        # Verified directly on real footage: a coach-confirmed point on a
+        # genuinely leaping, high-reach delivery produced ratio 1.49 and
+        # was silently discarded as "Measurement error" — rejecting a
+        # human's direct observation on the theory that it must be a
+        # tracking error, when there was no tracker involved at all for
+        # this value. A human-confirmed point is ground truth (same
+        # reasoning as the mandatory BFC/FFC/BR confirmation elsewhere) —
+        # this ceiling now only applies to the AUTOMATIC, unconfirmed
+        # reading, where "this is probably a tracking glitch" is actually
+        # a reasonable inference.
+        if wrist_override_norm is None and (ratio > 1.30 or ratio < 0.30):
             return {
                 "ratio": None,
                 "classification": "Measurement error — verify camera angle",
@@ -877,6 +904,33 @@ def generate_fail_safe_video(video_path: str, output_path: str,
 
     def _rs(px):
         return max(1, int(round(px * render_scale)))
+
+    # JOINT LEGIBILITY FLOOR: verified directly that a wide/distant shot
+    # (bowler ~90px tall on screen, well below the 400px reference this
+    # scaling was calibrated against) drives render_scale down to ~0.23,
+    # which makes _rs(9) round to a 2px joint dot — functionally invisible,
+    # reading as scattered noise rather than a skeleton. A joint DOT
+    # specifically needs a minimum area to read as a distinct point, so it
+    # gets its own floor instead of sharing the bone-width scale-down.
+    def _rs_joint(px):
+        return max(4, int(round(px * render_scale)))
+
+    # BONE OUTLINE FLOOR: BUG FIX — the comment this replaces claimed "a
+    # thin connecting line stays visually coherent even at 1px," which
+    # verified FALSE on real footage. At the same low render_scale above,
+    # _rs(6) (shadow) and _rs(3) (core) BOTH round down to 1px — identical
+    # widths — so the dark shadow layer (meant to give the white core line
+    # contrast against ANY background, sky included) gets completely
+    # covered by the core drawn on top of it. The result is a plain 1px
+    # near-white line with no outline, which visually vanishes against a
+    # bright overcast sky — this is what read as the skeleton "flying off"
+    # into empty space. Shadow now always stays wider than core by a fixed
+    # margin regardless of scale, so the outline effect can't disappear.
+    def _rs_bone_core(px):
+        return max(2, int(round(px * render_scale)))
+
+    def _rs_bone_shadow(px):
+        return _rs_bone_core(px) + 2
     # Kept for the release-badge accent color elsewhere (unchanged meaning,
     # just no longer used to color-code limbs in the skeleton itself).
     LEG_LINE_GLOW = BONE_SHADOW
@@ -1116,6 +1170,18 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     # so the badge doesn't flicker sides during a brief gap.
     last_known_bowler_x = None
 
+    # Coach-confirmed wrist/ball position (from "Correct Release Point")
+    # already fixes the Release Height NUMBER, but was never fed into the
+    # drawn skeleton — the visual overlay kept showing the original
+    # mistracked wrist even after the coach corrected it, so the video and
+    # the number silently disagreed with each other. Only applied at the
+    # exact confirmed release frame (the only frame the coach actually
+    # verified), not smeared across neighboring frames the coach never saw.
+    wrist_override_x = events.get("wrist_override_x")
+    wrist_override_y = events.get("wrist_override_y")
+    br_frame_for_override = events.get("BR")
+    bowl_side_for_override = "RIGHT" if bowling_arm == "right" else "LEFT"
+
     f_idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
@@ -1124,6 +1190,11 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         f_match = df[df["frame"] == f_idx]
         if not f_match.empty:
             row = f_match.iloc[0]
+            if (wrist_override_x is not None and wrist_override_y is not None
+                    and br_frame_for_override is not None and f_idx == br_frame_for_override):
+                row = row.copy()
+                row[f"{bowl_side_for_override}_WRIST_x"] = wrist_override_x
+                row[f"{bowl_side_for_override}_WRIST_y"] = wrist_override_y
             torso_x_cols = ["NOSE_x", "LEFT_HIP_x", "RIGHT_HIP_x"]
             torso_x_vals = [float(row[c]) for c in torso_x_cols if not pd.isna(row[c])]
             if torso_x_vals:
@@ -1138,8 +1209,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     yB = int(float(row[f"{partB}_y"]) * height)
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs(6), cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs(3), cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -1162,10 +1233,56 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_CORE, 3, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _rs(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _rs(6), JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _rs_joint(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _rs_joint(6), JOINT_CORE, -1, cv2.LINE_AA)
             except Exception:
                 pass
+
+            # LIMB FALLBACK: when the middle joint (elbow/knee) isn't tracked
+            # — verified directly on real footage that this happens on
+            # essentially every frame of a fast, motion-blurred arm swing —
+            # the normal two-segment connection (shoulder-elbow, elbow-wrist)
+            # both get skipped, but the wrist/ankle joint DOT still gets
+            # drawn on its own with nothing connecting it to the body. That
+            # floating, disconnected dot is exactly what read as "loose" /
+            # not attached to the bowler rather than a genuine limb. Drawing
+            # a direct shoulder-to-wrist (or hip-to-ankle) line in that
+            # specific case keeps every visible joint attached to the
+            # skeleton — straight instead of bent, which is honest (no real
+            # elbow position is invented) rather than fabricated.
+            for shoulder, elbow, wrist in (
+                ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
+                ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
+            ):
+                try:
+                    if pd.isna(row[f"{elbow}_x"]) and not pd.isna(row[f"{shoulder}_x"]) and not pd.isna(row[f"{wrist}_x"]):
+                        xA = int(float(row[f"{shoulder}_x"]) * width)
+                        yA = int(float(row[f"{shoulder}_y"]) * height)
+                        xB = int(float(row[f"{wrist}_x"]) * width)
+                        yB = int(float(row[f"{wrist}_y"]) * height)
+                        if (0 < xA < width and 0 < yA < height and
+                                0 < xB < width and 0 < yB < height):
+                            cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
+                            cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
+                except Exception:
+                    continue
+
+            for hip, knee, ankle in (
+                ("LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"),
+                ("RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"),
+            ):
+                try:
+                    if pd.isna(row[f"{knee}_x"]) and not pd.isna(row[f"{hip}_x"]) and not pd.isna(row[f"{ankle}_x"]):
+                        xA = int(float(row[f"{hip}_x"]) * width)
+                        yA = int(float(row[f"{hip}_y"]) * height)
+                        xB = int(float(row[f"{ankle}_x"]) * width)
+                        yB = int(float(row[f"{ankle}_y"]) * height)
+                        if (0 < xA < width and 0 < yA < height and
+                                0 < xB < width and 0 < yB < height):
+                            cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
+                            cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
+                except Exception:
+                    continue
 
             for node in joint_nodes:
                 try:
@@ -1174,8 +1291,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), _rs(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), _rs(6), JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs_joint(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs_joint(6), JOINT_CORE, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 

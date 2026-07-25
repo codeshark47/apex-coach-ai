@@ -692,32 +692,52 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
 
 def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
     """
-    Optional second (or more) confirmation point, later in the same
-    clip. Exists for exactly the failure mode found on real footage:
-    tracking can lose the bowler for several seconds (occlusion,
-    motion blur, or he's simply too small/distant for MediaPipe to
-    detect at all during part of the clip) and the single seed has
-    nothing to re-anchor to for the rest of the video. Re-confirming
-    identity here lets the tracker split the clip into zones, each
-    only needing to survive the gap to its NEAREST seed instead of one
-    seed carrying the whole thing — see main._walk_from_seed.
+    Optional additional confirmation points, spread across the clip.
+    Exists for exactly the failure mode found on real footage: a single
+    seed's "walk" gives up permanently once it can't find a matching
+    candidate for MAX_GAP_FRAMES in a row (see main._walk_from_seed) —
+    on a fast run-up or a clip where the bowler gets small/distant/
+    blurry for a stretch, this can leave large parts of the clip with
+    NO tracked skeleton at all, confirmed directly on real footage (a
+    126-frame clip where only 37 frames — one contiguous window around
+    the delivery — had any tracked landmarks; the rest of the run-up
+    and follow-through were blank). Re-confirming identity at MULTIPLE
+    points lets the tracker split the clip into more, shorter zones,
+    each only needing to survive the (much shorter) gap to its nearest
+    seed instead of one seed carrying the whole clip.
+
+    Supports up to 3 extra confirmations (4 seeds total including the
+    primary) — deliberately still a fixed small number of manual clicks,
+    not a new automatic re-acquisition heuristic. This codebase already
+    went through 9 commits of automatic identity-tracking heuristics
+    that each fixed one real clip and broke another before landing on
+    manual seeding as the reliable approach (see main.py's top-of-file
+    history) — the fix for insufficient COVERAGE is more manual anchor
+    points, not smarter automatic guessing.
 
     Returns a list of (frame_index, point) tuples for every extra
     confirmation the coach has added, or None if none were added.
     """
     if uploaded_file is None:
         return None
-    with st.expander(f"➕ Tracking lost partway through — add a second confirmation ({label})", expanded=False):
-        st.caption(
-            "Only needed if the skeleton drifts onto someone else partway through "
-            "this clip (e.g. a coach or another player standing nearby). Scrub to "
-            "a later frame where the bowler is clearly visible again and click him "
-            "— same as above, just a second time."
-        )
-        point, frame_idx = render_bowler_seed_ui(uploaded_file, f"{key_prefix}_extra", f"{label} — 2nd confirmation")
-        if point is not None:
-            return [(frame_idx, point)]
-    return None
+    extra_seeds = []
+    ordinals = ["2nd", "3rd", "4th"]
+    for i, ordinal in enumerate(ordinals):
+        expanded_default = (i == 0)
+        with st.expander(f"➕ Tracking lost partway through — add a {ordinal} confirmation ({label})",
+                          expanded=expanded_default):
+            st.caption(
+                "Only needed if the skeleton is missing or drifts onto someone else "
+                "for part of this clip (fast run-up, bowler far from camera, or "
+                "another player nearby). Scrub to a frame in that gap where the "
+                "bowler is clearly visible and click him — same as the first "
+                "confirmation above, just at a different point in the clip."
+            )
+            point, frame_idx = render_bowler_seed_ui(uploaded_file, f"{key_prefix}_extra{i}",
+                                                       f"{label} — {ordinal} confirmation")
+            if point is not None:
+                extra_seeds.append((frame_idx, point))
+    return extra_seeds if extra_seeds else None
 
 
 single_seed_point, single_seed_frame = (None, 0)
@@ -902,7 +922,27 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             st.session_state["_wrist_confirmed_point"] = None
             st.session_state["_wrist_identity"] = wrist_identity
 
-        with st.expander("🖐️ Correct Release Point (optional)", expanded=False):
+        # Force this open (instead of always collapsed) when the auto-detector
+        # itself already flagged low confidence on this release frame — verified
+        # directly on real footage that "low" br_confidence correlates with
+        # exactly the smooth-wrist-mistracking failure mode this panel exists to
+        # fix. Leaving it collapsed in that case let a coach miss the one step
+        # that actually corrects it, since it looks like an optional extra
+        # rather than a response to a signal the app already computed.
+        wrist_panel_label = "🖐️ Correct Release Point (optional)"
+        force_open = br_confidence == "low"
+        if force_open:
+            wrist_panel_label = "🖐️ Correct Release Point — ⚠️ recommended, auto-detection had low confidence here"
+
+        with st.expander(wrist_panel_label, expanded=force_open):
+            if force_open:
+                st.warning(
+                    "Auto-detection reported **low confidence** on this release frame. Verified on real "
+                    "footage: this specific signal correlates with the wrist/hand tracking silently "
+                    "undershooting the real arm extension — the drawn Release Height line can look "
+                    "plausible while still being wrong. Please check the marker below against the actual "
+                    "video frame before trusting Release Height for this session."
+                )
             st.caption(
                 "The yellow marker is the auto-tracked ball/hand position at your "
                 "confirmed release frame. If it doesn't sit on the real ball/hand — "
