@@ -7,6 +7,8 @@ st.markdown("""
 .stApp { background-color: #0B0E14; }
 .stApp, .stApp p, .stApp li, .stApp span { color: #E2E8F0 !important; }
 h1, h2, h3 { color: #00B4D8 !important; }
+section[data-testid="stSidebar"] { background-color: #0F1524 !important; border-right: 1px solid #00B4D8; }
+section[data-testid="stSidebar"] * { color: #E2E8F0 !important; }
 .story-card {
     background: linear-gradient(145deg, #121824, #1A2333);
     border: 1px solid #1E3A5F; border-radius: 12px; padding: 28px 32px; margin-bottom: 18px;

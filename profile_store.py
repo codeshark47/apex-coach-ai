@@ -155,6 +155,46 @@ def list_athletes(coach_user_id: str) -> list:
     return result.data or []
 
 
+def get_athlete(athlete_id: str, coach_user_id: str) -> dict:
+    """Full athlete row (name, team_id, photo_url, notes, ...), after
+    verifying this athlete belongs to this coach."""
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    result = (
+        client.table("athletes")
+        .select("*")
+        .eq("id", athlete_id)
+        .eq("coach_user_id", coach_user_id)
+        .execute()
+    )
+    if not result.data:
+        raise PermissionError(
+            "This athlete does not exist or does not belong to the signed-in coach."
+        )
+    return result.data[0]
+
+
+def update_athlete_profile(athlete_id: str, coach_user_id: str,
+                            photo_url: Optional[str] = None,
+                            notes: Optional[str] = None) -> None:
+    """Updates the optional profile fields (photo_url, notes) for an athlete.
+    Only fields explicitly passed (not None) are changed — passing neither
+    is a no-op, it does not clear existing values. Requires photo_url and
+    notes columns from add_teams.sql to exist on the athletes table."""
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    _assert_owns_athlete(client, athlete_id, coach_user_id)
+
+    updates = {}
+    if photo_url is not None:
+        updates["photo_url"] = photo_url
+    if notes is not None:
+        updates["notes"] = notes
+    if not updates:
+        return
+    client.table("athletes").update(updates).eq("id", athlete_id).execute()
+
+
 def save_session(athlete_id: str, coach_user_id: str, video_filename: str,
                   camera_mode: str, fps: float, metrics: dict,
                   phase_durations: Optional[dict],
@@ -194,6 +234,121 @@ def get_athlete_history(athlete_id: str, coach_user_id: str, limit: int = 20) ->
         .eq("athlete_id", athlete_id)
         .order("session_date", desc=True)
         .limit(limit)
+        .execute()
+    )
+    return result.data or []
+
+
+# ---------------------------------------------------------------
+# TEAMS / ACADEMY ROSTER — same coach-scoping security model as athletes
+# above: every function requires coach_user_id and filters by it directly,
+# since the service key bypasses RLS. Requires add_teams.sql to have been
+# run against the live database first (teams table + athletes.team_id
+# column) — these functions will raise a clear Postgres error otherwise,
+# not silently degrade.
+# ---------------------------------------------------------------
+
+def get_or_create_team(name: str, coach_user_id: str) -> str:
+    """Returns the team's UUID, creating it if it doesn't exist for this coach."""
+    name = name.strip()
+    if not name:
+        raise ValueError("Team name cannot be empty.")
+    _require_coach_user_id(coach_user_id)
+
+    client = get_client()
+    existing = (
+        client.table("teams")
+        .select("id")
+        .eq("name", name)
+        .eq("coach_user_id", coach_user_id)
+        .execute()
+    )
+    if existing.data:
+        return existing.data[0]["id"]
+
+    created = client.table("teams").insert(
+        {"name": name, "coach_user_id": coach_user_id}
+    ).execute()
+    if not created.data:
+        raise RuntimeError(f"Failed to create team '{name}'.")
+    return created.data[0]["id"]
+
+
+def list_teams(coach_user_id: str) -> list:
+    """Returns [{"id": ..., "name": ...}, ...] for THIS coach only, alphabetical."""
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    result = (
+        client.table("teams")
+        .select("id, name")
+        .eq("coach_user_id", coach_user_id)
+        .order("name")
+        .execute()
+    )
+    return result.data or []
+
+
+def assign_athlete_to_team(athlete_id: str, team_id: Optional[str], coach_user_id: str) -> None:
+    """
+    Sets (or clears, if team_id is None) which team an athlete belongs to.
+    Verifies the athlete belongs to this coach first; the team_id itself is
+    a foreign key, so an invalid/other-coach's team_id fails at the
+    database level rather than silently succeeding.
+    """
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    _assert_owns_athlete(client, athlete_id, coach_user_id)
+
+    if team_id is not None:
+        team_check = (
+            client.table("teams")
+            .select("id")
+            .eq("id", team_id)
+            .eq("coach_user_id", coach_user_id)
+            .execute()
+        )
+        if not team_check.data:
+            raise PermissionError("This team does not exist or does not belong to the signed-in coach.")
+
+    client.table("athletes").update({"team_id": team_id}).eq("id", athlete_id).execute()
+
+
+def list_athletes_by_team(team_id: str, coach_user_id: str) -> list:
+    """Returns [{"id": ..., "name": ...}, ...] for athletes on this team,
+    after verifying the team belongs to this coach."""
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    team_check = (
+        client.table("teams")
+        .select("id")
+        .eq("id", team_id)
+        .eq("coach_user_id", coach_user_id)
+        .execute()
+    )
+    if not team_check.data:
+        raise PermissionError("This team does not exist or does not belong to the signed-in coach.")
+
+    result = (
+        client.table("athletes")
+        .select("id, name")
+        .eq("team_id", team_id)
+        .eq("coach_user_id", coach_user_id)
+        .order("name")
+        .execute()
+    )
+    return result.data or []
+
+
+def list_unassigned_athletes(coach_user_id: str) -> list:
+    """Athletes belonging to this coach that aren't on any team yet."""
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    result = (
+        client.table("athletes")
+        .select("id, name")
+        .eq("coach_user_id", coach_user_id)
+        .is_("team_id", "null")
+        .order("name")
         .execute()
     )
     return result.data or []
