@@ -8,6 +8,8 @@ hasn't been run yet in Supabase, this page says so plainly instead of
 crashing or faking a roster.
 """
 
+import html
+
 import streamlit as st
 
 import profile_store as store
@@ -167,9 +169,13 @@ for i, t in enumerate(teams):
     except Exception:
         count = "—"
     with overview_cols[i % len(overview_cols)]:
+        # SECURITY FIX: team name is coach-typed free text embedded into an
+        # unsafe_allow_html block — escape it so it can only ever render as
+        # text, never break out into markup (see the same fix in
+        # Bowler Profile for the full reasoning).
         st.markdown(f"""
         <div class="roster-card" style="text-align:center;">
-            <div style="font-size:1.1rem;font-weight:600;">{t['name']}</div>
+            <div style="font-size:1.1rem;font-weight:600;">{html.escape(t['name'])}</div>
             <div class="team-count-pill" style="margin-top:8px;">{count} athlete(s)</div>
         </div>
         """, unsafe_allow_html=True)

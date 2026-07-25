@@ -11,6 +11,8 @@ each page runs as its own script — so this page re-checks st.session_state
 .auth_user itself before rendering anything athlete-specific.
 """
 
+import html
+
 import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime
@@ -112,13 +114,21 @@ notes = athlete.get("notes") or ""
 header_l, header_r = st.columns([1, 5])
 with header_l:
     if photo_url:
-        st.markdown(f'<img src="{photo_url}" class="avatar-circle">', unsafe_allow_html=True)
+        # SECURITY FIX: photo_url is coach-typed free text (the "Edit
+        # profile" form), embedded directly into an unsafe_allow_html
+        # block — unescaped, a value like `"><script>...` would break out
+        # of the src="" attribute and execute as live HTML/JS in whoever
+        # views this profile. html.escape() neutralizes quotes/angle
+        # brackets so it can only ever render as an (possibly broken)
+        # image, never as markup.
+        st.markdown(f'<img src="{html.escape(photo_url)}" class="avatar-circle">', unsafe_allow_html=True)
     else:
         st.markdown('<div class="avatar-placeholder">🏏</div>', unsafe_allow_html=True)
 with header_r:
     st.markdown(f"### {athlete['name']}")
     if team_id and team_id in team_names_by_id:
-        st.markdown(f'<span class="team-pill">🏫 {team_names_by_id[team_id]}</span>', unsafe_allow_html=True)
+        # Same fix — team name is coach-typed free text (the "Create team" form).
+        st.markdown(f'<span class="team-pill">🏫 {html.escape(team_names_by_id[team_id])}</span>', unsafe_allow_html=True)
     else:
         st.markdown('<span class="team-pill">Unassigned</span>', unsafe_allow_html=True)
     if notes:
