@@ -27,6 +27,47 @@ import data_quality as dq
 import run_up_analysis as rua
 import camera_angle_detection as cad
 
+
+def _render_frame_nudge_buttons(slider_key: str, min_value: int, max_value: int):
+    """
+    Small ◀ / ▶ buttons that nudge a frame-scrubbing slider by exactly
+    one frame. Dragging a slider to the EXACT right frame is fiddly on
+    a real video — fine BFC/FFC/BR or seed-point confirmation often
+    comes down to needing one frame earlier or later, which a slider
+    drag overshoots easily. Mutates the slider's own session_state key
+    via an on_click callback (the supported way to adjust a keyed
+    widget from outside itself) — call this immediately before the
+    st.slider(key=slider_key) call it targets, no other wiring needed,
+    the slider just picks up the new value on rerun.
+    """
+    def _step(delta):
+        current = st.session_state.get(slider_key, min_value)
+        st.session_state[slider_key] = max(min_value, min(max_value, current + delta))
+
+    nudge_cols = st.columns([1, 1, 10])
+    with nudge_cols[0]:
+        st.button("◀", key=f"{slider_key}_step_back", on_click=_step, args=(-1,),
+                  help="Back 1 frame", use_container_width=True)
+    with nudge_cols[1]:
+        st.button("▶", key=f"{slider_key}_step_fwd", on_click=_step, args=(1,),
+                  help="Forward 1 frame", use_container_width=True)
+
+
+def _framed_image_container():
+    """
+    A smaller, centered, bordered container for reference-frame images —
+    was full-page-width with no visual frame, which read as a raw debug
+    dump rather than a deliberate part of the UI. Purely a layout change:
+    streamlit_image_coordinates still reports back its own actual
+    rendered width/height regardless of container size, and every call
+    site already scales click coordinates using that reported size (not
+    a hardcoded one) — so shrinking the display here doesn't touch the
+    click-to-pixel math at all.
+    """
+    _, mid, _ = st.columns([1, 3, 1])
+    return mid.container(border=True)
+
+
 # ====================================================================
 # PAGE CONFIG & ELITE DARK UI  (unchanged from Phase 1)
 # ====================================================================
@@ -408,6 +449,7 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
 
         total_frames = cal.get_frame_count(temp_path)
         if total_frames > 1:
+            _render_frame_nudge_buttons("calib_frame_idx", 0, max(total_frames - 1, 0))
             frame_idx = st.slider(
                 "Scrub to a frame where your reference points (e.g. stumps) are clearly visible",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -454,10 +496,11 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
             else:
                 st.caption("✅ Both points selected — see below.")
 
-            click = streamlit_image_coordinates(
-                display_img, key="calib_click_widget",
-                use_column_width="always"
-            )
+            with _framed_image_container():
+                click = streamlit_image_coordinates(
+                    display_img, key="calib_click_widget",
+                    use_column_width="always"
+                )
 
             if click is not None and len(st.session_state.calib_points) < 2:
                 # The component may report coords relative to its rendered size,
@@ -628,6 +671,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
             "the skeleton ever locking onto the wrong person."
         )
         if total_frames > 1:
+            _render_frame_nudge_buttons(f"{key_prefix}_seed_slider", 0, max(total_frames - 1, 0))
             frame_idx = st.slider(
                 "Scrub to a frame with the bowler visible",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -663,10 +707,11 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
             else:
                 st.caption("✅ Bowler confirmed — click again to move the marker.")
 
-            click = streamlit_image_coordinates(
-                display_img, key=f"{key_prefix}_seed_click_widget",
-                use_column_width="always"
-            )
+            with _framed_image_container():
+                click = streamlit_image_coordinates(
+                    display_img, key=f"{key_prefix}_seed_click_widget",
+                    use_column_width="always"
+                )
 
             if click is not None:
                 rendered_w = click.get("width") or orig_w
@@ -890,6 +935,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 f"wrong even when it reports high confidence, so this step always runs."
             )
             total_frames_single = cal.get_frame_count(single_ref_path)
+            _render_frame_nudge_buttons("br_confirm_slider", 0, max(total_frames_single - 1, 0))
             br_slider_val = st.slider(
                 "Scrub to the true ball-release frame",
                 min_value=0, max_value=max(total_frames_single - 1, 0),
@@ -898,8 +944,9 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             )
             br_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=br_slider_val)
             if br_frame_img is not None:
-                st.image(br_frame_img, use_column_width=True,
-                          caption=f"Frame {br_slider_val} — is the ball leaving the hand here?")
+                with _framed_image_container():
+                    st.image(br_frame_img, use_column_width=True,
+                              caption=f"Frame {br_slider_val} — is the ball leaving the hand here?")
             if st.button("✅ Confirm this is the release frame", key="confirm_br_button"):
                 st.session_state["_br_confirmed_frame"] = br_slider_val
                 st.rerun()
@@ -984,10 +1031,11 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 else:
                     st.caption("✅ Corrected — click again to move the marker, or reset below.")
 
-                wrist_click = streamlit_image_coordinates(
-                    display_img, key="wrist_click_widget",
-                    use_column_width="always"
-                )
+                with _framed_image_container():
+                    wrist_click = streamlit_image_coordinates(
+                        display_img, key="wrist_click_widget",
+                        use_column_width="always"
+                    )
 
                 if wrist_click is not None:
                     rendered_w = wrist_click.get("width") or orig_w
@@ -1038,6 +1086,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 f"far earlier in the run-up."
             )
             total_frames_ffc = cal.get_frame_count(single_ref_path)
+            _render_frame_nudge_buttons("ffc_confirm_slider", 0, max(total_frames_ffc - 1, 0))
             ffc_slider_val = st.slider(
                 "Scrub to the true front-foot-contact frame",
                 min_value=0, max_value=max(total_frames_ffc - 1, 0),
@@ -1046,8 +1095,9 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             )
             ffc_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=ffc_slider_val)
             if ffc_frame_img is not None:
-                st.image(ffc_frame_img, use_column_width=True,
-                          caption=f"Frame {ffc_slider_val} — has the front foot just planted here?")
+                with _framed_image_container():
+                    st.image(ffc_frame_img, use_column_width=True,
+                              caption=f"Frame {ffc_slider_val} — has the front foot just planted here?")
             if st.button("✅ Confirm this is the front-foot-contact frame", key="confirm_ffc_button"):
                 st.session_state["_ffc_confirmed_frame"] = ffc_slider_val
                 st.rerun()
@@ -1081,6 +1131,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 f"contact you just confirmed, not far back in the run-up."
             )
             total_frames_bfc = cal.get_frame_count(single_ref_path)
+            _render_frame_nudge_buttons("bfc_confirm_slider", 0, max(total_frames_bfc - 1, 0))
             bfc_slider_val = st.slider(
                 "Scrub to the true back-foot-contact frame",
                 min_value=0, max_value=max(total_frames_bfc - 1, 0),
@@ -1089,8 +1140,9 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             )
             bfc_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=bfc_slider_val)
             if bfc_frame_img is not None:
-                st.image(bfc_frame_img, use_column_width=True,
-                          caption=f"Frame {bfc_slider_val} — has the back foot just planted here?")
+                with _framed_image_container():
+                    st.image(bfc_frame_img, use_column_width=True,
+                              caption=f"Frame {bfc_slider_val} — has the back foot just planted here?")
             if st.button("✅ Confirm this is the back-foot-contact frame", key="confirm_bfc_button"):
                 st.session_state["_bfc_confirmed_frame"] = bfc_slider_val
                 st.rerun()
