@@ -19,7 +19,9 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                               bowling_arm_override: str = None,
                               side_seed_point: tuple = None, side_seed_frame_index: int = 0,
                               rear_seed_point: tuple = None, rear_seed_frame_index: int = 0,
-                              side_extra_seeds: list = None, rear_extra_seeds: list = None) -> dict:
+                              side_extra_seeds: list = None, rear_extra_seeds: list = None,
+                              side_precomputed: dict = None, rear_precomputed: dict = None,
+                              side_event_overrides: dict = None, rear_event_overrides: dict = None) -> dict:
     """
     SaaS Architecture Dual Camera Engine.
     Processes side-on and rear streams independently to bypass manual sync issues.
@@ -32,34 +34,66 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     side_extra_seeds/rear_extra_seeds: optional additional (frame_index,
     point) re-confirmations later in each stream — same purpose as
     Single Camera mode's extra_seeds, passed straight through.
+
+    side_precomputed/rear_precomputed: optional result dicts already
+    returned by orchestrator.extract_and_detect_events() for each stream —
+    reuses them instead of re-running extraction, for the Streamlit UI
+    flow that already ran that stage to show each stream's own BFC/FFC/BR
+    confirmation before this function is called. Falls back to running
+    extraction internally (the original behavior) when not given, so any
+    other caller (CLI, tests) is unaffected.
+
+    side_event_overrides/rear_event_overrides: optional coach-confirmed
+    {"BFC": int, "FFC": int, "BR": int, "wrist_override_x": float|None,
+    "wrist_override_y": float|None} per stream — see
+    streamlit_app.render_stream_event_confirmation. BUG FIX (found during
+    a full app audit): before this, Dual Camera went straight from upload
+    to fully-automatic event detection with NO human review at all, while
+    every real auto-detection failure mode this session found and fixed
+    (wrong release frame despite "high confidence", FFC landing on an
+    ordinary run-up stride, etc.) applies here exactly as much as it does
+    to Single Camera — a human confirming the frame is what actually
+    catches those, not a confidence score. wrist_override only applies to
+    the side stream (release_height is only ever computed from it).
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    print("[DUAL-CAM CORE] Extracting side-on tracking vectors...")
-    side_csv = os.path.join(output_dir, "landmarks_side.csv")
-    side_extraction = extract_video_landmarks(side_on_path, side_csv,
-                                               seed_point=side_seed_point,
-                                               seed_frame_index=side_seed_frame_index,
-                                               extra_seeds=side_extra_seeds)
-    if side_extraction["status"] == "error":
-        return {"status": "failed", "stage": "side_camera", "message": side_extraction["error_message"]}
-
-    side_df  = pd.read_csv(side_csv)
-    side_fps = side_extraction["fps"]
-
-    # BOWLING ARM AUTO-DETECTION — detected from the side-on stream (the
-    # primary view for delivery mechanics), then applied consistently to
-    # both camera streams so left-arm and right-arm bowlers are both
-    # measured correctly, matching the fix already applied to Single
-    # Camera mode.
-    if bowling_arm_override in ("left", "right"):
-        bowling_arm = bowling_arm_override
+    if side_precomputed is not None and side_precomputed.get("status") == "success":
+        side_df = side_precomputed["df"]
+        side_fps = side_precomputed["fps"]
+        bowling_arm = (bowling_arm_override if bowling_arm_override in ("left", "right")
+                       else side_precomputed.get("bowling_arm") or "right")
+        side_events = dict(side_precomputed["events"])
     else:
-        bowling_arm = detect_bowling_arm(side_df)
-    lead_side = "left" if bowling_arm == "right" else "right"
+        print("[DUAL-CAM CORE] Extracting side-on tracking vectors...")
+        side_csv = os.path.join(output_dir, "landmarks_side.csv")
+        side_extraction = extract_video_landmarks(side_on_path, side_csv,
+                                                   seed_point=side_seed_point,
+                                                   seed_frame_index=side_seed_frame_index,
+                                                   extra_seeds=side_extra_seeds)
+        if side_extraction["status"] == "error":
+            return {"status": "failed", "stage": "side_camera", "message": side_extraction["error_message"]}
 
-    side_events = embedded_detect_events(side_df, fps=side_fps, bowling_arm=bowling_arm,
-                                         camera_angle="side_on")
+        side_df  = pd.read_csv(side_csv)
+        side_fps = side_extraction["fps"]
+
+        # BOWLING ARM AUTO-DETECTION — detected from the side-on stream (the
+        # primary view for delivery mechanics), then applied consistently to
+        # both camera streams so left-arm and right-arm bowlers are both
+        # measured correctly, matching the fix already applied to Single
+        # Camera mode.
+        if bowling_arm_override in ("left", "right"):
+            bowling_arm = bowling_arm_override
+        else:
+            bowling_arm = detect_bowling_arm(side_df)
+
+        side_events = embedded_detect_events(side_df, fps=side_fps, bowling_arm=bowling_arm,
+                                             camera_angle="side_on")
+
+    if side_event_overrides:
+        side_events.update(side_event_overrides)
+
+    lead_side = "left" if bowling_arm == "right" else "right"
 
     side_ffc_rows = side_df[side_df["frame"] == side_events["FFC"]]
     side_br_rows  = side_df[side_df["frame"] == side_events["BR"]]
@@ -75,8 +109,17 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         side_height_ref = _nearest_complete_row(
             side_df, side_events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
         )
+    # Coach-confirmed wrist/ball position, when given, overrides the
+    # tracked landmark entirely — same reasoning as Single Camera (see
+    # calculate_release_height_ratio_safe's docstring): verified real
+    # MediaPipe mistracking during a fast, blurred release swing that no
+    # automatic plausibility filter can catch.
+    side_wrist_x = side_events.get("wrist_override_x")
+    side_wrist_y = side_events.get("wrist_override_y")
+    side_wrist_override_norm = (side_wrist_x, side_wrist_y) if side_wrist_x is not None and side_wrist_y is not None else None
     release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm,
-                                                              reference_row=side_height_ref)
+                                                              reference_row=side_height_ref,
+                                                              wrist_override_norm=side_wrist_override_norm)
 
     # FFC-to-Release knee angle delta ("yielding knee" check from external
     # biomechanical audit) — same logic as Single Camera mode.
@@ -86,19 +129,27 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         knee_delta = round(knee_at_release["degrees"] - knee_analysis["degrees"], 1)
         knee_delta_status = "yielding" if knee_delta < -5.0 else ("braced" if knee_delta >= 0 else "minor_yield")
 
-    print("[DUAL-CAM CORE] Extracting rear-view tracking vectors...")
-    rear_csv = os.path.join(output_dir, "landmarks_rear.csv")
-    rear_extraction = extract_video_landmarks(rear_view_path, rear_csv,
-                                               seed_point=rear_seed_point,
-                                               seed_frame_index=rear_seed_frame_index,
-                                               extra_seeds=rear_extra_seeds)
-    if rear_extraction["status"] == "error":
-        return {"status": "failed", "stage": "rear_camera", "message": rear_extraction["error_message"]}
+    if rear_precomputed is not None and rear_precomputed.get("status") == "success":
+        rear_df = rear_precomputed["df"]
+        rear_fps = rear_precomputed["fps"]
+        rear_events = dict(rear_precomputed["events"])
+    else:
+        print("[DUAL-CAM CORE] Extracting rear-view tracking vectors...")
+        rear_csv = os.path.join(output_dir, "landmarks_rear.csv")
+        rear_extraction = extract_video_landmarks(rear_view_path, rear_csv,
+                                                   seed_point=rear_seed_point,
+                                                   seed_frame_index=rear_seed_frame_index,
+                                                   extra_seeds=rear_extra_seeds)
+        if rear_extraction["status"] == "error":
+            return {"status": "failed", "stage": "rear_camera", "message": rear_extraction["error_message"]}
 
-    rear_df  = pd.read_csv(rear_csv)
-    rear_fps = rear_extraction["fps"]
-    rear_events = embedded_detect_events(rear_df, fps=rear_fps, bowling_arm=bowling_arm,
-                                         camera_angle="front_or_rear")
+        rear_df  = pd.read_csv(rear_csv)
+        rear_fps = rear_extraction["fps"]
+        rear_events = embedded_detect_events(rear_df, fps=rear_fps, bowling_arm=bowling_arm,
+                                             camera_angle="front_or_rear")
+
+    if rear_event_overrides:
+        rear_events.update(rear_event_overrides)
 
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
     head_stability = calculate_head_stability(rear_df, rear_events["BFC"], rear_events["BR"])
@@ -139,6 +190,13 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             "ball_release_frame": int(side_events["BR"]),
             "ball_release_confidence": side_events.get("BR_confidence", "high"),
             "ball_release_plausible_fraction": side_events.get("BR_plausible_fraction", 1.0),
+            # Present when side_event_overrides was given (the Streamlit UI's
+            # confirmation flow) — same (auto_guess, coach_confirmed) label
+            # pairs Single Camera already logs, for Phase 2 training data.
+            "ball_release_frame_auto_detected": side_events.get("BR_auto_detected"),
+            "ball_release_auto_confidence": side_events.get("BR_auto_confidence"),
+            "front_foot_contact_frame_auto_detected": side_events.get("FFC_auto_detected"),
+            "back_foot_contact_frame_auto_detected": side_events.get("BFC_auto_detected"),
         },
         "biomechanical_metrics": {
             "trunk_lean": {

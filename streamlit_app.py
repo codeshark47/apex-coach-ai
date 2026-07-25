@@ -68,6 +68,259 @@ def _framed_image_container():
     return mid.container(border=True)
 
 
+def render_stream_event_confirmation(stage12_result, ref_path: str, file_identity: str,
+                                      key_prefix: str, bowling_arm: str, stream_label: str,
+                                      include_wrist_correction: bool = False):
+    """
+    Mandatory BFC/FFC/BR confirmation (+ optional wrist correction) for ONE
+    video stream — built so Dual Camera mode gets the exact same reliability
+    safeguards Single Camera already has, instead of trusting raw
+    auto-detection with no human review at all. Every one of these steps
+    exists because a real, confirmed failure mode was found on actual
+    footage where auto-detection looked confident and was still wrong
+    (see the comments in Single Camera's own confirmation flow, further
+    down this file, for the specific clips that proved each one out).
+
+    Deliberately a NEW, separate function rather than a refactor of Single
+    Camera's existing (already working, already verified) inline flow —
+    this is pure addition with its own session_state keys (prefixed by
+    key_prefix, e.g. "side"/"rear"), so it carries zero risk of changing
+    Single Camera's behavior.
+
+    include_wrist_correction: only meaningful for whichever stream actually
+    feeds Release Height (the side-on stream in dual mode) — the rear
+    stream's release-point tracking isn't used for any metric, so showing
+    a correction panel for it would be a pointless, confusing extra step.
+
+    Returns None if BFC/FFC/BR aren't all confirmed yet. Once confirmed,
+    returns {"BFC": int, "FFC": int, "BR": int, "BFC_auto_detected": ...,
+    "FFC_auto_detected": ..., "BR_auto_detected": ..., "BR_auto_confidence": ...,
+    "wrist_override_x": float|None, "wrist_override_y": float|None}.
+    """
+    br_key, ffc_key, bfc_key = f"_{key_prefix}_br_confirmed_frame", f"_{key_prefix}_ffc_confirmed_frame", f"_{key_prefix}_bfc_confirmed_frame"
+    br_id_key, ffc_id_key, bfc_id_key = f"_{key_prefix}_br_identity", f"_{key_prefix}_ffc_identity", f"_{key_prefix}_bfc_identity"
+
+    if st.session_state.get(br_id_key) != file_identity:
+        st.session_state[br_key] = None
+        st.session_state[br_id_key] = file_identity
+    if st.session_state.get(ffc_id_key) != file_identity:
+        st.session_state[ffc_key] = None
+        st.session_state[ffc_id_key] = file_identity
+    if st.session_state.get(bfc_id_key) != file_identity:
+        st.session_state[bfc_key] = None
+        st.session_state[bfc_id_key] = file_identity
+
+    br_auto, br_confidence, ffc_auto, bfc_auto = None, None, None, None
+    if stage12_result is not None and stage12_result.get("status") == "success":
+        br_auto = stage12_result["events"].get("BR")
+        br_confidence = stage12_result["events"].get("BR_confidence")
+        ffc_auto = stage12_result["events"].get("FFC")
+        bfc_auto = stage12_result["events"].get("BFC")
+
+    total_frames = cal.get_frame_count(ref_path)
+
+    with st.expander(f"🎯 Confirm Ball Release Frame — {stream_label}",
+                      expanded=st.session_state.get(br_key) is None):
+        if br_auto is None:
+            st.error("Couldn't detect a release frame at all — check tracking above.")
+        else:
+            conf_note = {"high": "high confidence", "low": "low confidence"}.get(br_confidence, "unknown confidence")
+            st.info(
+                f"Algorithm's best guess: **frame {br_auto}** ({conf_note}). Scrub to the exact "
+                f"frame where the ball actually leaves the hand and confirm. Auto-detection can "
+                f"be wrong even when it reports high confidence, so this step always runs."
+            )
+            slider_key = f"{key_prefix}_br_confirm_slider"
+            _render_frame_nudge_buttons(slider_key, 0, max(total_frames - 1, 0))
+            br_slider_val = st.slider(
+                "Scrub to the true ball-release frame",
+                min_value=0, max_value=max(total_frames - 1, 0),
+                value=min(max(br_auto, 0), max(total_frames - 1, 0)),
+                key=slider_key
+            )
+            br_frame_img = cal.extract_reference_frame(ref_path, frame_index=br_slider_val)
+            if br_frame_img is not None:
+                with _framed_image_container():
+                    st.image(br_frame_img, use_column_width=True,
+                              caption=f"Frame {br_slider_val} — is the ball leaving the hand here?")
+            if st.button("✅ Confirm this is the release frame", key=f"{key_prefix}_confirm_br_button"):
+                st.session_state[br_key] = br_slider_val
+                st.rerun()
+            if st.session_state.get(br_key) is not None:
+                st.success(f"Confirmed: release at frame {st.session_state[br_key]}.")
+
+    confirmed_br_frame = st.session_state.get(br_key)
+    wrist_override_x, wrist_override_y = None, None
+    if include_wrist_correction and confirmed_br_frame is not None:
+        wrist_point_key = f"_{key_prefix}_wrist_confirmed_point"
+        wrist_id_key = f"_{key_prefix}_wrist_identity"
+        wrist_identity = f"{file_identity}_{confirmed_br_frame}"
+        if st.session_state.get(wrist_id_key) != wrist_identity:
+            st.session_state[wrist_point_key] = None
+            st.session_state[wrist_id_key] = wrist_identity
+
+        wrist_panel_label = f"🖐️ Correct Release Point — {stream_label} (optional)"
+        force_open = br_confidence == "low"
+        if force_open:
+            wrist_panel_label = f"🖐️ Correct Release Point — {stream_label} — ⚠️ recommended, auto-detection had low confidence here"
+
+        with st.expander(wrist_panel_label, expanded=force_open):
+            if force_open:
+                st.warning(
+                    "Auto-detection reported **low confidence** on this release frame. This specific "
+                    "signal correlates with the wrist/hand tracking silently undershooting the real "
+                    "arm extension — the drawn Release Height line can look plausible while still "
+                    "being wrong. Please check the marker below before trusting Release Height."
+                )
+            st.caption(
+                "The yellow marker is the auto-tracked ball/hand position at your confirmed "
+                "release frame. If it doesn't sit on the real ball/hand, click the real position "
+                "to correct it. This feeds Release Height directly."
+            )
+            wrist_frame_img = cal.extract_reference_frame(ref_path, frame_index=confirmed_br_frame)
+            if wrist_frame_img is not None:
+                from PIL import Image, ImageDraw
+                from streamlit_image_coordinates import streamlit_image_coordinates
+
+                pil_img = Image.fromarray(wrist_frame_img)
+                orig_w, orig_h = pil_img.size
+
+                auto_point = None
+                stage12_df = stage12_result.get("df") if stage12_result else None
+                bowl_side_for_wrist = "RIGHT" if bowling_arm == "right" else "LEFT"
+                if stage12_df is not None:
+                    wrist_rows = stage12_df[stage12_df["frame"] == confirmed_br_frame]
+                    if not wrist_rows.empty:
+                        wx = wrist_rows.iloc[0].get(f"{bowl_side_for_wrist}_WRIST_x")
+                        wy = wrist_rows.iloc[0].get(f"{bowl_side_for_wrist}_WRIST_y")
+                        if wx is not None and wy is not None and not pd.isna(wx) and not pd.isna(wy):
+                            auto_point = (round(wx * orig_w), round(wy * orig_h))
+
+                corrected_point = st.session_state.get(wrist_point_key)
+                display_point = corrected_point or auto_point
+
+                display_img = pil_img.copy()
+                if display_point is not None:
+                    draw = ImageDraw.Draw(display_img)
+                    r = max(5, orig_w // 100)
+                    px, py = display_point
+                    color = "lime" if corrected_point is not None else "yellow"
+                    draw.ellipse((px - r, py - r, px + r, py + r), outline=color, width=4)
+
+                if corrected_point is None:
+                    st.caption("🟡 Auto-tracked position shown. Click the image below to correct it if wrong.")
+                else:
+                    st.caption("✅ Corrected — click again to move the marker, or reset below.")
+
+                with _framed_image_container():
+                    wrist_click = streamlit_image_coordinates(
+                        display_img, key=f"{key_prefix}_wrist_click_widget",
+                        use_column_width="always"
+                    )
+
+                if wrist_click is not None:
+                    rendered_w = wrist_click.get("width") or orig_w
+                    rendered_h = wrist_click.get("height") or orig_h
+                    scale_x = orig_w / rendered_w
+                    scale_y = orig_h / rendered_h
+                    new_point = (round(wrist_click["x"] * scale_x), round(wrist_click["y"] * scale_y))
+                    if st.session_state.get(wrist_point_key) != new_point:
+                        st.session_state[wrist_point_key] = new_point
+                        st.rerun()
+
+                if corrected_point is not None and st.button("↺ Reset to auto-tracked position", key=f"{key_prefix}_reset_wrist_point"):
+                    st.session_state[wrist_point_key] = None
+                    st.rerun()
+
+        confirmed_point = st.session_state.get(wrist_point_key)
+        if confirmed_point is not None:
+            wrist_frame_dims = cal.extract_reference_frame(ref_path, frame_index=confirmed_br_frame)
+            if wrist_frame_dims is not None:
+                _wf_h, _wf_w = wrist_frame_dims.shape[:2]
+                wrist_override_x = confirmed_point[0] / _wf_w
+                wrist_override_y = confirmed_point[1] / _wf_h
+
+    with st.expander(f"🦶 Confirm Front Foot Contact Frame — {stream_label}",
+                      expanded=st.session_state.get(ffc_key) is None):
+        if ffc_auto is None:
+            st.error("Couldn't detect a front-foot-contact frame at all — check tracking above.")
+        else:
+            st.info(
+                f"Algorithm's best guess: **frame {ffc_auto}**. Scrub to the exact frame where "
+                f"the front (lead) foot first plants on the ground and confirm."
+            )
+            slider_key = f"{key_prefix}_ffc_confirm_slider"
+            _render_frame_nudge_buttons(slider_key, 0, max(total_frames - 1, 0))
+            ffc_slider_val = st.slider(
+                "Scrub to the true front-foot-contact frame",
+                min_value=0, max_value=max(total_frames - 1, 0),
+                value=min(max(ffc_auto, 0), max(total_frames - 1, 0)),
+                key=slider_key
+            )
+            ffc_frame_img = cal.extract_reference_frame(ref_path, frame_index=ffc_slider_val)
+            if ffc_frame_img is not None:
+                with _framed_image_container():
+                    st.image(ffc_frame_img, use_column_width=True,
+                              caption=f"Frame {ffc_slider_val} — has the front foot just planted here?")
+            if st.button("✅ Confirm this is the front-foot-contact frame", key=f"{key_prefix}_confirm_ffc_button"):
+                st.session_state[ffc_key] = ffc_slider_val
+                st.rerun()
+            if st.session_state.get(ffc_key) is not None:
+                st.success(f"Confirmed: front-foot contact at frame {st.session_state[ffc_key]}.")
+
+    with st.expander(f"👟 Confirm Back Foot Contact Frame — {stream_label}",
+                      expanded=st.session_state.get(bfc_key) is None):
+        if bfc_auto is None:
+            st.error("Couldn't detect a back-foot-contact frame at all — check tracking above.")
+        else:
+            st.info(
+                f"Algorithm's best guess: **frame {bfc_auto}**. Scrub to the frame where the back "
+                f"(rear) foot plants just before the final delivery stride and confirm."
+            )
+            slider_key = f"{key_prefix}_bfc_confirm_slider"
+            _render_frame_nudge_buttons(slider_key, 0, max(total_frames - 1, 0))
+            bfc_slider_val = st.slider(
+                "Scrub to the true back-foot-contact frame",
+                min_value=0, max_value=max(total_frames - 1, 0),
+                value=min(max(bfc_auto, 0), max(total_frames - 1, 0)),
+                key=slider_key
+            )
+            bfc_frame_img = cal.extract_reference_frame(ref_path, frame_index=bfc_slider_val)
+            if bfc_frame_img is not None:
+                with _framed_image_container():
+                    st.image(bfc_frame_img, use_column_width=True,
+                              caption=f"Frame {bfc_slider_val} — has the back foot just planted here?")
+            if st.button("✅ Confirm this is the back-foot-contact frame", key=f"{key_prefix}_confirm_bfc_button"):
+                st.session_state[bfc_key] = bfc_slider_val
+                st.rerun()
+            if st.session_state.get(bfc_key) is not None:
+                st.success(f"Confirmed: back-foot contact at frame {st.session_state[bfc_key]}.")
+
+    br_confirmed = st.session_state.get(br_key)
+    ffc_confirmed = st.session_state.get(ffc_key)
+    bfc_confirmed = st.session_state.get(bfc_key)
+    if br_confirmed is None or ffc_confirmed is None or bfc_confirmed is None:
+        return None
+
+    return {
+        "BFC": bfc_confirmed, "FFC": ffc_confirmed, "BR": br_confirmed,
+        "BFC_auto_detected": bfc_auto, "FFC_auto_detected": ffc_auto,
+        "BR_auto_detected": br_auto, "BR_auto_confidence": br_confidence,
+        "wrist_override_x": wrist_override_x, "wrist_override_y": wrist_override_y,
+    }
+
+
+def stream_confirmation_resolved(key_prefix: str) -> bool:
+    """Whether all 3 mandatory events are confirmed for this stream — used
+    to gate the Execute button, same purpose as Single Camera's br/ffc/bfc
+    _resolved checks."""
+    return (
+        st.session_state.get(f"_{key_prefix}_br_confirmed_frame") is not None
+        and st.session_state.get(f"_{key_prefix}_ffc_confirmed_frame") is not None
+        and st.session_state.get(f"_{key_prefix}_bfc_confirmed_frame") is not None
+    )
+
+
 # ====================================================================
 # PAGE CONFIG & ELITE DARK UI  (unchanged from Phase 1)
 # ====================================================================
@@ -1153,6 +1406,82 @@ br_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_br_con
 ffc_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_ffc_confirmed_frame") is not None)
 bfc_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_bfc_confirmed_frame") is not None)
 
+# DUAL CAMERA — EVENT CONFIRMATION, same mandatory pattern as Single Camera
+# above (BUG FOUND during a full app audit: Dual Camera was going straight
+# from upload to fully-automatic BFC/FFC/BR detection with NO human review
+# at all, while being labeled "Recommended" — every auto-detection failure
+# mode this session found and fixed for Single Camera was fully exposed,
+# unmitigated, here). Each stream is its own independently-filmed video
+# with its own timeline, so each gets its own stage1+2 extraction and its
+# own confirmation flow — reusing render_stream_event_confirmation defined
+# above rather than duplicating Single Camera's inline code a third time.
+side_stage12_result = None
+rear_stage12_result = None
+side_confirmed_events = None
+rear_confirmed_events = None
+
+if (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_rear is not None
+        and side_seed_point is not None and rear_seed_point is not None):
+    side_ref_path = st.session_state.get("side_seed_ref_path")
+    rear_ref_path = st.session_state.get("rear_seed_ref_path")
+
+    side_file_identity = (
+        f"{uploaded_side.name}_{uploaded_side.size}_{bowling_arm_override}"
+        f"_{side_seed_point}_{side_seed_frame}_{side_extra_seeds}"
+    )
+    rear_file_identity = (
+        f"{uploaded_rear.name}_{uploaded_rear.size}_{bowling_arm_override}"
+        f"_{rear_seed_point}_{rear_seed_frame}_{rear_extra_seeds}"
+    )
+
+    # Fixed camera_angle_override per stream — Dual Camera knows each
+    # stream's angle by construction (the side upload IS side-on, the rear
+    # upload IS front/rear), same reasoning as the comment above on why
+    # angle_resolved skips Dual Camera entirely.
+    if st.session_state.get("_side_stage12_identity") != side_file_identity:
+        with st.spinner("📐 Extracting side-on tracking data..."):
+            st.session_state["_side_stage12_result"] = o.extract_and_detect_events(
+                side_ref_path, output_dir="output",
+                bowling_arm_override=bowling_arm_override,
+                seed_point=side_seed_point, seed_frame_index=side_seed_frame,
+                extra_seeds=side_extra_seeds, camera_angle_override="side_on",
+            )
+        st.session_state["_side_stage12_identity"] = side_file_identity
+    side_stage12_result = st.session_state.get("_side_stage12_result")
+
+    if st.session_state.get("_rear_stage12_identity") != rear_file_identity:
+        with st.spinner("📐 Extracting rear-view tracking data..."):
+            st.session_state["_rear_stage12_result"] = o.extract_and_detect_events(
+                rear_ref_path, output_dir="output",
+                bowling_arm_override=bowling_arm_override,
+                seed_point=rear_seed_point, seed_frame_index=rear_seed_frame,
+                extra_seeds=rear_extra_seeds, camera_angle_override="front_or_rear",
+            )
+        st.session_state["_rear_stage12_identity"] = rear_file_identity
+    rear_stage12_result = st.session_state.get("_rear_stage12_result")
+
+    st.markdown("#### 📹 Side-On Stream — Confirm Delivery Events")
+    if side_stage12_result is None or side_stage12_result.get("status") != "success":
+        st.error(side_stage12_result.get("message", "Side-on tracking extraction failed.")
+                  if side_stage12_result else "Side-on tracking extraction failed.")
+    else:
+        side_confirmed_events = render_stream_event_confirmation(
+            side_stage12_result, side_ref_path, side_file_identity,
+            key_prefix="side", bowling_arm=side_stage12_result.get("bowling_arm", "right"),
+            stream_label="Side-On", include_wrist_correction=True,
+        )
+
+    st.markdown("#### 📹 Rear-View Stream — Confirm Delivery Events")
+    if rear_stage12_result is None or rear_stage12_result.get("status") != "success":
+        st.error(rear_stage12_result.get("message", "Rear-view tracking extraction failed.")
+                  if rear_stage12_result else "Rear-view tracking extraction failed.")
+    else:
+        rear_confirmed_events = render_stream_event_confirmation(
+            rear_stage12_result, rear_ref_path, rear_file_identity,
+            key_prefix="rear", bowling_arm=rear_stage12_result.get("bowling_arm", "right"),
+            stream_label="Rear-View", include_wrist_correction=False,
+        )
+
 # Angle must be genuinely resolved (not left on "Not sure") before running —
 # matches the same hard-gate already applied to bowling arm above. Dual
 # Camera doesn't need this: each stream's angle is known by construction.
@@ -1166,7 +1495,8 @@ single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None
               and side_seed_point is not None and rear_seed_point is not None
-              and bowling_arm_selected)
+              and bowling_arm_selected
+              and side_confirmed_events is not None and rear_confirmed_events is not None)
 
 if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is None:
     st.sidebar.warning("👆 Click the bowler in the frame above to enable analysis.")
@@ -1190,6 +1520,12 @@ elif (camera_mode == "Single Camera" and uploaded_single is not None and single_
       and bowling_arm_selected and angle_resolved and br_resolved and ffc_resolved and not bfc_resolved):
     st.sidebar.warning("👆 Confirm the back-foot-contact frame above to enable analysis — "
                         "this feeds Head Stability's measurement window.")
+elif (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_rear is not None
+      and side_seed_point is not None and rear_seed_point is not None and bowling_arm_selected
+      and not (side_confirmed_events is not None and rear_confirmed_events is not None)):
+    st.sidebar.warning("👆 Confirm the ball-release/front-foot/back-foot frames for BOTH streams "
+                        "above to enable analysis — auto-detection can be wrong even when it "
+                        "looks confident.")
 
 import usage_limits
 _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
@@ -1232,6 +1568,8 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     side_seed_point=side_seed_point, side_seed_frame_index=side_seed_frame,
                     rear_seed_point=rear_seed_point, rear_seed_frame_index=rear_seed_frame,
                     side_extra_seeds=side_extra_seeds, rear_extra_seeds=rear_extra_seeds,
+                    side_precomputed=side_stage12_result, rear_precomputed=rear_stage12_result,
+                    side_event_overrides=side_confirmed_events, rear_event_overrides=rear_confirmed_events,
                 )
                 active_camera_mode = "Dual Camera"
             else:
