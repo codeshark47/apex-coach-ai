@@ -4,6 +4,8 @@ import numpy as np
 import os
 import urllib.request
 
+import monitoring
+
 # ============================================================
 # REVERTED to a simple baseline after 9 commits of identity-tracking
 # heuristics (multi-person warm-up/lock, ankle-visibility gating, body-
@@ -163,6 +165,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         try:
             urllib.request.urlretrieve(model_url, model_path)
         except Exception as e:
+            monitoring.capture(e)
             return {"status": "error", "error_message": f"Failed to download model file: {str(e)}"}
 
     try:

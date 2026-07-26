@@ -3,6 +3,7 @@ import re
 from typing import Dict, Any
 
 import metric_ranges as mr
+import monitoring
 
 ZONE_LABELS = {"green": "OPTIMAL", "amber": "ACCEPTABLE", "red": "CRITICAL", "unknown": "NO DATA"}
 
@@ -221,6 +222,7 @@ DRILL NAME: explaining what it corrects and how to perform it.
         }
 
     except Exception as e:
+        monitoring.capture(e)
         return _error_state(f"Gemini API call failed: {str(e)}")
 
 

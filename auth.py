@@ -64,16 +64,30 @@ def get_auth_client():
     return _auth_client
 
 
-def sign_up(email: str, password: str) -> dict:
+def sign_up(email: str, password: str, consent_given: bool = False) -> dict:
     email = email.strip()
     if not email or "@" not in email:
         return {"status": "error", "message": "Enter a valid email address."}
     if not password or len(password) < 6:
         return {"status": "error", "message": "Password must be at least 6 characters."}
+    if not consent_given:
+        return {
+            "status": "error",
+            "message": "You must confirm the data-use notice before creating an account.",
+        }
 
     try:
         client = get_auth_client()
-        client.auth.sign_up({"email": email, "password": password})
+        # Recorded in Supabase Auth's own user_metadata (raw_user_meta_data) —
+        # no new table needed, and it ties the consent record directly to the
+        # account it was given for, with a timestamp, instead of just trusting
+        # that the checkbox was ticked.
+        from datetime import datetime, timezone
+        client.auth.sign_up({
+            "email": email,
+            "password": password,
+            "options": {"data": {"consent_given_at": datetime.now(timezone.utc).isoformat()}},
+        })
         return {
             "status": "success",
             "message": "Account created. Check your email to confirm your address before signing in.",

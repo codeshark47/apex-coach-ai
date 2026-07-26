@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import cv2
 
+import monitoring
 from main import extract_video_landmarks
 from kinematics import (
     calculate_knee_bracing,
@@ -582,6 +583,7 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
         return {"degrees": separation, "tier": tier, "status": "success"}
 
     except Exception as e:
+        monitoring.capture(e)
         return {
             "degrees": None,
             "tier": "Calculation error",
@@ -749,6 +751,7 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         return {"ratio": ratio, "classification": classification, "status": "success", "debug_raw": debug_raw}
 
     except Exception as e:
+        monitoring.capture(e)
         return {
             "ratio": None,
             "classification": "Calculation error",
@@ -882,6 +885,7 @@ def transcode_to_h264(input_path: str) -> str:
                 f"{result.stderr.decode(errors='ignore')[:300]}"
             )
     except Exception as e:
+        monitoring.capture(e)
         print(f"WARNING: ffmpeg transcode raised an exception: {e}")
 
     return input_path

@@ -27,6 +27,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+import monitoring
+
 
 def compute_phase_durations(events: dict, fps: float) -> dict:
     """
@@ -293,6 +295,7 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
             "used_raw_reextraction": used_raw,
         }
     except Exception as e:
+        monitoring.capture(e)
         return {"status": "error", "message": str(e)}
 
 
@@ -344,4 +347,5 @@ def compute_release_height_absolute(release_height_debug: Optional[dict], frame_
 
         return {"status": "success", "cm": round(vertical_cm, 1), "m": round(vertical_m, 3)}
     except Exception as e:
+        monitoring.capture(e)
         return {"status": "error", "message": str(e)}

@@ -12,6 +12,9 @@ import html
 
 import streamlit as st
 
+import monitoring
+monitoring.init_sentry()
+
 import profile_store as store
 
 st.set_page_config(page_title="Academy Profile - Apex Coach AI", page_icon="🏫", layout="wide")
@@ -85,6 +88,7 @@ with st.expander("➕ Create a new team / academy group", expanded=(len(teams) =
                     st.success(f"Team '{new_team_name.strip()}' created.")
                     st.rerun()
                 except Exception as e:
+                    monitoring.capture(e)
                     st.error(f"Could not create team: {e}")
             else:
                 st.error("Team name cannot be empty.")
@@ -105,12 +109,14 @@ selected_team_id = next(t["id"] for t in teams if t["name"] == selected_team_nam
 try:
     roster = store.list_athletes_by_team(selected_team_id, coach_user_id)
 except Exception as e:
+    monitoring.capture(e)
     st.error(f"Could not load roster: {e}")
     st.stop()
 
 try:
     unassigned = store.list_unassigned_athletes(coach_user_id)
 except Exception as e:
+    monitoring.capture(e)
     unassigned = []
     st.error(f"Could not load unassigned athletes: {e}")
 
@@ -138,6 +144,7 @@ with roster_col:
                         store.assign_athlete_to_team(athlete["id"], None, coach_user_id)
                         st.rerun()
                     except Exception as e:
+                        monitoring.capture(e)
                         st.error(f"Could not remove athlete: {e}")
 
 with add_col:
@@ -154,6 +161,7 @@ with add_col:
                 st.success(f"Added {pick_name} to {selected_team_name}.")
                 st.rerun()
             except Exception as e:
+                monitoring.capture(e)
                 st.error(f"Could not assign athlete: {e}")
 
 st.divider()

@@ -17,6 +17,9 @@ import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime
 
+import monitoring
+monitoring.init_sentry()
+
 import profile_store as store
 import metric_ranges as mr
 
@@ -81,6 +84,7 @@ st.divider()
 try:
     athletes = store.list_athletes(coach_user_id)
 except Exception as e:
+    monitoring.capture(e)
     st.error(f"Could not load athletes: {e}")
     st.stop()
 
@@ -95,6 +99,7 @@ selected_id = next(a["id"] for a in athletes if a["name"] == selected_name)
 try:
     athlete = store.get_athlete(selected_id, coach_user_id)
 except Exception as e:
+    monitoring.capture(e)
     st.error(f"Could not load athlete profile: {e}")
     st.stop()
 
@@ -161,6 +166,7 @@ with st.expander("✏️ Edit profile", expanded=False):
                 st.success("Profile updated.")
                 st.rerun()
             except Exception as e:
+                monitoring.capture(e)
                 st.error(f"Could not save changes: {e}")
 
 st.divider()
@@ -171,6 +177,7 @@ st.divider()
 try:
     history = store.get_athlete_history(selected_id, coach_user_id, limit=50)
 except Exception as e:
+    monitoring.capture(e)
     st.error(f"Could not load session history: {e}")
     st.stop()
 

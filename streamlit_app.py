@@ -3,6 +3,9 @@ import base64
 from dotenv import load_dotenv
 load_dotenv()
 
+import monitoring
+monitoring.init_sentry()
+
 import streamlit as st
 import pandas as pd
 
@@ -583,10 +586,30 @@ if st.session_state.auth_user is None:
         with st.form("signup_form"):
             signup_email = st.text_input("Email", key="signup_email")
             signup_password = st.text_input("Password (min 6 characters)", type="password", key="signup_password")
+            st.markdown(
+                "<div style='font-size:0.85rem;color:#94A3B8;line-height:1.5;margin-top:6px;'>"
+                "<b>Data use notice:</b> creating an account means you're a coach or academy "
+                "staff member submitting athlete performance data. We collect the bowling-action "
+                "video you upload, the biomechanical measurements and timing data extracted from "
+                "it, any corrections you make to that data, and the athlete profile details "
+                "(name, team, notes) you enter. This is used only to generate coaching reports "
+                "and track an athlete's progress in your account — it is never sold or shared "
+                "outside your account's coaching use. <b>If an athlete you submit data for is "
+                "under 18, creating an account confirms you have the consent of that athlete's "
+                "parent or guardian</b> to have this data collected and analyzed."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            signup_consent = st.checkbox(
+                "I have read the data use notice above and confirm I have the authority "
+                "and any required consent (including parent/guardian consent for athletes "
+                "under 18) to submit this data.",
+                key="signup_consent",
+            )
             signup_submitted = st.form_submit_button("Create Account", use_container_width=True)
         if signup_submitted:
             try:
-                result = auth_module.sign_up(signup_email, signup_password)
+                result = auth_module.sign_up(signup_email, signup_password, consent_given=signup_consent)
                 if result["status"] == "success":
                     st.success(result["message"])
                 else:
@@ -766,6 +789,7 @@ if history_enabled:
         try:
             athletes = store.list_athletes(st.session_state.auth_user["id"])
         except Exception as e:
+            monitoring.capture(e)
             athletes = []
             st.error(f"Could not load athletes: {e}")
 
@@ -776,6 +800,7 @@ if history_enabled:
             try:
                 history = store.get_athlete_history(selected_id, st.session_state.auth_user["id"])
             except Exception as e:
+                monitoring.capture(e)
                 history = []
                 st.error(f"Could not load history: {e}")
 
@@ -1822,6 +1847,7 @@ if st.session_state.get("pending_result_payload") is not None:
                         usage_limits.record_usage(st.session_state.auth_user["id"])
                         st.session_state.usage_recorded_for_run = True
                     except Exception as e:
+                        monitoring.capture(e)
                         st.warning(f"Could not update usage count: {e}")
 
             metrics = result_payload["biomechanical_metrics"]
@@ -2258,6 +2284,7 @@ if st.session_state.get("pending_result_payload") is not None:
                     st.session_state.history_saved_for_run = True
                     st.toast(f"Session saved to {player_name}'s history.")
                 except Exception as e:
+                    monitoring.capture(e)
                     st.warning(f"Could not save this session to history: {e}")
 
         else:
