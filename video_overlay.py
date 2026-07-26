@@ -59,16 +59,27 @@ def render_annotated_video(video_path: str, output_path: str,
     which is the correct way to get true slow motion without needing frame
     interpolation. Default 4.0 = 4x slower than real time.
 
-    camera_angle: 'side_on' | 'front_or_rear' | 'uncertain' — purely a
-    label for the on-video indicator badge right now. The skeleton/chart
-    drawing itself is intentionally identical across angles: every fixed
-    biomechanical calculation feeding this render (knee angle, release
-    height) already works from 2D landmarks regardless of which side the
-    camera is on, and no clear, evidence-backed case exists yet for
-    swapping which metric is charted per angle — see the module docstring
-    in metric_ranges.py for which metrics are already flagged as
-    angle-sensitive at the DATA level (that's the layer to adjust
-    reliability warnings in, not this renderer).
+    camera_angle: 'side_on' | 'front_or_rear' | 'uncertain' — now actually
+    changes which metric is the "hero" of this render, not just a label:
+
+      - side_on sees the true sagittal-plane bend without foreshortening,
+        so it charts LEAD KNEE ANGLE (+ colors the lead knee bones/joint
+        and the spine by TRUNK LEAN's classification).
+      - front_or_rear sees the full shoulder/hip width needed to measure
+        their rotational offset, so it charts HIP-SHOULDER SEPARATION
+        (+ colors the shoulder-line and hip-line bones instead).
+
+    This is deliberately only a 2-way split, not 3 (side-on / front-on /
+    rear-on): camera_angle_detection.py's own docstring documents that
+    front-on and rear-on produce geometrically IDENTICAL 2D joint data —
+    there's no landmark signal for which way the face points — so there's
+    no evidence-backed basis for treating them differently here. Every
+    color/highlight below reuses metric_ranges.classify against a metric
+    this app already computes and validates elsewhere (dashboard, PDF);
+    nothing here is a newly invented metric or judgment.
+
+    'uncertain' (or any other value) falls back to the side_on treatment,
+    matching this overlay's original behavior before camera_angle existed.
     """
     from orchestrator import (
         calculate_release_height_ratio_safe,
@@ -251,20 +262,22 @@ def render_annotated_video(video_path: str, output_path: str,
     _chart_lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
     _lead_hip_knee = (f"{_chart_lead_side}_HIP", f"{_chart_lead_side}_KNEE")
     _lead_knee_ankle = (f"{_chart_lead_side}_KNEE", f"{_chart_lead_side}_ANKLE")
+    _shoulder_line = ("LEFT_SHOULDER", "RIGHT_SHOULDER")
+    _hip_line = ("LEFT_HIP", "RIGHT_HIP")
 
-    # COLOR/THICKNESS BY ANGLE: the lead knee is the one joint this overlay
-    # already tracks a live per-frame value for (knee_arr below), so it's
-    # the one place a real, non-fabricated severity color can be drawn —
-    # reusing metric_ranges.classify, the exact same green/amber/red the
-    # dashboard and PDF report already use for this metric, not a new
-    # judgment invented for the video. Everything else on the skeleton
-    # (shoulders, hips, spine, wrists) has no live-tracked classification
-    # to color by, so it stays the neutral broadcast palette rather than
-    # inventing one.
-    def _knee_tier_and_color(angle):
-        if angle is None or (isinstance(angle, float) and np.isnan(angle)):
+    # A problem angle (amber/red) gets a visibly bolder bone/joint, not
+    # just a different color — "thickness according to the angle": draws
+    # the eye to whichever joint actually needs coaching attention instead
+    # of every joint looking equally important.
+    _TIER_EXTRA_PX = {"green": 0, "amber": 2, "red": 4, "unknown": 0}
+
+    # COLOR/THICKNESS BY ANGLE: reuses metric_ranges.classify — the exact
+    # same green/amber/red the dashboard and PDF report already use for
+    # each of these metrics, not a new judgment invented for the video.
+    def _tier_and_color(metric_key, value):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
             return "unknown", TIER_COLORS_BGR["unknown"]
-        tier = mr.classify("front_knee_bracing", float(angle))
+        tier = mr.classify(metric_key, float(value))
         return tier, TIER_COLORS_BGR[tier]
 
     def _row_knee_angle(r):
@@ -281,10 +294,64 @@ def render_annotated_video(video_path: str, output_path: str,
         except Exception:
             return np.nan
 
-    knee_by_frame = {int(r["frame"]): _row_knee_angle(r) for _, r in df.iterrows()}
-    knee_series = pd.Series([knee_by_frame.get(i, np.nan) for i in range(total_frames)])
-    knee_series = knee_series.interpolate(limit_direction="both")
-    knee_arr = knee_series.to_numpy()
+    # Mirrors kinematics.calculate_trunk_lean's math exactly, row-based —
+    # same reasoning as _row_knee_angle above (this chart/overlay needs a
+    # per-frame value, the report function works off a single confirmed
+    # frame), so the color drawn here can never disagree with the report.
+    def _row_trunk_lean(r):
+        try:
+            mid_hip_x = (float(r["LEFT_HIP_x"]) + float(r["RIGHT_HIP_x"])) / 2
+            mid_hip_y = (float(r["LEFT_HIP_y"]) + float(r["RIGHT_HIP_y"])) / 2
+            mid_sh_x = (float(r["LEFT_SHOULDER_x"]) + float(r["RIGHT_SHOULDER_x"])) / 2
+            mid_sh_y = (float(r["LEFT_SHOULDER_y"]) + float(r["RIGHT_SHOULDER_y"])) / 2
+            dx = mid_sh_x - mid_hip_x
+            dy = mid_hip_y - mid_sh_y
+            return float(np.degrees(np.arctan2(np.abs(dx), dy)))
+        except Exception:
+            return np.nan
+
+    # Mirrors orchestrator.calculate_hip_shoulder_separation's math exactly
+    # (arctan2 + wraparound-safe fold into [0, 90]) for the same reason.
+    def _row_hip_shoulder_separation(r):
+        try:
+            shoulder_angle = np.degrees(np.arctan2(
+                float(r["LEFT_SHOULDER_y"]) - float(r["RIGHT_SHOULDER_y"]),
+                float(r["LEFT_SHOULDER_x"]) - float(r["RIGHT_SHOULDER_x"])
+            ))
+            hip_angle = np.degrees(np.arctan2(
+                float(r["LEFT_HIP_y"]) - float(r["RIGHT_HIP_y"]),
+                float(r["LEFT_HIP_x"]) - float(r["RIGHT_HIP_x"])
+            ))
+            if np.isnan(shoulder_angle) or np.isnan(hip_angle):
+                return np.nan
+            wrapped = (shoulder_angle - hip_angle + 180) % 360 - 180
+            separation = abs(wrapped)
+            if separation > 90:
+                separation = 180 - separation
+            return float(separation)
+        except Exception:
+            return np.nan
+
+    def _interpolated_array(row_fn):
+        by_frame = {int(r["frame"]): row_fn(r) for _, r in df.iterrows()}
+        series = pd.Series([by_frame.get(i, np.nan) for i in range(total_frames)])
+        return series.interpolate(limit_direction="both").to_numpy()
+
+    knee_arr = _interpolated_array(_row_knee_angle)
+    hip_shoulder_arr = _interpolated_array(_row_hip_shoulder_separation)
+
+    # CAMERA-ANGLE MODULE: which metric is the hero (live chart + badge +
+    # bone highlight) — see the docstring above for why this is a 2-way
+    # split, and why each side gets the metric it can actually measure.
+    if camera_angle == "front_or_rear":
+        hero_key, hero_arr, hero_label, hero_badge_label = (
+            "hip_shoulder_separation", hip_shoulder_arr,
+            "HIP-SHOULDER SEPARATION", "HIP-SHOULDER",
+        )
+    else:
+        hero_key, hero_arr, hero_label, hero_badge_label = (
+            "front_knee_bracing", knee_arr, "LEAD KNEE ANGLE", "KNEE",
+        )
 
     # --- RELEASE HEIGHT % at BR ---
     # Reuses calculate_release_height_ratio_safe (same function that feeds the
@@ -340,8 +407,21 @@ def render_annotated_video(video_path: str, output_path: str,
                         "ground_y": dbg["y_ankle"],
                     }
 
-    ANGLE_MIN, ANGLE_MAX = 0.0, 180.0
-    ELITE_MIN = 165.0
+    # CHART BOUNDS: driven by whichever metric is the hero (see above),
+    # not hardcoded to knee angle anymore. front_knee_bracing is
+    # "higher_better" (0-180, green band open-ended at the top);
+    # hip_shoulder_separation is "band" (0-90, since the separation
+    # calculation folds into that range, green band in the middle) — both
+    # read straight from metric_ranges.RANGES, the same single source of
+    # truth the dashboard and PDF already use, so this can't silently
+    # drift out of sync with what "green" actually means for either metric.
+    if hero_key == "hip_shoulder_separation":
+        CHART_MIN, CHART_MAX = 0.0, 90.0
+        CHART_GRIDLINES = (0, 45, 90)
+    else:
+        CHART_MIN, CHART_MAX = 0.0, 180.0
+        CHART_GRIDLINES = (0, 90, 180)
+    _hero_green_lo, _hero_green_hi = mr.RANGES[hero_key].green
     # SHRUNK from 38% of frame height to a slim ~16% strip — the old chart
     # dominated a third of the video, which read as a dashboard bolted onto
     # footage rather than a broadcast graphic. The data itself (live knee
@@ -367,27 +447,35 @@ def render_annotated_video(video_path: str, output_path: str,
         return MARGIN_L + int((fidx / span) * (width - MARGIN_L - MARGIN_R))
 
     def y_to_px(angle):
-        clipped = max(ANGLE_MIN, min(ANGLE_MAX, angle))
-        frac = (clipped - ANGLE_MIN) / (ANGLE_MAX - ANGLE_MIN)
+        clipped = max(CHART_MIN, min(CHART_MAX, angle))
+        frac = (clipped - CHART_MIN) / (CHART_MAX - CHART_MIN)
         usable = PANEL_H - MARGIN_T - MARGIN_B
         return MARGIN_T + int((1 - frac) * usable)
 
     chart_base = np.full((PANEL_H, width, 3), (16, 16, 18), dtype=np.uint8)
-    elite_y = y_to_px(ELITE_MIN)
-    cv2.rectangle(chart_base, (MARGIN_L, MARGIN_T), (width - MARGIN_R, elite_y),
+    # Green band rect: for a "higher_better" metric green_hi == CHART_MAX,
+    # so this naturally reproduces the old "elite zone from the top down"
+    # look; for a "band" metric (green in the middle) it's a thinner
+    # strip — either way it's the metric's REAL green band, not a
+    # separately-hardcoded threshold that could drift from it.
+    green_top_y = y_to_px(_hero_green_hi)
+    green_bot_y = y_to_px(_hero_green_lo)
+    cv2.rectangle(chart_base, (MARGIN_L, green_top_y), (width - MARGIN_R, green_bot_y),
                   (28, 55, 28), -1)
-    cv2.putText(chart_base, f"ELITE {ELITE_MIN:.0f}+", (MARGIN_L + 8, MARGIN_T + 14),
+    band_label = (f"OPTIMAL {_hero_green_lo:.0f}-{_hero_green_hi:.0f}"
+                  if hero_key == "hip_shoulder_separation" else f"ELITE {_hero_green_lo:.0f}+")
+    cv2.putText(chart_base, band_label, (MARGIN_L + 8, green_top_y + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 205, 130), 1, cv2.LINE_AA)
     # Fewer gridlines (was every 45deg incl. labels at each) — a compact
     # panel doesn't have room for a dense axis without feeling cramped.
-    for g in (0, 90, 180):
+    for g in CHART_GRIDLINES:
         gy = y_to_px(g)
         cv2.line(chart_base, (MARGIN_L, gy), (width - MARGIN_R, gy), (48, 48, 50), 1, cv2.LINE_AA)
         cv2.putText(chart_base, f"{g}", (6, gy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                     (150, 150, 150), 1, cv2.LINE_AA)
     prev_pt = None
     for fidx in range(total_frames):
-        val = knee_arr[fidx] if fidx < len(knee_arr) else np.nan
+        val = hero_arr[fidx] if fidx < len(hero_arr) else np.nan
         if np.isnan(val):
             prev_pt = None
             continue
@@ -395,7 +483,7 @@ def render_annotated_video(video_path: str, output_path: str,
         if prev_pt is not None:
             cv2.line(chart_base, prev_pt, pt, JOINT_CORE, 2, cv2.LINE_AA)
         prev_pt = pt
-    cv2.putText(chart_base, "LEAD KNEE ANGLE", (MARGIN_L, 16),
+    cv2.putText(chart_base, hero_label, (MARGIN_L, 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, (235, 235, 235), 1, cv2.LINE_AA)
 
     PHASE_BADGE_WINDOW = max(3, int(round(source_fps * 0.5)))
@@ -458,14 +546,10 @@ def render_annotated_video(video_path: str, output_path: str,
                 render_scale = max(MIN_RENDER_SCALE,
                                     min(MAX_RENDER_SCALE, _frame_body_height_px / REFERENCE_BODY_HEIGHT_PX))
 
-            _cur_knee_val = knee_arr[f_idx] if f_idx < len(knee_arr) else np.nan
-            _knee_tier, _knee_color = _knee_tier_and_color(_cur_knee_val)
-            # A problem angle (amber/red) gets a visibly bolder lead-leg
-            # bone, not just a different color — "thickness according to
-            # the angle" per the same reasoning as the color: draws the
-            # eye to the joint that actually needs coaching attention
-            # instead of every joint looking equally important.
-            _knee_bone_extra_px = {"green": 0, "amber": 2, "red": 4, "unknown": 0}[_knee_tier]
+            _hero_val = hero_arr[f_idx] if f_idx < len(hero_arr) else np.nan
+            _hero_tier, _hero_color = _tier_and_color(hero_key, _hero_val)
+            _hero_extra_px = _TIER_EXTRA_PX[_hero_tier]
+            _is_side_on_module = hero_key == "front_knee_bracing"
 
             torso_x_cols = ["NOSE_x", "LEFT_HIP_x", "RIGHT_HIP_x"]
             torso_x_vals = [float(row[c]) for c in torso_x_cols if not pd.isna(row[c])]
@@ -479,9 +563,12 @@ def render_annotated_video(video_path: str, output_path: str,
                     yA = int(float(row[f"{partA}_y"]) * height)
                     xB = int(float(row[f"{partB}_x"]) * width)
                     yB = int(float(row[f"{partB}_y"]) * height)
-                    is_lead_knee_bone = (partA, partB) in (_lead_hip_knee, _lead_knee_ankle)
-                    bone_color = _knee_color if is_lead_knee_bone else BONE_CORE
-                    bone_extra = _knee_bone_extra_px if is_lead_knee_bone else 0
+                    is_hero_bone = (
+                        (partA, partB) in (_lead_hip_knee, _lead_knee_ankle) if _is_side_on_module
+                        else (partA, partB) in (_shoulder_line, _hip_line)
+                    )
+                    bone_color = _hero_color if is_hero_bone else BONE_CORE
+                    bone_extra = _hero_extra_px if is_hero_bone else 0
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
                         cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6) + bone_extra, cv2.LINE_AA)
@@ -495,6 +582,13 @@ def render_annotated_video(video_path: str, output_path: str,
             # line + two side lines + hip line) with nothing down the
             # middle, which is what made the skeleton look unrigged/amateur
             # rather than like a proper body frame.
+            #
+            # SIDE-ON MODULE ONLY: colored by trunk_lean's own
+            # classification — the secondary highlight alongside the lead
+            # knee for this module (both are sagittal-plane bends best
+            # measured side-on). Front-or-rear leaves it the neutral
+            # palette, same reasoning as the knee bones above: trunk lean
+            # isn't this module's hero metric.
             try:
                 spine_cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
                               "LEFT_HIP_x", "LEFT_HIP_y", "RIGHT_HIP_x", "RIGHT_HIP_y"]
@@ -505,9 +599,13 @@ def render_annotated_video(video_path: str, output_path: str,
                     midhip_y = (float(row["LEFT_HIP_y"]) + float(row["RIGHT_HIP_y"])) / 2
                     sx1, sy1 = int(neck_x * width), int(neck_y * height)
                     sx2, sy2 = int(midhip_x * width), int(midhip_y * height)
+                    if _is_side_on_module:
+                        _, spine_color = _tier_and_color("trunk_lean", _row_trunk_lean(row))
+                    else:
+                        spine_color = BONE_CORE
                     if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
-                        cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_CORE, 3, cv2.LINE_AA)
+                        cv2.line(frame, (sx1, sy1), (sx2, sy2), spine_color, 3, cv2.LINE_AA)
                         cv2.circle(frame, (sx1, sy1), _rs_joint(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
                         cv2.circle(frame, (sx1, sy1), _rs_joint(6), JOINT_CORE, -1, cv2.LINE_AA)
             except Exception:
@@ -559,15 +657,19 @@ def render_annotated_video(video_path: str, output_path: str,
                 except Exception:
                     continue
 
-            _lead_knee_node = f"{_chart_lead_side}_KNEE"
+            _hero_joint_nodes = (
+                {f"{_chart_lead_side}_KNEE"} if _is_side_on_module
+                else {"LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"}
+            )
             for node in joint_nodes:
                 try:
                     if pd.isna(row[f"{node}_x"]):
                         continue
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
-                    node_color = _knee_color if node == _lead_knee_node else JOINT_CORE
-                    node_extra = _knee_bone_extra_px if node == _lead_knee_node else 0
+                    is_hero_node = node in _hero_joint_nodes
+                    node_color = _hero_color if is_hero_node else JOINT_CORE
+                    node_extra = _hero_extra_px if is_hero_node else 0
                     if 0 < nx < width and 0 < ny < height:
                         cv2.circle(frame, (nx, ny), _rs_joint(9) + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
                         cv2.circle(frame, (nx, ny), _rs_joint(6) + node_extra, node_color, -1, cv2.LINE_AA)
@@ -596,9 +698,9 @@ def render_annotated_video(video_path: str, output_path: str,
         blended = cv2.addWeighted(panel_region, 0.35, chart_base, 0.65, 0)
         frame[PANEL_TOP:PANEL_TOP + PANEL_H, 0:width] = blended
 
-        cur_val = knee_arr[f_idx] if f_idx < len(knee_arr) else np.nan
+        cur_val = hero_arr[f_idx] if f_idx < len(hero_arr) else np.nan
         if not np.isnan(cur_val):
-            _, cur_val_color = _knee_tier_and_color(cur_val)
+            _, cur_val_color = _tier_and_color(hero_key, cur_val)
             px, py_rel = x_to_px(f_idx), y_to_px(cur_val)
             py = PANEL_TOP + py_rel
             cv2.line(frame, (px, PANEL_TOP + MARGIN_T), (px, PANEL_TOP + PANEL_H - MARGIN_B),
@@ -728,12 +830,19 @@ def render_annotated_video(video_path: str, output_path: str,
 
         if active_badge is not None:
             label, color, ev_frame = active_badge
-            badge_val = knee_arr[ev_frame] if ev_frame < len(knee_arr) else np.nan
+            badge_val = hero_arr[ev_frame] if ev_frame < len(hero_arr) else np.nan
             is_release = (label == "RELEASE")
+            # Metric-label width varies ("KNEE" vs "HIP-SHOULDER") — measure
+            # it rather than assuming a fixed offset, so the degree value
+            # next to it never overlaps regardless of which module is active.
+            (metric_label_w, _), _ = cv2.getTextSize(
+                hero_badge_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            value_x_offset = 14 + metric_label_w + 14
             # SHRUNK from 340x150/130 — smaller, less boxy footprint, more
             # in line with the reference sample's restraint, while keeping
-            # every number the old, larger version showed.
-            box_w = 290
+            # every number the old, larger version showed. Widened to fit
+            # the longer "HIP-SHOULDER" label when that module is active.
+            box_w = max(290, value_x_offset + 110)
             box_h = 128 if is_release else 108
             # Default to the left (matches the old fixed behavior) unless
             # the bowler is known to be on the left half of frame, in
@@ -747,16 +856,16 @@ def render_annotated_video(video_path: str, output_path: str,
             _draw_panel(frame, (box_x, box_y), (box_x + box_w, box_y + box_h))
             cv2.putText(frame, label, (box_x + 14, box_y + 34),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
-            cv2.putText(frame, "KNEE", (box_x + 14, box_y + 64),
+            cv2.putText(frame, hero_badge_label, (box_x + 14, box_y + 64),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
             if not np.isnan(badge_val):
                 # Colored by the SAME classification as the skeleton/chart
                 # (green/amber/red), not the badge's own event-type color —
                 # this number's color means "how good is this angle", the
                 # badge label's color just means "which event is this".
-                _, badge_knee_color = _knee_tier_and_color(badge_val)
-                cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + 85, box_y + 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.05, badge_knee_color, 2, cv2.LINE_AA)
+                _, badge_hero_color = _tier_and_color(hero_key, badge_val)
+                cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + value_x_offset, box_y + 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05, badge_hero_color, 2, cv2.LINE_AA)
             if is_release:
                 cv2.putText(frame, "RELEASE HEIGHT", (box_x + 14, box_y + 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
