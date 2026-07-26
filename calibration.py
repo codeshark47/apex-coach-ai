@@ -21,10 +21,11 @@ delivery.
 """
 
 import math
+import os
 from dataclasses import dataclass
-from typing import Optional
 
 import cv2
+import streamlit as st
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,40 @@ class Calibration:
         )
 
 
+def _file_signature(video_path: str) -> float:
+    """
+    Modification time of the file, used only to key the caches below —
+    NOT for any real logic. Several upload flows in this app reuse a
+    fixed or filename-derived path across genuinely different uploads
+    (calibration's temp file is always "calibration_ref.mp4" regardless
+    of what was uploaded; seed reference paths are built from just the
+    original filename, which two different recordings can share). A
+    cache keyed on path alone would silently serve a stale frame from
+    the PREVIOUS file at that same path. Including mtime means a
+    freshly-written file (even at an identical path) gets a fresh cache
+    entry, while re-requesting the same untouched file still hits cache.
+    """
+    try:
+        return os.path.getmtime(video_path)
+    except OSError:
+        return 0.0
+
+
 def get_frame_count(video_path: str) -> int:
+    return _get_frame_count_cached(video_path, _file_signature(video_path))
+
+
+@st.cache_data(show_spinner=False)
+def _get_frame_count_cached(video_path: str, file_mtime: float) -> int:
+    # BUG FIX: this parameter must NOT start with an underscore — Streamlit
+    # treats a leading underscore on a cached function's parameter as "do
+    # not hash this, it's unhashable" and silently EXCLUDES it from the
+    # cache key entirely. It was named _file_mtime originally (to signal
+    # "not real logic, just a cache key"), which meant the whole point of
+    # this parameter — busting the cache when a reused path's file changes
+    # — was being silently ignored. Verified directly: two genuinely
+    # different videos written to the same path still returned the exact
+    # same cached frame, byte-for-byte, until this rename.
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return 0
@@ -68,7 +102,28 @@ def extract_reference_frame(video_path: str, frame_index: int = 0):
     """
     Pulls a single frame from the video for the coach to click on.
     Returns an RGB numpy array, or None if the frame can't be read.
+
+    CACHED (see _extract_reference_frame_cached) — BUG FIX found from
+    real coach feedback ("the confirmation expanders keep reloading,
+    it's annoying"): every widget interaction ANYWHERE on a Streamlit
+    page reruns the entire script top to bottom, and with up to 4-5
+    separate reference-frame expanders open at once in Dual Camera mode,
+    EVERY one of them was re-decoding its frame from the source video on
+    EVERY rerun — including reruns triggered by a totally unrelated
+    widget (moving a zoom slider in a different expander, typing in a
+    different frame-number box). Seeking to an arbitrary frame in a real
+    video (especially anything past the first keyframe) is genuinely
+    slow — that repeated, unnecessary decoding on every single click is
+    what read as the whole page "reloading." Caching means only a frame
+    that's actually new gets decoded; everything else returns instantly.
     """
+    return _extract_reference_frame_cached(video_path, frame_index, _file_signature(video_path))
+
+
+@st.cache_data(show_spinner=False)
+def _extract_reference_frame_cached(video_path: str, frame_index: int, file_mtime: float):
+    # file_mtime must NOT start with an underscore — see the identical note
+    # in _get_frame_count_cached above for why.
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None

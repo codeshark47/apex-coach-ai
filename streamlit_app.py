@@ -28,32 +28,29 @@ import run_up_analysis as rua
 import camera_angle_detection as cad
 
 
-def _render_frame_nudge_buttons(slider_key: str, min_value: int, max_value: int):
+def _render_frame_jump_box(slider_key: str, min_value: int, max_value: int):
     """
-    Small ◀ / ▶ buttons plus a direct "type the frame number" box, all
-    targeting one frame-scrubbing slider. Dragging a slider to the EXACT
-    right frame is fiddly on a real video, and clicking ◀/▶ one frame at
-    a time from frame 0 to frame 147 is slow — a coach who already knows
-    roughly which frame they want (e.g. from scrubbing the source video
-    in another player) should be able to just type it. Both controls
-    mutate the slider's own session_state key via a callback (the
-    supported way to adjust a keyed widget from outside itself) — call
-    this immediately before the st.slider(key=slider_key) call it
-    targets, no other wiring needed, the slider just picks up the new
-    value on rerun.
+    A direct "type the frame number" box targeting one frame-scrubbing
+    slider. Dragging a slider to the EXACT right frame is fiddly on a
+    real video — a coach who already knows roughly which frame they want
+    (e.g. from scrubbing the source video in another player) should be
+    able to just type it. The box's own up/down stepper arrows already
+    cover the "nudge by one frame" case (an earlier version of this had
+    separate ◀/▶ buttons for that — removed as redundant, per direct
+    coach feedback, once this box existed). Mutates the slider's own
+    session_state key via a callback (the supported way to adjust a
+    keyed widget from outside itself) — call this immediately before the
+    st.slider(key=slider_key) call it targets, no other wiring needed,
+    the slider just picks up the new value on rerun.
 
     The number box's own widget key is derived from the CURRENT slider
     value (not a fixed string) — this is deliberate: Streamlit only reads
     a keyed widget's value= argument on first creation, so a fixed key
-    would go stale and show the wrong number after a ◀/▶ click or a
-    slider drag. Deriving the key from the current value forces a fresh
-    widget each time something else changes it, so the displayed number
-    is always correct regardless of which control last touched it.
+    would go stale and show the wrong number after the slider itself is
+    dragged directly. Deriving the key from the current value forces a
+    fresh widget each time something else changes it, so the displayed
+    number is always correct regardless of which control last touched it.
     """
-    def _step(delta):
-        current = st.session_state.get(slider_key, min_value)
-        st.session_state[slider_key] = max(min_value, min(max_value, current + delta))
-
     current_value = st.session_state.get(slider_key, min_value)
     jump_key = f"{slider_key}_jump_input_{current_value}"
 
@@ -62,19 +59,11 @@ def _render_frame_nudge_buttons(slider_key: str, min_value: int, max_value: int)
         if typed is not None:
             st.session_state[slider_key] = max(min_value, min(max_value, int(typed)))
 
-    nudge_cols = st.columns([1, 1, 2, 6])
-    with nudge_cols[0]:
-        st.button("◀", key=f"{slider_key}_step_back", on_click=_step, args=(-1,),
-                  help="Back 1 frame", use_container_width=True)
-    with nudge_cols[1]:
-        st.button("▶", key=f"{slider_key}_step_fwd", on_click=_step, args=(1,),
-                  help="Forward 1 frame", use_container_width=True)
-    with nudge_cols[2]:
-        st.number_input(
-            "Jump to frame", min_value=min_value, max_value=max_value,
-            value=current_value, key=jump_key, on_change=_jump_to_typed,
-            help="Type an exact frame number and press Enter", label_visibility="collapsed",
-        )
+    st.number_input(
+        "Jump to an exact frame number", min_value=min_value, max_value=max_value,
+        value=current_value, key=jump_key, on_change=_jump_to_typed,
+        help="Type an exact frame number (or use the arrows) and press Enter",
+    )
 
 
 def _framed_image_container():
@@ -93,21 +82,28 @@ def _framed_image_container():
 
 
 def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, marker_color: str = "lime",
-                                 extra_markers: list = None):
+                                 extra_markers: list = None, enable_zoom: bool = False):
     """
-    Displays a reference-frame image with an optional digital zoom, and
+    Displays a reference-frame image, with an optional digital zoom, and
     returns a click position in ORIGINAL image pixel coordinates (or None
     if nothing was clicked this run).
 
-    WHY A CROP-BASED "DIGITAL" ZOOM, NOT CSS/BROWSER PINCH-ZOOM: real
-    coach feedback — on a phone screen the reference frame is small
-    enough that clicking the exact right pixel (a wrist, a stump edge)
-    is genuinely hard. The click-to-original-pixel math already depends
-    on knowing exactly what region of the source image is on screen and
-    at what scale (see the scale_x/scale_y pattern used everywhere in
-    this file) — a server-side crop keeps that fully under this app's
-    control, where an uncontrolled browser pinch-zoom gesture would risk
-    desyncing reported click coordinates from what's actually visible.
+    enable_zoom: OFF by default — direct coach feedback was that zoom
+    should be reserved for the one click that genuinely needs
+    pixel-level precision (the release-point/wrist correction), not
+    every clickable image. Seed-point (roughly which person is the
+    bowler) and calibration (usually a stump, a large target) don't need
+    it and it was just adding a control to skip past.
+
+    WHY A CROP-BASED "DIGITAL" ZOOM, NOT CSS/BROWSER PINCH-ZOOM: on a
+    phone screen the reference frame is small enough that clicking the
+    exact right pixel (a wrist, a stump edge) is genuinely hard. The
+    click-to-original-pixel math already depends on knowing exactly what
+    region of the source image is on screen and at what scale (see the
+    scale_x/scale_y pattern used everywhere in this file) — a
+    server-side crop keeps that fully under this app's control, where an
+    uncontrolled browser pinch-zoom gesture would risk desyncing
+    reported click coordinates from what's actually visible.
 
     marker_point: (x, y) in ORIGINAL image coordinates, if a PRIMARY
     marker should be drawn — also used to CENTER the zoom, since a coach
@@ -131,13 +127,15 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     orig_w, orig_h = pil_img.size
     extra_markers = extra_markers or []
 
-    zoom_options = {"1x (no zoom)": 1.0, "2x": 2.0, "3x": 3.0, "4x": 4.0}
-    zoom_label = st.select_slider(
-        "Zoom", options=list(zoom_options.keys()), value="1x (no zoom)",
-        key=f"{key_prefix}_zoom_level",
-        help="Zoom in for more precise clicking — especially useful on a phone screen.",
-    )
-    zoom = zoom_options[zoom_label]
+    zoom = 1.0
+    if enable_zoom:
+        zoom_options = {"1x (no zoom)": 1.0, "2x": 2.0, "3x": 3.0, "4x": 4.0}
+        zoom_label = st.select_slider(
+            "Zoom", options=list(zoom_options.keys()), value="1x (no zoom)",
+            key=f"{key_prefix}_zoom_level",
+            help="Zoom in for more precise clicking — especially useful on a phone screen.",
+        )
+        zoom = zoom_options[zoom_label]
 
     crop_w = max(1, int(orig_w / zoom))
     crop_h = max(1, int(orig_h / zoom))
@@ -189,17 +187,16 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
 
 
 def render_stream_event_confirmation(stage12_result, ref_path: str, file_identity: str,
-                                      key_prefix: str, bowling_arm: str, stream_label: str,
-                                      include_wrist_correction: bool = False):
+                                      key_prefix: str, bowling_arm: str, stream_label: str):
     """
-    Mandatory BFC/FFC/BR confirmation (+ optional wrist correction) for ONE
-    video stream — built so Dual Camera mode gets the exact same reliability
-    safeguards Single Camera already has, instead of trusting raw
-    auto-detection with no human review at all. Every one of these steps
-    exists because a real, confirmed failure mode was found on actual
-    footage where auto-detection looked confident and was still wrong
-    (see the comments in Single Camera's own confirmation flow, further
-    down this file, for the specific clips that proved each one out).
+    Mandatory BFC/FFC/BR + release-point confirmation for ONE video stream
+    — built so Dual Camera mode gets the exact same reliability safeguards
+    Single Camera already has, instead of trusting raw auto-detection with
+    no human review at all. Every one of these steps exists because a
+    real, confirmed failure mode was found on actual footage where
+    auto-detection looked confident and was still wrong (see the comments
+    in Single Camera's own confirmation flow, further down this file, for
+    the specific clips that proved each one out).
 
     Deliberately a NEW, separate function rather than a refactor of Single
     Camera's existing (already working, already verified) inline flow —
@@ -207,12 +204,15 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
     key_prefix, e.g. "side"/"rear"), so it carries zero risk of changing
     Single Camera's behavior.
 
-    include_wrist_correction: only meaningful for whichever stream actually
-    feeds Release Height (the side-on stream in dual mode) — the rear
-    stream's release-point tracking isn't used for any metric, so showing
-    a correction panel for it would be a pointless, confusing extra step.
+    The release-point step runs for BOTH streams, not just whichever one
+    was originally expected to feed Release Height — BUG FIX from real
+    footage: Release Height used to be computed only from the side
+    stream with no way to correct a failed reading, and when it failed,
+    there was no fallback. dual_camera_orchestrator.py now falls back to
+    the rear stream's own corrected release point when the side stream's
+    is unavailable, so both need the same correction opportunity.
 
-    Returns None if BFC/FFC/BR aren't all confirmed yet. Once confirmed,
+    Returns None if BFC/FFC/BR/release-point aren't all confirmed yet. Once confirmed,
     returns {"BFC": int, "FFC": int, "BR": int, "BFC_auto_detected": ...,
     "FFC_auto_detected": ..., "BR_auto_detected": ..., "BR_auto_confidence": ...,
     "wrist_override_x": float|None, "wrist_override_y": float|None}.
@@ -251,7 +251,7 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
                 f"be wrong even when it reports high confidence, so this step always runs."
             )
             slider_key = f"{key_prefix}_br_confirm_slider"
-            _render_frame_nudge_buttons(slider_key, 0, max(total_frames - 1, 0))
+            _render_frame_jump_box(slider_key, 0, max(total_frames - 1, 0))
             br_slider_val = st.slider(
                 "Scrub to the true ball-release frame",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -271,31 +271,33 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
 
     confirmed_br_frame = st.session_state.get(br_key)
     wrist_override_x, wrist_override_y = None, None
-    if include_wrist_correction and confirmed_br_frame is not None:
+    wrist_confirmed_key = f"_{key_prefix}_wrist_step_confirmed"
+    if confirmed_br_frame is not None:
         wrist_point_key = f"_{key_prefix}_wrist_confirmed_point"
         wrist_id_key = f"_{key_prefix}_wrist_identity"
         wrist_identity = f"{file_identity}_{confirmed_br_frame}"
         if st.session_state.get(wrist_id_key) != wrist_identity:
             st.session_state[wrist_point_key] = None
             st.session_state[wrist_id_key] = wrist_identity
+            st.session_state[wrist_confirmed_key] = False
 
-        wrist_panel_label = f"🖐️ Correct Release Point — {stream_label} (optional)"
-        force_open = br_confidence == "low"
-        if force_open:
-            wrist_panel_label = f"🖐️ Correct Release Point — {stream_label} — ⚠️ recommended, auto-detection had low confidence here"
-
-        with st.expander(wrist_panel_label, expanded=force_open):
-            if force_open:
+        # MANDATORY, not optional (BUG FIX from direct coach feedback: this
+        # used to be a skippable "(optional)" panel, but release_height is
+        # exactly as prone to silent wrist mistracking as any other event —
+        # same reasoning as why BFC/FFC/BR are never skippable either).
+        with st.expander(f"🖐️ Confirm Release Point — {stream_label}",
+                          expanded=not st.session_state.get(wrist_confirmed_key, False)):
+            if br_confidence == "low":
                 st.warning(
                     "Auto-detection reported **low confidence** on this release frame. This specific "
                     "signal correlates with the wrist/hand tracking silently undershooting the real "
                     "arm extension — the drawn Release Height line can look plausible while still "
-                    "being wrong. Please check the marker below before trusting Release Height."
+                    "being wrong. Please check the marker below carefully before confirming."
                 )
             st.caption(
                 "The yellow marker is the auto-tracked ball/hand position at your confirmed "
                 "release frame. If it doesn't sit on the real ball/hand, click the real position "
-                "to correct it. This feeds Release Height directly."
+                "to correct it, then confirm. This feeds Release Height directly."
             )
             wrist_frame_img = cal.extract_reference_frame(ref_path, frame_index=confirmed_br_frame)
             if wrist_frame_img is not None:
@@ -326,6 +328,7 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
                 new_point = render_zoomable_click_image(
                     pil_img, key_prefix=f"{key_prefix}_wrist", marker_point=display_point,
                     marker_color=("lime" if corrected_point is not None else "yellow"),
+                    enable_zoom=True,
                 )
                 if new_point is not None and st.session_state.get(wrist_point_key) != new_point:
                     st.session_state[wrist_point_key] = new_point
@@ -334,6 +337,12 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
                 if corrected_point is not None and st.button("↺ Reset to auto-tracked position", key=f"{key_prefix}_reset_wrist_point"):
                     st.session_state[wrist_point_key] = None
                     st.rerun()
+
+            if st.button("✅ Confirm this release point", key=f"{key_prefix}_confirm_wrist_button"):
+                st.session_state[wrist_confirmed_key] = True
+                st.rerun()
+            if st.session_state.get(wrist_confirmed_key):
+                st.success("Release point confirmed.")
 
         confirmed_point = st.session_state.get(wrist_point_key)
         if confirmed_point is not None:
@@ -353,7 +362,7 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
                 f"the front (lead) foot first plants on the ground and confirm."
             )
             slider_key = f"{key_prefix}_ffc_confirm_slider"
-            _render_frame_nudge_buttons(slider_key, 0, max(total_frames - 1, 0))
+            _render_frame_jump_box(slider_key, 0, max(total_frames - 1, 0))
             ffc_slider_val = st.slider(
                 "Scrub to the true front-foot-contact frame",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -381,7 +390,7 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
                 f"(rear) foot plants just before the final delivery stride and confirm."
             )
             slider_key = f"{key_prefix}_bfc_confirm_slider"
-            _render_frame_nudge_buttons(slider_key, 0, max(total_frames - 1, 0))
+            _render_frame_jump_box(slider_key, 0, max(total_frames - 1, 0))
             bfc_slider_val = st.slider(
                 "Scrub to the true back-foot-contact frame",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -402,7 +411,8 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
     br_confirmed = st.session_state.get(br_key)
     ffc_confirmed = st.session_state.get(ffc_key)
     bfc_confirmed = st.session_state.get(bfc_key)
-    if br_confirmed is None or ffc_confirmed is None or bfc_confirmed is None:
+    wrist_confirmed = st.session_state.get(wrist_confirmed_key, False)
+    if br_confirmed is None or ffc_confirmed is None or bfc_confirmed is None or not wrist_confirmed:
         return None
 
     return {
@@ -414,13 +424,15 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
 
 
 def stream_confirmation_resolved(key_prefix: str) -> bool:
-    """Whether all 3 mandatory events are confirmed for this stream — used
+    """Whether all 4 mandatory steps are confirmed for this stream — used
     to gate the Execute button, same purpose as Single Camera's br/ffc/bfc
-    _resolved checks."""
+    _resolved checks. Release point is included since it's no longer an
+    optional extra (see render_stream_event_confirmation)."""
     return (
         st.session_state.get(f"_{key_prefix}_br_confirmed_frame") is not None
         and st.session_state.get(f"_{key_prefix}_ffc_confirmed_frame") is not None
         and st.session_state.get(f"_{key_prefix}_bfc_confirmed_frame") is not None
+        and st.session_state.get(f"_{key_prefix}_wrist_step_confirmed", False)
     )
 
 
@@ -805,7 +817,7 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
 
         total_frames = cal.get_frame_count(temp_path)
         if total_frames > 1:
-            _render_frame_nudge_buttons("calib_frame_idx", 0, max(total_frames - 1, 0))
+            _render_frame_jump_box("calib_frame_idx", 0, max(total_frames - 1, 0))
             frame_idx = st.slider(
                 "Scrub to a frame where your reference points (e.g. stumps) are clearly visible",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -1011,7 +1023,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
             "the skeleton ever locking onto the wrong person."
         )
         if total_frames > 1:
-            _render_frame_nudge_buttons(f"{key_prefix}_seed_slider", 0, max(total_frames - 1, 0))
+            _render_frame_jump_box(f"{key_prefix}_seed_slider", 0, max(total_frames - 1, 0))
             frame_idx = st.slider(
                 "Scrub to a frame with the bowler visible",
                 min_value=0, max_value=max(total_frames - 1, 0),
@@ -1082,6 +1094,17 @@ def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
     history) — the fix for insufficient COVERAGE is more manual anchor
     points, not smarter automatic guessing.
 
+    PROGRESSIVELY REVEALED, not all 3 shown at once (BUG FIX from direct
+    coach feedback: "why do we have 4 expanders just to identify the
+    bowler" — showing empty "add a 3rd"/"add a 4th" slots before they
+    were ever needed was clutter for the large majority of clips where
+    one extra confirmation is plenty). Only the 2nd slot shows by
+    default; the 3rd only appears once the 2nd is actually filled in,
+    and the 4th only once the 3rd is filled — so a coach who never needs
+    more than one extra confirmation only ever sees ONE extra expander
+    (two total, including the primary seed), while a genuinely hard clip
+    can still escalate all the way to 4 seeds exactly as before.
+
     Returns a list of (frame_index, point) tuples for every extra
     confirmation the coach has added, or None if none were added.
     """
@@ -1090,9 +1113,8 @@ def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
     extra_seeds = []
     ordinals = ["2nd", "3rd", "4th"]
     for i, ordinal in enumerate(ordinals):
-        expanded_default = (i == 0)
         with st.expander(f"➕ Tracking lost partway through — add a {ordinal} confirmation ({label})",
-                          expanded=expanded_default):
+                          expanded=(i == 0)):
             st.caption(
                 "Only needed if the skeleton is missing or drifts onto someone else "
                 "for part of this clip (fast run-up, bowler far from camera, or "
@@ -1104,6 +1126,11 @@ def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
                                                        f"{label} — {ordinal} confirmation")
             if point is not None:
                 extra_seeds.append((frame_idx, point))
+        # Reveal the NEXT slot only once this one is actually filled in —
+        # keeps the common case (0 or 1 extra confirmation needed) down
+        # to at most one extra expander instead of always showing all 3.
+        if point is None:
+            break
     return extra_seeds if extra_seeds else None
 
 
@@ -1257,7 +1284,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 f"wrong even when it reports high confidence, so this step always runs."
             )
             total_frames_single = cal.get_frame_count(single_ref_path)
-            _render_frame_nudge_buttons("br_confirm_slider", 0, max(total_frames_single - 1, 0))
+            _render_frame_jump_box("br_confirm_slider", 0, max(total_frames_single - 1, 0))
             br_slider_val = st.slider(
                 "Scrub to the true ball-release frame",
                 min_value=0, max_value=max(total_frames_single - 1, 0),
@@ -1281,42 +1308,36 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
     # far the hand extends during a fast, blurred swing — not a one-frame
     # glitch (shoulder-to-wrist distance grew smoothly right through the
     # bad reading, no anomaly for a filter to catch), so no automatic check
-    # can fix it. This is optional (not gated into single_ready) since most
-    # deliveries track the wrist fine — only needed when the drawn "Ball
-    # Release Height" line visibly doesn't reach the real hand position.
+    # can fix it. MANDATORY, not optional (BUG FIX from direct coach
+    # feedback: this used to be a skippable "(optional)" panel — same
+    # reasoning as why BFC/FFC/BR are never skippable either, now also
+    # gated into single_ready below).
     confirmed_br_frame = st.session_state.get("_br_confirmed_frame")
+    if st.session_state.get("_wrist_step_identity") != single_file_identity:
+        st.session_state["_wrist_step_confirmed"] = False
+        st.session_state["_wrist_step_identity"] = single_file_identity
     if confirmed_br_frame is not None:
         wrist_identity = f"{single_file_identity}_{confirmed_br_frame}"
         if st.session_state.get("_wrist_identity") != wrist_identity:
             st.session_state["_wrist_confirmed_point"] = None
             st.session_state["_wrist_identity"] = wrist_identity
+            st.session_state["_wrist_step_confirmed"] = False
 
-        # Force this open (instead of always collapsed) when the auto-detector
-        # itself already flagged low confidence on this release frame — verified
-        # directly on real footage that "low" br_confidence correlates with
-        # exactly the smooth-wrist-mistracking failure mode this panel exists to
-        # fix. Leaving it collapsed in that case let a coach miss the one step
-        # that actually corrects it, since it looks like an optional extra
-        # rather than a response to a signal the app already computed.
-        wrist_panel_label = "🖐️ Correct Release Point (optional)"
-        force_open = br_confidence == "low"
-        if force_open:
-            wrist_panel_label = "🖐️ Correct Release Point — ⚠️ recommended, auto-detection had low confidence here"
-
-        with st.expander(wrist_panel_label, expanded=force_open):
-            if force_open:
+        with st.expander("🖐️ Confirm Release Point",
+                          expanded=not st.session_state.get("_wrist_step_confirmed", False)):
+            if br_confidence == "low":
                 st.warning(
                     "Auto-detection reported **low confidence** on this release frame. Verified on real "
                     "footage: this specific signal correlates with the wrist/hand tracking silently "
                     "undershooting the real arm extension — the drawn Release Height line can look "
-                    "plausible while still being wrong. Please check the marker below against the actual "
-                    "video frame before trusting Release Height for this session."
+                    "plausible while still being wrong. Please check the marker below carefully before "
+                    "confirming."
                 )
             st.caption(
                 "The yellow marker is the auto-tracked ball/hand position at your "
                 "confirmed release frame. If it doesn't sit on the real ball/hand — "
                 "common during fast, motion-blurred swings — click the real position "
-                "to correct it. This feeds Release Height directly."
+                "to correct it, then confirm. This feeds Release Height directly."
             )
             wrist_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=confirmed_br_frame)
             if wrist_frame_img is not None:
@@ -1347,6 +1368,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 new_point = render_zoomable_click_image(
                     pil_img, key_prefix="single_wrist", marker_point=display_point,
                     marker_color=("lime" if corrected_point is not None else "yellow"),
+                    enable_zoom=True,
                 )
                 if new_point is not None and st.session_state.get("_wrist_confirmed_point") != new_point:
                     st.session_state["_wrist_confirmed_point"] = new_point
@@ -1355,6 +1377,12 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 if corrected_point is not None and st.button("↺ Reset to auto-tracked position", key="reset_wrist_point"):
                     st.session_state["_wrist_confirmed_point"] = None
                     st.rerun()
+
+            if st.button("✅ Confirm this release point", key="confirm_wrist_button"):
+                st.session_state["_wrist_step_confirmed"] = True
+                st.rerun()
+            if st.session_state.get("_wrist_step_confirmed"):
+                st.success("Release point confirmed.")
 
     # FRONT FOOT CONTACT FRAME — same reasoning, same mandatory pattern,
     # for a real, separate bug: Hip-Shoulder Separation and the FFC-frame
@@ -1391,7 +1419,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 f"far earlier in the run-up."
             )
             total_frames_ffc = cal.get_frame_count(single_ref_path)
-            _render_frame_nudge_buttons("ffc_confirm_slider", 0, max(total_frames_ffc - 1, 0))
+            _render_frame_jump_box("ffc_confirm_slider", 0, max(total_frames_ffc - 1, 0))
             ffc_slider_val = st.slider(
                 "Scrub to the true front-foot-contact frame",
                 min_value=0, max_value=max(total_frames_ffc - 1, 0),
@@ -1436,7 +1464,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 f"contact you just confirmed, not far back in the run-up."
             )
             total_frames_bfc = cal.get_frame_count(single_ref_path)
-            _render_frame_nudge_buttons("bfc_confirm_slider", 0, max(total_frames_bfc - 1, 0))
+            _render_frame_jump_box("bfc_confirm_slider", 0, max(total_frames_bfc - 1, 0))
             bfc_slider_val = st.slider(
                 "Scrub to the true back-foot-contact frame",
                 min_value=0, max_value=max(total_frames_bfc - 1, 0),
@@ -1457,6 +1485,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
 br_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_br_confirmed_frame") is not None)
 ffc_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_ffc_confirmed_frame") is not None)
 bfc_resolved = (camera_mode != "Single Camera") or (st.session_state.get("_bfc_confirmed_frame") is not None)
+wrist_resolved = (camera_mode != "Single Camera") or st.session_state.get("_wrist_step_confirmed", False)
 
 # DUAL CAMERA — EVENT CONFIRMATION, same mandatory pattern as Single Camera
 # above (BUG FOUND during a full app audit: Dual Camera was going straight
@@ -1520,7 +1549,7 @@ if (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_re
         side_confirmed_events = render_stream_event_confirmation(
             side_stage12_result, side_ref_path, side_file_identity,
             key_prefix="side", bowling_arm=side_stage12_result.get("bowling_arm", "right"),
-            stream_label="Side-On", include_wrist_correction=True,
+            stream_label="Side-On",
         )
 
     st.markdown("#### 📹 Rear-View Stream — Confirm Delivery Events")
@@ -1531,7 +1560,7 @@ if (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_re
         rear_confirmed_events = render_stream_event_confirmation(
             rear_stage12_result, rear_ref_path, rear_file_identity,
             key_prefix="rear", bowling_arm=rear_stage12_result.get("bowling_arm", "right"),
-            stream_label="Rear-View", include_wrist_correction=True,
+            stream_label="Rear-View",
         )
 
 # Angle must be genuinely resolved (not left on "Not sure") before running —
@@ -1543,7 +1572,7 @@ angle_resolved = (camera_mode != "Single Camera") or (
 
 single_ready = (camera_mode == "Single Camera" and uploaded_single is not None
                  and single_seed_point is not None and bowling_arm_selected and angle_resolved
-                 and br_resolved and ffc_resolved and bfc_resolved)
+                 and br_resolved and ffc_resolved and bfc_resolved and wrist_resolved)
 dual_ready = (camera_mode == "Dual Camera — Recommended"
               and uploaded_side is not None and uploaded_rear is not None
               and side_seed_point is not None and rear_seed_point is not None
@@ -1572,6 +1601,11 @@ elif (camera_mode == "Single Camera" and uploaded_single is not None and single_
       and bowling_arm_selected and angle_resolved and br_resolved and ffc_resolved and not bfc_resolved):
     st.sidebar.warning("👆 Confirm the back-foot-contact frame above to enable analysis — "
                         "this feeds Head Stability's measurement window.")
+elif (camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None
+      and bowling_arm_selected and angle_resolved and br_resolved and ffc_resolved and bfc_resolved
+      and not wrist_resolved):
+    st.sidebar.warning("👆 Confirm the release point above to enable analysis — "
+                        "this feeds Release Height directly.")
 elif (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_rear is not None
       and side_seed_point is not None and rear_seed_point is not None and bowling_arm_selected
       and not (side_confirmed_events is not None and rear_confirmed_events is not None)):
