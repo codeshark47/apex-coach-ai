@@ -167,9 +167,21 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
         display_img = display_img.crop((crop_x0, crop_y0, crop_x0 + crop_w, crop_y0 + crop_h))
         st.caption(f"🔍 Zoomed {zoom_label} — click anywhere in this cropped view to place the marker there.")
 
+    # BUG FIX found on real footage (a click reported "in the sky", nowhere
+    # near the bowler): this widget's key was FIXED regardless of zoom or
+    # crop region, so switching zoom level didn't create a fresh widget —
+    # streamlit_image_coordinates can replay a STALE click position (valid
+    # for the previous, differently-cropped image) against the new one,
+    # which lands the translated coordinate somewhere that has nothing to
+    # do with where the coach actually clicked. Deriving the key from the
+    # crop region itself (same "dynamic key" pattern as the frame-number
+    # jump box above) forces a genuinely new widget instance whenever the
+    # displayed image changes, so a click can never be misattributed to
+    # the wrong crop.
+    click_widget_key = f"{key_prefix}_zoomclick_widget_{crop_x0}_{crop_y0}_{crop_w}_{crop_h}"
     with _framed_image_container():
         click = streamlit_image_coordinates(
-            display_img, key=f"{key_prefix}_zoomclick_widget",
+            display_img, key=click_widget_key,
             use_column_width="always"
         )
 
