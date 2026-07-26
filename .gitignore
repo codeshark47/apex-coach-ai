@@ -25,6 +25,11 @@ venv/
 # Data files
 *.csv
 
+# Real athlete/session data pulled out of Supabase by tools/ scripts —
+# contains PII (athlete names), never belongs in git regardless of format
+training_data/
+backups/
+
 # Streamlit
 .streamlit/secrets.toml
 streamlit_cloud_secrets.toml
