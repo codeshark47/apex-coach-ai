@@ -541,10 +541,26 @@ def render_annotated_video(video_path: str, output_path: str,
             # single clip-wide scale isn't good enough. Keeps the previous
             # value on a frame where the body height can't be measured
             # (brief tracking gap) rather than reverting to a fallback.
+            #
+            # BUG FIX: a raw per-frame measurement with no plausibility
+            # check or damping let ONE frame with a bad ankle/nose reading
+            # (exactly the kind of single-frame landmark noise this app
+            # sees constantly on real footage) spike render_scale toward
+            # its ceiling — verified on real footage this produced
+            # comically oversized joints for that frame ("beach balls").
+            # Two guards now: reject a measurement implying a body taller
+            # than 85% of the frame outright (no real camera framing
+            # produces that; it's a tracking artifact every time), and
+            # exponential smoothing on top so even a borderline-plausible
+            # bad reading only nudges the size a little rather than
+            # snapping straight to it — a real, sustained distance change
+            # still converges within a few frames, which is correct.
             _frame_body_height_px = _estimate_body_height_px(row)
-            if _frame_body_height_px and _frame_body_height_px > 10:
-                render_scale = max(MIN_RENDER_SCALE,
-                                    min(MAX_RENDER_SCALE, _frame_body_height_px / REFERENCE_BODY_HEIGHT_PX))
+            if _frame_body_height_px and 10 < _frame_body_height_px < height * 0.85:
+                _measured_scale = max(MIN_RENDER_SCALE,
+                                       min(MAX_RENDER_SCALE, _frame_body_height_px / REFERENCE_BODY_HEIGHT_PX))
+                SCALE_SMOOTHING_ALPHA = 0.25
+                render_scale = (1 - SCALE_SMOOTHING_ALPHA) * render_scale + SCALE_SMOOTHING_ALPHA * _measured_scale
 
             _hero_val = hero_arr[f_idx] if f_idx < len(hero_arr) else np.nan
             _hero_tier, _hero_color = _tier_and_color(hero_key, _hero_val)
@@ -661,6 +677,16 @@ def render_annotated_video(video_path: str, output_path: str,
                 {f"{_chart_lead_side}_KNEE"} if _is_side_on_module
                 else {"LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"}
             )
+            # BUG FIX: front-or-rear used to also apply the same size bump
+            # as the single lead-knee dot to all FOUR shoulder/hip joints
+            # at once. One enlarged, isolated knee dot reads fine — four
+            # enlarged dots clustered into the much smaller shoulder/hip
+            # span (verified on real footage: they visually merged into
+            # oversized blobs covering the whole torso) does not. The bone
+            # lines already carry the color/thickness "vector axis"
+            # highlight for this module — the dots only need the color,
+            # not extra size on top of it.
+            _hero_node_size_extra = _hero_extra_px if _is_side_on_module else 0
             for node in joint_nodes:
                 try:
                     if pd.isna(row[f"{node}_x"]):
@@ -669,7 +695,7 @@ def render_annotated_video(video_path: str, output_path: str,
                     ny = int(float(row[f"{node}_y"]) * height)
                     is_hero_node = node in _hero_joint_nodes
                     node_color = _hero_color if is_hero_node else JOINT_CORE
-                    node_extra = _hero_extra_px if is_hero_node else 0
+                    node_extra = _hero_node_size_extra if is_hero_node else 0
                     if 0 < nx < width and 0 < ny < height:
                         cv2.circle(frame, (nx, ny), _rs_joint(9) + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
                         cv2.circle(frame, (nx, ny), _rs_joint(6) + node_extra, node_color, -1, cv2.LINE_AA)
