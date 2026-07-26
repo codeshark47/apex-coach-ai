@@ -27,6 +27,20 @@ import cv2
 import numpy as np
 import pandas as pd
 
+import metric_ranges as mr
+
+
+def _hex_to_bgr(hex_color: str) -> tuple:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return (b, g, r)
+
+
+# Same green/amber/red the dashboard and PDF already use for this exact
+# classification (mr.TIER_COLORS) — converted to BGR for OpenCV so the
+# skeleton's color never has to be kept in sync with those by hand.
+TIER_COLORS_BGR = {tier: _hex_to_bgr(hexval) for tier, hexval in mr.TIER_COLORS.items()}
+
 
 def render_annotated_video(video_path: str, output_path: str,
                             df: pd.DataFrame, events: dict,
@@ -143,18 +157,27 @@ def render_annotated_video(video_path: str, output_path: str,
         except Exception:
             return None
 
-    scale_ref_rows = df[df["frame"] == events.get("FFC")]
-    scale_ref_row = scale_ref_rows.iloc[0] if not scale_ref_rows.empty else None
-    body_height_px = _estimate_body_height_px(scale_ref_row)
-
     REFERENCE_BODY_HEIGHT_PX = 400.0
     MIN_RENDER_SCALE, MAX_RENDER_SCALE = 0.18, 1.5
-    if body_height_px and body_height_px > 10:
-        render_scale = max(MIN_RENDER_SCALE, min(MAX_RENDER_SCALE, body_height_px / REFERENCE_BODY_HEIGHT_PX))
+
+    # PER-FRAME, not a single global value computed once at FFC. BUG FIX:
+    # verified directly on real footage that a bowler's on-screen size
+    # changes a lot over one clip — small and distant during run-up,
+    # progressively larger approaching release — so a scale locked to
+    # whatever he measured at FFC was correct for maybe one phase of the
+    # delivery and visibly wrong (joints overlapping into a blob, "covering
+    # the whole body") for the rest. Recomputed every frame from that
+    # frame's own landmarks below; _render_scale holds the last successfully
+    # measured value so a frame with a brief tracking gap keeps the
+    # previous size instead of snapping to a fallback default.
+    _fallback_scale = max(MIN_RENDER_SCALE, min(MAX_RENDER_SCALE, min(width, height) / 1080.0))
+    scale_ref_rows = df[df["frame"] == events.get("FFC")]
+    scale_ref_row = scale_ref_rows.iloc[0] if not scale_ref_rows.empty else None
+    _initial_body_height_px = _estimate_body_height_px(scale_ref_row)
+    if _initial_body_height_px and _initial_body_height_px > 10:
+        render_scale = max(MIN_RENDER_SCALE, min(MAX_RENDER_SCALE, _initial_body_height_px / REFERENCE_BODY_HEIGHT_PX))
     else:
-        # Bowler not measurable at FFC (missing landmarks) — fall back to
-        # the old resolution-only estimate rather than guessing further.
-        render_scale = max(MIN_RENDER_SCALE, min(MAX_RENDER_SCALE, min(width, height) / 1080.0))
+        render_scale = _fallback_scale
 
     def _rs(px):
         return max(1, int(round(px * render_scale)))
@@ -226,6 +249,23 @@ def render_annotated_video(video_path: str, output_path: str,
     # burned-in badge showed 173deg while the correct lead-knee value at
     # that exact frame was ~152deg.
     _chart_lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+    _lead_hip_knee = (f"{_chart_lead_side}_HIP", f"{_chart_lead_side}_KNEE")
+    _lead_knee_ankle = (f"{_chart_lead_side}_KNEE", f"{_chart_lead_side}_ANKLE")
+
+    # COLOR/THICKNESS BY ANGLE: the lead knee is the one joint this overlay
+    # already tracks a live per-frame value for (knee_arr below), so it's
+    # the one place a real, non-fabricated severity color can be drawn —
+    # reusing metric_ranges.classify, the exact same green/amber/red the
+    # dashboard and PDF report already use for this metric, not a new
+    # judgment invented for the video. Everything else on the skeleton
+    # (shoulders, hips, spine, wrists) has no live-tracked classification
+    # to color by, so it stays the neutral broadcast palette rather than
+    # inventing one.
+    def _knee_tier_and_color(angle):
+        if angle is None or (isinstance(angle, float) and np.isnan(angle)):
+            return "unknown", TIER_COLORS_BGR["unknown"]
+        tier = mr.classify("front_knee_bracing", float(angle))
+        return tier, TIER_COLORS_BGR[tier]
 
     def _row_knee_angle(r):
         try:
@@ -407,6 +447,26 @@ def render_annotated_video(video_path: str, output_path: str,
                 row = row.copy()
                 row[f"{bowl_side_for_override}_WRIST_x"] = wrist_override_x
                 row[f"{bowl_side_for_override}_WRIST_y"] = wrist_override_y
+
+            # PER-FRAME SIZE: recompute from THIS frame's own landmarks —
+            # see the comment above render_scale's initial value for why a
+            # single clip-wide scale isn't good enough. Keeps the previous
+            # value on a frame where the body height can't be measured
+            # (brief tracking gap) rather than reverting to a fallback.
+            _frame_body_height_px = _estimate_body_height_px(row)
+            if _frame_body_height_px and _frame_body_height_px > 10:
+                render_scale = max(MIN_RENDER_SCALE,
+                                    min(MAX_RENDER_SCALE, _frame_body_height_px / REFERENCE_BODY_HEIGHT_PX))
+
+            _cur_knee_val = knee_arr[f_idx] if f_idx < len(knee_arr) else np.nan
+            _knee_tier, _knee_color = _knee_tier_and_color(_cur_knee_val)
+            # A problem angle (amber/red) gets a visibly bolder lead-leg
+            # bone, not just a different color — "thickness according to
+            # the angle" per the same reasoning as the color: draws the
+            # eye to the joint that actually needs coaching attention
+            # instead of every joint looking equally important.
+            _knee_bone_extra_px = {"green": 0, "amber": 2, "red": 4, "unknown": 0}[_knee_tier]
+
             torso_x_cols = ["NOSE_x", "LEFT_HIP_x", "RIGHT_HIP_x"]
             torso_x_vals = [float(row[c]) for c in torso_x_cols if not pd.isna(row[c])]
             if torso_x_vals:
@@ -419,10 +479,13 @@ def render_annotated_video(video_path: str, output_path: str,
                     yA = int(float(row[f"{partA}_y"]) * height)
                     xB = int(float(row[f"{partB}_x"]) * width)
                     yB = int(float(row[f"{partB}_y"]) * height)
+                    is_lead_knee_bone = (partA, partB) in (_lead_hip_knee, _lead_knee_ankle)
+                    bone_color = _knee_color if is_lead_knee_bone else BONE_CORE
+                    bone_extra = _knee_bone_extra_px if is_lead_knee_bone else 0
                     if (0 < xA < width and 0 < yA < height and
                             0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6) + bone_extra, cv2.LINE_AA)
+                        cv2.line(frame, (xA, yA), (xB, yB), bone_color, _rs_bone_core(3) + bone_extra, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -496,15 +559,18 @@ def render_annotated_video(video_path: str, output_path: str,
                 except Exception:
                     continue
 
+            _lead_knee_node = f"{_chart_lead_side}_KNEE"
             for node in joint_nodes:
                 try:
                     if pd.isna(row[f"{node}_x"]):
                         continue
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
+                    node_color = _knee_color if node == _lead_knee_node else JOINT_CORE
+                    node_extra = _knee_bone_extra_px if node == _lead_knee_node else 0
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), _rs_joint(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), _rs_joint(6), JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs_joint(9) + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs_joint(6) + node_extra, node_color, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
@@ -532,14 +598,15 @@ def render_annotated_video(video_path: str, output_path: str,
 
         cur_val = knee_arr[f_idx] if f_idx < len(knee_arr) else np.nan
         if not np.isnan(cur_val):
+            _, cur_val_color = _knee_tier_and_color(cur_val)
             px, py_rel = x_to_px(f_idx), y_to_px(cur_val)
             py = PANEL_TOP + py_rel
             cv2.line(frame, (px, PANEL_TOP + MARGIN_T), (px, PANEL_TOP + PANEL_H - MARGIN_B),
-                     JOINT_CORE, 1, cv2.LINE_AA)
+                     cur_val_color, 1, cv2.LINE_AA)
             cv2.circle(frame, (px, py), 5, JOINT_OUTLINE, -1, cv2.LINE_AA)
-            cv2.circle(frame, (px, py), 3, JOINT_CORE, -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 3, cur_val_color, -1, cv2.LINE_AA)
             cv2.putText(frame, f"{cur_val:.0f}deg", (width - 130, PANEL_TOP + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, JOINT_CORE, 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, cur_val_color, 2, cv2.LINE_AA)
 
         status_text = "RUN-UP"
         if f_idx >= events["BR"]:
@@ -683,8 +750,13 @@ def render_annotated_video(video_path: str, output_path: str,
             cv2.putText(frame, "KNEE", (box_x + 14, box_y + 64),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
             if not np.isnan(badge_val):
+                # Colored by the SAME classification as the skeleton/chart
+                # (green/amber/red), not the badge's own event-type color —
+                # this number's color means "how good is this angle", the
+                # badge label's color just means "which event is this".
+                _, badge_knee_color = _knee_tier_and_color(badge_val)
                 cv2.putText(frame, f"{badge_val:.0f}deg", (box_x + 85, box_y + 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.05, color, 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05, badge_knee_color, 2, cv2.LINE_AA)
             if is_release:
                 cv2.putText(frame, "RELEASE HEIGHT", (box_x + 14, box_y + 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)

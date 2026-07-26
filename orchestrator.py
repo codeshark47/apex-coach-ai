@@ -13,6 +13,12 @@ from kinematics import (
 )
 import camera_angle_detection as cad
 
+# Shared with calculate_release_height_ratio_safe's own "too small to divide
+# by reliably" floor below — kept as one named constant so the search that
+# LOOKS for a usable reference frame and the check that later REJECTS an
+# unusable one can never silently drift apart.
+MIN_BODY_HEIGHT_SPAN = 0.05
+
 
 def _nearest_complete_row(df: pd.DataFrame, frame_idx: int, required_cols: list, max_search: int = 10):
     """
@@ -65,6 +71,22 @@ def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm:
 
     Returns a pd.Series (the row) or None if nothing within range
     qualifies (a genuinely unusual clip, not a bug in the search).
+
+    BUG FIX: "grounded" used to mean ONLY "ankle sits below knee and hip in
+    the frame" — correct ordering, but not checked against NOSE_y at all.
+    Verified directly on real footage (a rear-view delivery at fast,
+    blurred release) that a frame can pass that ordering check while the
+    tracked ankle is still wrong: nose/hip/knee/ankle all landed within a
+    ~0.05-normalized band of each other — a physically implausible,
+    compressed body span — because the ankle landmark itself was
+    inaccurate that frame, not because the bowler was crouched or
+    mid-stride. That frame was accepted as "grounded" on the first check
+    and returned immediately, so the search never looked further outward
+    for a frame where the ankle was actually trustworthy — the resulting
+    body_height then failed calculate_release_height_ratio_safe's own
+    MIN_BODY_HEIGHT_SPAN floor anyway, just one step too late to keep
+    searching. Now checked here too, so the search keeps going until it
+    finds a frame that's both correctly ordered AND has a plausible span.
     """
     lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
     required = ["NOSE_y", f"{lead_side}_ANKLE_y", f"{lead_side}_KNEE_y", f"{lead_side}_HIP_y"]
@@ -72,8 +94,10 @@ def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm:
     def _is_grounded(row) -> bool:
         if any(pd.isna(row.get(c)) for c in required):
             return False
-        return float(row[f"{lead_side}_ANKLE_y"]) >= float(row[f"{lead_side}_KNEE_y"]) and \
-            float(row[f"{lead_side}_ANKLE_y"]) >= float(row[f"{lead_side}_HIP_y"])
+        ankle_y = float(row[f"{lead_side}_ANKLE_y"])
+        if ankle_y < float(row[f"{lead_side}_KNEE_y"]) or ankle_y < float(row[f"{lead_side}_HIP_y"]):
+            return False
+        return abs(ankle_y - float(row["NOSE_y"])) >= MIN_BODY_HEIGHT_SPAN
 
     rows = df[df["frame"] == frame_idx]
     if not rows.empty and _is_grounded(rows.iloc[0]):
@@ -680,7 +704,7 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         # frame depends heavily on camera distance, so a flat cutoff here
         # (previously 0.35) rejects legitimately well-tracked videos just
         # because they were filmed wider or further away.
-        if body_height < 0.05:
+        if body_height < MIN_BODY_HEIGHT_SPAN:
             return {
                 "ratio": None,
                 "classification": "Body height too small",

@@ -1,8 +1,8 @@
 """
 tests/test_orchestrator_metrics.py
 
-Regression tests for the two orchestrator.py metric functions that had
-real, confirmed bugs found on real footage this session:
+Regression tests for orchestrator.py metric functions that had real,
+confirmed bugs found on real footage this session:
 
   - calculate_hip_shoulder_separation: a NaN landmark used to compare
     False against every tier threshold and silently fall through to a
@@ -12,6 +12,14 @@ real, confirmed bugs found on real footage this session:
     to catch a MISTRACKED wrist was also rejecting a coach's directly
     confirmed release point — discarding a human's ground-truth
     observation on the theory that it must be a tracking glitch.
+  - _find_grounded_reference_near: "grounded" only checked ankle-vs-knee/
+    hip ORDERING, not whether the resulting nose-to-ankle span was even
+    physically plausible — found on a real rear-view clip where a frame
+    passed that ordering check with a compressed, implausible span
+    (inaccurate ankle landmark, not a real crouch), got returned
+    immediately, and then failed calculate_release_height_ratio_safe's
+    own too-small-to-divide-by floor one step later — "N/A" instead of
+    searching further out for a frame that was actually usable.
 """
 
 import numpy as np
@@ -138,3 +146,43 @@ class TestReleaseHeightRatio:
         assert result["classification"] in (
             "Standard Mid-Arm Release", "High-Release Leverage", "Low-Sling Action",
         )
+
+
+def _tracking_row(frame, nose_y, ankle_y, knee_y=0.70, hip_y=0.55):
+    """LEFT-side landmarks only — lead side for a right-arm bowler."""
+    return {
+        "frame": frame, "NOSE_y": nose_y,
+        "LEFT_ANKLE_y": ankle_y, "LEFT_KNEE_y": knee_y, "LEFT_HIP_y": hip_y,
+    }
+
+
+class TestFindGroundedReferenceNear:
+    def test_skips_ordinally_grounded_frame_with_implausible_span(self):
+        """The exact bug found on real rear-view footage: frame 10 has the
+        ankle correctly below the knee/hip (passes the old check) but only
+        0.03 away from the nose — a physically compressed span from a bad
+        ankle reading, not a real crouch. Frame 12 is a genuinely normal,
+        fully plausible standing reference a few frames away and must be
+        preferred over the nearer-but-implausible frame 10."""
+        df = pd.DataFrame([
+            _tracking_row(frame=10, nose_y=0.53, ankle_y=0.56, knee_y=0.55, hip_y=0.54),
+            _tracking_row(frame=11, nose_y=0.20, ankle_y=0.10, knee_y=0.25, hip_y=0.22),
+            _tracking_row(frame=12, nose_y=0.20, ankle_y=0.85, knee_y=0.70, hip_y=0.55),
+        ])
+        ref = o._find_grounded_reference_near(df, frame_idx=10, bowling_arm="right", max_search=5)
+        assert ref is not None
+        assert ref["frame"] == 12
+
+    def test_accepts_frame_at_idx_when_span_is_plausible(self):
+        row = _tracking_row(frame=50, nose_y=0.20, ankle_y=0.85, knee_y=0.70, hip_y=0.55)
+        df = pd.DataFrame([row])
+        ref = o._find_grounded_reference_near(df, frame_idx=50, bowling_arm="right")
+        assert ref is not None
+        assert ref["frame"] == 50
+
+    def test_returns_none_when_nothing_in_range_is_plausible(self):
+        df = pd.DataFrame([
+            _tracking_row(frame=10, nose_y=0.53, ankle_y=0.56, knee_y=0.55, hip_y=0.54),
+        ])
+        ref = o._find_grounded_reference_near(df, frame_idx=10, bowling_arm="right", max_search=3)
+        assert ref is None
