@@ -30,27 +30,51 @@ import camera_angle_detection as cad
 
 def _render_frame_nudge_buttons(slider_key: str, min_value: int, max_value: int):
     """
-    Small ◀ / ▶ buttons that nudge a frame-scrubbing slider by exactly
-    one frame. Dragging a slider to the EXACT right frame is fiddly on
-    a real video — fine BFC/FFC/BR or seed-point confirmation often
-    comes down to needing one frame earlier or later, which a slider
-    drag overshoots easily. Mutates the slider's own session_state key
-    via an on_click callback (the supported way to adjust a keyed
-    widget from outside itself) — call this immediately before the
-    st.slider(key=slider_key) call it targets, no other wiring needed,
-    the slider just picks up the new value on rerun.
+    Small ◀ / ▶ buttons plus a direct "type the frame number" box, all
+    targeting one frame-scrubbing slider. Dragging a slider to the EXACT
+    right frame is fiddly on a real video, and clicking ◀/▶ one frame at
+    a time from frame 0 to frame 147 is slow — a coach who already knows
+    roughly which frame they want (e.g. from scrubbing the source video
+    in another player) should be able to just type it. Both controls
+    mutate the slider's own session_state key via a callback (the
+    supported way to adjust a keyed widget from outside itself) — call
+    this immediately before the st.slider(key=slider_key) call it
+    targets, no other wiring needed, the slider just picks up the new
+    value on rerun.
+
+    The number box's own widget key is derived from the CURRENT slider
+    value (not a fixed string) — this is deliberate: Streamlit only reads
+    a keyed widget's value= argument on first creation, so a fixed key
+    would go stale and show the wrong number after a ◀/▶ click or a
+    slider drag. Deriving the key from the current value forces a fresh
+    widget each time something else changes it, so the displayed number
+    is always correct regardless of which control last touched it.
     """
     def _step(delta):
         current = st.session_state.get(slider_key, min_value)
         st.session_state[slider_key] = max(min_value, min(max_value, current + delta))
 
-    nudge_cols = st.columns([1, 1, 10])
+    current_value = st.session_state.get(slider_key, min_value)
+    jump_key = f"{slider_key}_jump_input_{current_value}"
+
+    def _jump_to_typed():
+        typed = st.session_state.get(jump_key)
+        if typed is not None:
+            st.session_state[slider_key] = max(min_value, min(max_value, int(typed)))
+
+    nudge_cols = st.columns([1, 1, 2, 6])
     with nudge_cols[0]:
         st.button("◀", key=f"{slider_key}_step_back", on_click=_step, args=(-1,),
                   help="Back 1 frame", use_container_width=True)
     with nudge_cols[1]:
         st.button("▶", key=f"{slider_key}_step_fwd", on_click=_step, args=(1,),
                   help="Forward 1 frame", use_container_width=True)
+    with nudge_cols[2]:
+        st.number_input(
+            "Jump to frame", min_value=min_value, max_value=max_value,
+            value=current_value, key=jump_key, on_change=_jump_to_typed,
+            help="Type an exact frame number and press Enter", label_visibility="collapsed",
+        )
 
 
 def _framed_image_container():
@@ -66,6 +90,102 @@ def _framed_image_container():
     """
     _, mid, _ = st.columns([1, 3, 1])
     return mid.container(border=True)
+
+
+def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, marker_color: str = "lime",
+                                 extra_markers: list = None):
+    """
+    Displays a reference-frame image with an optional digital zoom, and
+    returns a click position in ORIGINAL image pixel coordinates (or None
+    if nothing was clicked this run).
+
+    WHY A CROP-BASED "DIGITAL" ZOOM, NOT CSS/BROWSER PINCH-ZOOM: real
+    coach feedback — on a phone screen the reference frame is small
+    enough that clicking the exact right pixel (a wrist, a stump edge)
+    is genuinely hard. The click-to-original-pixel math already depends
+    on knowing exactly what region of the source image is on screen and
+    at what scale (see the scale_x/scale_y pattern used everywhere in
+    this file) — a server-side crop keeps that fully under this app's
+    control, where an uncontrolled browser pinch-zoom gesture would risk
+    desyncing reported click coordinates from what's actually visible.
+
+    marker_point: (x, y) in ORIGINAL image coordinates, if a PRIMARY
+    marker should be drawn — also used to CENTER the zoom, since a coach
+    zooming in almost always wants to fine-tune a point they already
+    placed roughly, not an arbitrary corner of the frame. None if no
+    marker exists yet (zoom centers on the last extra_marker, or the
+    image middle if there's nothing to center on at all).
+
+    extra_markers: optional list of {"point": (x,y), "color": str,
+    "label": str|None} — for the calibration flow, which shows up to two
+    numbered reference points at once, unlike every other call site here
+    (seed point, wrist correction) which only ever has one marker.
+
+    At the default "1x (no zoom)" level this is mathematically identical
+    to the previous non-zoomable code (crop offset is exactly (0, 0), no
+    .crop() call happens at all) — verified directly, not assumed.
+    """
+    from PIL import ImageDraw
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    orig_w, orig_h = pil_img.size
+    extra_markers = extra_markers or []
+
+    zoom_options = {"1x (no zoom)": 1.0, "2x": 2.0, "3x": 3.0, "4x": 4.0}
+    zoom_label = st.select_slider(
+        "Zoom", options=list(zoom_options.keys()), value="1x (no zoom)",
+        key=f"{key_prefix}_zoom_level",
+        help="Zoom in for more precise clicking — especially useful on a phone screen.",
+    )
+    zoom = zoom_options[zoom_label]
+
+    crop_w = max(1, int(orig_w / zoom))
+    crop_h = max(1, int(orig_h / zoom))
+    if marker_point is not None:
+        center_x, center_y = marker_point
+    elif extra_markers:
+        center_x, center_y = extra_markers[-1]["point"]
+    else:
+        center_x, center_y = orig_w // 2, orig_h // 2
+    crop_x0 = max(0, min(orig_w - crop_w, center_x - crop_w // 2))
+    crop_y0 = max(0, min(orig_h - crop_h, center_y - crop_h // 2))
+
+    display_img = pil_img.copy()
+    if extra_markers:
+        draw = ImageDraw.Draw(display_img)
+        r = max(4, orig_w // 150)
+        for m in extra_markers:
+            px, py = m["point"]
+            draw.ellipse((px - r, py - r, px + r, py + r), outline=m.get("color", "red"), width=3)
+            if m.get("label"):
+                draw.text((px + r + 4, py - r - 4), str(m["label"]), fill=m.get("color", "red"))
+    if marker_point is not None:
+        draw = ImageDraw.Draw(display_img)
+        r = max(5, orig_w // 100)
+        px, py = marker_point
+        draw.ellipse((px - r, py - r, px + r, py + r), outline=marker_color, width=4)
+
+    if zoom > 1.0:
+        display_img = display_img.crop((crop_x0, crop_y0, crop_x0 + crop_w, crop_y0 + crop_h))
+        st.caption(f"🔍 Zoomed {zoom_label} — click anywhere in this cropped view to place the marker there.")
+
+    with _framed_image_container():
+        click = streamlit_image_coordinates(
+            display_img, key=f"{key_prefix}_zoomclick_widget",
+            use_column_width="always"
+        )
+
+    if click is None:
+        return None
+
+    crop_disp_w, crop_disp_h = display_img.size
+    rendered_w = click.get("width") or crop_disp_w
+    rendered_h = click.get("height") or crop_disp_h
+    scale_x = crop_disp_w / rendered_w
+    scale_y = crop_disp_h / rendered_h
+    click_x_in_crop = click["x"] * scale_x
+    click_y_in_crop = click["y"] * scale_y
+    return (round(crop_x0 + click_x_in_crop), round(crop_y0 + click_y_in_crop))
 
 
 def render_stream_event_confirmation(stage12_result, ref_path: str, file_identity: str,
@@ -179,8 +299,7 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
             )
             wrist_frame_img = cal.extract_reference_frame(ref_path, frame_index=confirmed_br_frame)
             if wrist_frame_img is not None:
-                from PIL import Image, ImageDraw
-                from streamlit_image_coordinates import streamlit_image_coordinates
+                from PIL import Image
 
                 pil_img = Image.fromarray(wrist_frame_img)
                 orig_w, orig_h = pil_img.size
@@ -199,34 +318,18 @@ def render_stream_event_confirmation(stage12_result, ref_path: str, file_identit
                 corrected_point = st.session_state.get(wrist_point_key)
                 display_point = corrected_point or auto_point
 
-                display_img = pil_img.copy()
-                if display_point is not None:
-                    draw = ImageDraw.Draw(display_img)
-                    r = max(5, orig_w // 100)
-                    px, py = display_point
-                    color = "lime" if corrected_point is not None else "yellow"
-                    draw.ellipse((px - r, py - r, px + r, py + r), outline=color, width=4)
-
                 if corrected_point is None:
-                    st.caption("🟡 Auto-tracked position shown. Click the image below to correct it if wrong.")
+                    st.caption("🟡 Auto-tracked position shown. Zoom in and click the image below to correct it if wrong.")
                 else:
                     st.caption("✅ Corrected — click again to move the marker, or reset below.")
 
-                with _framed_image_container():
-                    wrist_click = streamlit_image_coordinates(
-                        display_img, key=f"{key_prefix}_wrist_click_widget",
-                        use_column_width="always"
-                    )
-
-                if wrist_click is not None:
-                    rendered_w = wrist_click.get("width") or orig_w
-                    rendered_h = wrist_click.get("height") or orig_h
-                    scale_x = orig_w / rendered_w
-                    scale_y = orig_h / rendered_h
-                    new_point = (round(wrist_click["x"] * scale_x), round(wrist_click["y"] * scale_y))
-                    if st.session_state.get(wrist_point_key) != new_point:
-                        st.session_state[wrist_point_key] = new_point
-                        st.rerun()
+                new_point = render_zoomable_click_image(
+                    pil_img, key_prefix=f"{key_prefix}_wrist", marker_point=display_point,
+                    marker_color=("lime" if corrected_point is not None else "yellow"),
+                )
+                if new_point is not None and st.session_state.get(wrist_point_key) != new_point:
+                    st.session_state[wrist_point_key] = new_point
+                    st.rerun()
 
                 if corrected_point is not None and st.button("↺ Reset to auto-tracked position", key=f"{key_prefix}_reset_wrist_point"):
                     st.session_state[wrist_point_key] = None
@@ -729,18 +832,9 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
             st.session_state["_calib_last_preset"] = calib_preset_choice
 
         if frame is not None:
-            from PIL import Image, ImageDraw
-            from streamlit_image_coordinates import streamlit_image_coordinates
+            from PIL import Image
 
             pil_img = Image.fromarray(frame)
-            orig_w, orig_h = pil_img.size
-
-            display_img = pil_img.copy()
-            draw = ImageDraw.Draw(display_img)
-            for i, (px, py) in enumerate(st.session_state.calib_points):
-                r = max(4, orig_w // 150)
-                draw.ellipse((px - r, py - r, px + r, py + r), outline="red", width=3)
-                draw.text((px + r + 4, py - r - 4), str(i + 1), fill="red")
 
             if len(st.session_state.calib_points) < 2:
                 which_point = (calib_preset["point1_prompt"] if len(st.session_state.calib_points) == 0
@@ -749,22 +843,15 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
             else:
                 st.caption("✅ Both points selected — see below.")
 
-            with _framed_image_container():
-                click = streamlit_image_coordinates(
-                    display_img, key="calib_click_widget",
-                    use_column_width="always"
-                )
+            existing_markers = [
+                {"point": pt, "color": "red", "label": str(i + 1)}
+                for i, pt in enumerate(st.session_state.calib_points)
+            ]
+            new_point = render_zoomable_click_image(
+                pil_img, key_prefix="calib", extra_markers=existing_markers,
+            )
 
-            if click is not None and len(st.session_state.calib_points) < 2:
-                # The component may report coords relative to its rendered size,
-                # which can differ from the source image's native resolution —
-                # rescale back to the original frame's pixel space to stay accurate.
-                rendered_w = click.get("width") or orig_w
-                rendered_h = click.get("height") or orig_h
-                scale_x = orig_w / rendered_w
-                scale_y = orig_h / rendered_h
-                new_point = (round(click["x"] * scale_x), round(click["y"] * scale_y))
-
+            if new_point is not None and len(st.session_state.calib_points) < 2:
                 if not st.session_state.calib_points or st.session_state.calib_points[-1] != new_point:
                     st.session_state.calib_points.append(new_point)
                     st.rerun()
@@ -941,42 +1028,24 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
             st.session_state[f"_{key_prefix}_last_frame_idx"] = frame_idx
 
         if frame is not None:
-            from PIL import Image, ImageDraw
-            from streamlit_image_coordinates import streamlit_image_coordinates
+            from PIL import Image
 
             pil_img = Image.fromarray(frame)
-            orig_w, orig_h = pil_img.size
-
-            display_img = pil_img.copy()
             point = st.session_state.get(point_key)
-            if point is not None:
-                draw = ImageDraw.Draw(display_img)
-                r = max(5, orig_w // 100)
-                px, py = point
-                draw.ellipse((px - r, py - r, px + r, py + r), outline="lime", width=4)
 
             if point is None:
                 st.caption("📍 Click directly on the bowler below.")
             else:
                 st.caption("✅ Bowler confirmed — click again to move the marker.")
 
-            with _framed_image_container():
-                click = streamlit_image_coordinates(
-                    display_img, key=f"{key_prefix}_seed_click_widget",
-                    use_column_width="always"
-                )
+            new_point = render_zoomable_click_image(
+                pil_img, key_prefix=f"{key_prefix}_seed", marker_point=point,
+            )
 
-            if click is not None:
-                rendered_w = click.get("width") or orig_w
-                rendered_h = click.get("height") or orig_h
-                scale_x = orig_w / rendered_w
-                scale_y = orig_h / rendered_h
-                new_point = (round(click["x"] * scale_x), round(click["y"] * scale_y))
-
-                if st.session_state.get(point_key) != new_point:
-                    st.session_state[point_key] = new_point
-                    st.session_state[frame_key] = frame_idx
-                    st.rerun()
+            if new_point is not None and st.session_state.get(point_key) != new_point:
+                st.session_state[point_key] = new_point
+                st.session_state[frame_key] = frame_idx
+                st.rerun()
 
             if st.session_state.get(point_key) is not None:
                 if st.button("↺ Reset marker", key=f"{key_prefix}_reset_seed"):
@@ -1251,8 +1320,7 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
             )
             wrist_frame_img = cal.extract_reference_frame(single_ref_path, frame_index=confirmed_br_frame)
             if wrist_frame_img is not None:
-                from PIL import Image, ImageDraw
-                from streamlit_image_coordinates import streamlit_image_coordinates
+                from PIL import Image
 
                 pil_img = Image.fromarray(wrist_frame_img)
                 orig_w, orig_h = pil_img.size
@@ -1271,34 +1339,18 @@ if camera_mode == "Single Camera" and uploaded_single is not None and single_see
                 corrected_point = st.session_state.get("_wrist_confirmed_point")
                 display_point = corrected_point or auto_point
 
-                display_img = pil_img.copy()
-                if display_point is not None:
-                    draw = ImageDraw.Draw(display_img)
-                    r = max(5, orig_w // 100)
-                    px, py = display_point
-                    color = "lime" if corrected_point is not None else "yellow"
-                    draw.ellipse((px - r, py - r, px + r, py + r), outline=color, width=4)
-
                 if corrected_point is None:
-                    st.caption("🟡 Auto-tracked position shown. Click the image below to correct it if wrong.")
+                    st.caption("🟡 Auto-tracked position shown. Zoom in and click the image below to correct it if wrong.")
                 else:
                     st.caption("✅ Corrected — click again to move the marker, or reset below.")
 
-                with _framed_image_container():
-                    wrist_click = streamlit_image_coordinates(
-                        display_img, key="wrist_click_widget",
-                        use_column_width="always"
-                    )
-
-                if wrist_click is not None:
-                    rendered_w = wrist_click.get("width") or orig_w
-                    rendered_h = wrist_click.get("height") or orig_h
-                    scale_x = orig_w / rendered_w
-                    scale_y = orig_h / rendered_h
-                    new_point = (round(wrist_click["x"] * scale_x), round(wrist_click["y"] * scale_y))
-                    if st.session_state.get("_wrist_confirmed_point") != new_point:
-                        st.session_state["_wrist_confirmed_point"] = new_point
-                        st.rerun()
+                new_point = render_zoomable_click_image(
+                    pil_img, key_prefix="single_wrist", marker_point=display_point,
+                    marker_color=("lime" if corrected_point is not None else "yellow"),
+                )
+                if new_point is not None and st.session_state.get("_wrist_confirmed_point") != new_point:
+                    st.session_state["_wrist_confirmed_point"] = new_point
+                    st.rerun()
 
                 if corrected_point is not None and st.button("↺ Reset to auto-tracked position", key="reset_wrist_point"):
                     st.session_state["_wrist_confirmed_point"] = None
@@ -1479,7 +1531,7 @@ if (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_re
         rear_confirmed_events = render_stream_event_confirmation(
             rear_stage12_result, rear_ref_path, rear_file_identity,
             key_prefix="rear", bowling_arm=rear_stage12_result.get("bowling_arm", "right"),
-            stream_label="Rear-View", include_wrist_correction=False,
+            stream_label="Rear-View", include_wrist_correction=True,
         )
 
 # Angle must be genuinely resolved (not left on "Not sure") before running —

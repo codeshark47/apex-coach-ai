@@ -53,8 +53,14 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     (wrong release frame despite "high confidence", FFC landing on an
     ordinary run-up stride, etc.) applies here exactly as much as it does
     to Single Camera — a human confirming the frame is what actually
-    catches those, not a confidence score. wrist_override only applies to
-    the side stream (release_height is only ever computed from it).
+    catches those, not a confidence score.
+
+    Release height is computed from BOTH streams' wrist overrides (see
+    the fallback logic below) — an earlier version of this function only
+    ever computed it from the side stream with no way to correct a failed
+    reading from the rear stream at all, found on real footage where the
+    side stream's auto-tracked wrist failed and the coach had no way to
+    fix it even though the rear stream was sitting right there.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -154,6 +160,39 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     hip_separation = calculate_hip_shoulder_separation(rear_df, rear_events["FFC"])
     head_stability = calculate_head_stability(rear_df, rear_events["BFC"], rear_events["BR"])
 
+    # RELEASE HEIGHT FALLBACK — BUG FIX found on real footage: this metric
+    # was ONLY ever computed from the side stream, with no way to correct
+    # its wrist tracking from the rear stream at all. Release height only
+    # needs vertical (y-axis) wrist/ankle/head positions, which are just
+    # as valid from a rear-view stream as side-on (Single Camera mode
+    # already computes this metric from a front/rear-only upload — nothing
+    # about the calculation itself requires a side profile). If the side
+    # stream's reading is unavailable (tracking failure on that specific
+    # clip, or the coach never got a usable auto-track to correct), the
+    # rear stream's own coach-corrected wrist point is now used instead of
+    # just reporting "N/A" when a second, real, independently-tracked
+    # camera angle was sitting right there with a possibly-good reading.
+    rear_ffc_rows = rear_df[rear_df["frame"] == rear_events["FFC"]]
+    rear_br_rows = rear_df[rear_df["frame"] == rear_events["BR"]]
+    rear_release_height = {"status": "error", "ratio": None, "classification": "Not computed"}
+    if not rear_br_rows.empty:
+        rear_height_ref = _find_grounded_reference_near(rear_df, rear_events["BR"], bowling_arm)
+        if rear_height_ref is None and not rear_ffc_rows.empty:
+            rear_height_ref = _nearest_complete_row(
+                rear_df, rear_events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+            )
+        rear_wrist_x = rear_events.get("wrist_override_x")
+        rear_wrist_y = rear_events.get("wrist_override_y")
+        rear_wrist_override_norm = (rear_wrist_x, rear_wrist_y) if rear_wrist_x is not None and rear_wrist_y is not None else None
+        rear_release_height = calculate_release_height_ratio_safe(rear_br_rows.iloc[0], bowling_arm=bowling_arm,
+                                                                    reference_row=rear_height_ref,
+                                                                    wrist_override_norm=rear_wrist_override_norm)
+
+    release_height_source = "side"
+    if release_height.get("status") != "success" and rear_release_height.get("status") == "success":
+        release_height = rear_release_height
+        release_height_source = "rear"
+
     # SIDE-ON ANNOTATED VIDEO
     raw_video = os.path.join(output_dir, "annotated_raw.mp4")
     generate_fail_safe_video(side_on_path, raw_video, side_df, side_events, bowling_arm=bowling_arm,
@@ -215,7 +254,11 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             "release_height": {
                 "ratio": clean_numeric(release_height.get("ratio")),
                 "classification": release_height.get("classification", "Unknown"),
-                "status": release_height.get("status", "error")
+                "status": release_height.get("status", "error"),
+                # "side" (preferred/default) or "rear" (used only because
+                # the side stream's own reading failed and the rear
+                # stream's coach-corrected wrist point produced a real one)
+                "measured_from": release_height_source,
             },
             "hip_shoulder_separation": {
                 "degrees": clean_numeric(hip_separation.get("degrees")),
