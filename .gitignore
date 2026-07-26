@@ -30,6 +30,10 @@ venv/
 training_data/
 backups/
 
+# Contains the real Supabase secret key in plaintext (Task Scheduler can't
+# read secrets.toml / env vars the way an interactive shell can)
+tools/run_backup.bat
+
 # Streamlit
 .streamlit/secrets.toml
 streamlit_cloud_secrets.toml
