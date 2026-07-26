@@ -117,11 +117,13 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     numbered reference points at once, unlike every other call site here
     (seed point, wrist correction) which only ever has one marker.
 
-    At the default "1x (no zoom)" level this is mathematically identical
-    to the previous non-zoomable code (crop offset is exactly (0, 0), no
-    .crop() call happens at all) — verified directly, not assumed.
+    At the default "1x (no zoom)" level the crop offset is exactly (0, 0)
+    (no .crop() call happens at all) — the ONE other transformation that
+    can still apply regardless of zoom level is the display downscale
+    below, for images larger than MAX_DISPLAY_DIM (verified necessary on
+    real 1080x1920 phone footage — see that comment for why).
     """
-    from PIL import ImageDraw
+    from PIL import Image, ImageDraw
     from streamlit_image_coordinates import streamlit_image_coordinates
 
     orig_w, orig_h = pil_img.size
@@ -167,6 +169,35 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
         display_img = display_img.crop((crop_x0, crop_y0, crop_x0 + crop_w, crop_y0 + crop_h))
         st.caption(f"🔍 Zoomed {zoom_label} — click anywhere in this cropped view to place the marker there.")
 
+    # crop_disp_w/h = the TRUE pixel size of the region being shown, before
+    # any resize below — this is what the final click math scales back
+    # from, so it must be captured here regardless of what happens next.
+    crop_disp_w, crop_disp_h = display_img.size
+
+    # DOWNSCALE FOR THE COMPONENT — BUG FIX found on real footage: a
+    # phone-shot rear-view clip (1080x1920, verified directly — 5x the
+    # pixels of a same-session side-on clip at 848x478) was slow enough
+    # sending its full-resolution image to the streamlit_image_coordinates
+    # component that it looked like the image "wasn't loading" at all,
+    # every time, until zoomed in — which incidentally shrank the actual
+    # pixel data enough to render quickly, creating the false impression
+    # that zoom was required for the image to work. The component
+    # transmits the PIL image's actual pixel data every render regardless
+    # of its CSS-displayed size (use_column_width scales it visually in
+    # the browser, but doesn't reduce what gets sent) — resizing down to a
+    # fixed max dimension keeps rendering fast and CONSISTENT regardless
+    # of the source video's native resolution. MAX_DISPLAY_DIM is an
+    # engineering choice (comfortably above any phone screen's effective
+    # width) balancing load speed against not needlessly blurring detail,
+    # not a validated number.
+    MAX_DISPLAY_DIM = 960
+    downscale = min(1.0, MAX_DISPLAY_DIM / max(crop_disp_w, crop_disp_h))
+    if downscale < 1.0:
+        display_img = display_img.resize(
+            (max(1, round(crop_disp_w * downscale)), max(1, round(crop_disp_h * downscale))),
+            Image.LANCZOS,
+        )
+
     # BUG FIX found on real footage (a click reported "in the sky", nowhere
     # near the bowler): this widget's key was FIXED regardless of zoom or
     # crop region, so switching zoom level didn't create a fresh widget —
@@ -188,7 +219,6 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     if click is None:
         return None
 
-    crop_disp_w, crop_disp_h = display_img.size
     rendered_w = click.get("width") or crop_disp_w
     rendered_h = click.get("height") or crop_disp_h
     scale_x = crop_disp_w / rendered_w
