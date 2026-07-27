@@ -39,7 +39,7 @@ def _fetch_all_label_rows(client, page_size: int = 1000) -> list:
     while True:
         result = (
             client.table("ball_tracking_labels")
-            .select("source_video_filename")
+            .select("source_video_filename,notes")
             .range(start, start + page_size - 1)
             .execute()
         )
@@ -53,7 +53,15 @@ def _fetch_all_label_rows(client, page_size: int = 1000) -> list:
 
 def main():
     client = store.get_client()
-    rows = _fetch_all_label_rows(client)
+    all_rows = _fetch_all_label_rows(client)
+
+    # Rows whose notes start with "FLAGGED" are known-bad (see
+    # extract_circled_ball's false-positive-lock issue, found 2026-07-28) —
+    # excluded from the checkpoint count so it reflects usable data, not
+    # just raw row count. Still counted separately below so the flagged
+    # volume itself is visible, not silently dropped.
+    rows = [r for r in all_rows if not (r.get("notes") or "").startswith("FLAGGED")]
+    flagged_rows = [r for r in all_rows if r not in rows]
 
     total_frames = len(rows)
     distinct_clips = sorted(set(r["source_video_filename"] for r in rows))
@@ -64,6 +72,12 @@ def main():
     for name in distinct_clips:
         count = sum(1 for r in rows if r["source_video_filename"] == name)
         print(f"  - {name}: {count} frames")
+
+    if flagged_rows:
+        flagged_clips = sorted(set(r["source_video_filename"] for r in flagged_rows))
+        print(f"\nExcluded as flagged/unreliable: {len(flagged_rows)} frames across {len(flagged_clips)} clip(s):")
+        for name in flagged_clips:
+            print(f"  - {name}")
 
     print()
     if total_clips >= CLIP_CHECKPOINT or total_frames >= FRAME_CHECKPOINT:

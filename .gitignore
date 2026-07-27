@@ -45,3 +45,11 @@ Thumbs.db
 # MediaPipe pose model — auto-downloaded at runtime by main.py on first
 # use (see model_url), ~9MB binary that doesn't need to live in git
 models/
+
+# YOLO training artifacts: extracted video frames (real bowler footage),
+# trained weights, and downloaded pretrained checkpoints — all
+# regeneratable from Supabase + prepare_dataset.py, none of it belongs in
+# git (large binaries, and the frames are real footage of real people)
+ball_tracking/training/dataset/
+ball_tracking/training/runs/
+ball_tracking/training/*.pt
