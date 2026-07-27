@@ -27,10 +27,33 @@ CLIP_CHECKPOINT = 15
 FRAME_CHECKPOINT = 250
 
 
+def _fetch_all_label_rows(client, page_size: int = 1000) -> list:
+    """BUG FIX: an unpaginated select() silently truncates at Supabase's
+    default 1000-row response cap — verified directly once real row count
+    crossed 1000 (this table just did): the checkpoint report undercounted
+    by over 100 rows with no error at all, just a wrong-but-plausible-
+    looking number. Page through with .range() until a page comes back
+    short, same pattern already used in tools/export_training_data.py."""
+    rows = []
+    start = 0
+    while True:
+        result = (
+            client.table("ball_tracking_labels")
+            .select("source_video_filename")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        page = result.data or []
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        start += page_size
+    return rows
+
+
 def main():
     client = store.get_client()
-    result = client.table("ball_tracking_labels").select("source_video_filename").execute()
-    rows = result.data or []
+    rows = _fetch_all_label_rows(client)
 
     total_frames = len(rows)
     distinct_clips = sorted(set(r["source_video_filename"] for r in rows))
