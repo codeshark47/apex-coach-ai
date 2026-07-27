@@ -200,6 +200,13 @@ def render_annotated_video(video_path: str, output_path: str,
     # reading as scattered noise rather than a skeleton. A joint DOT
     # specifically needs a minimum area to read as a distinct point, so it
     # gets its own floor instead of sharing the bone-width scale-down.
+    #
+    # BASE RADIUS LOWERED (callers now pass 6/4, was 9/6): reported on
+    # real phone footage as visibly oversized dots relative to the body —
+    # not just the front-or-rear hero-joint clustering fixed separately,
+    # every joint read too large. ~33% smaller at the same render_scale;
+    # the floor below is unchanged so dots still can't shrink into
+    # invisibility on a wide/distant shot.
     def _rs_joint(px):
         return max(4, int(round(px * render_scale)))
 
@@ -269,7 +276,7 @@ def render_annotated_video(video_path: str, output_path: str,
     # just a different color — "thickness according to the angle": draws
     # the eye to whichever joint actually needs coaching attention instead
     # of every joint looking equally important.
-    _TIER_EXTRA_PX = {"green": 0, "amber": 2, "red": 4, "unknown": 0}
+    _TIER_EXTRA_PX = {"green": 0, "amber": 1, "red": 2, "unknown": 0}
 
     # COLOR/THICKNESS BY ANGLE: reuses metric_ranges.classify — the exact
     # same green/amber/red the dashboard and PDF report already use for
@@ -622,8 +629,8 @@ def render_annotated_video(video_path: str, output_path: str,
                     if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), spine_color, 3, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _rs_joint(9), JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _rs_joint(6), JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _rs_joint(6), JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _rs_joint(4), JOINT_CORE, -1, cv2.LINE_AA)
             except Exception:
                 pass
 
@@ -697,8 +704,8 @@ def render_annotated_video(video_path: str, output_path: str,
                     node_color = _hero_color if is_hero_node else JOINT_CORE
                     node_extra = _hero_node_size_extra if is_hero_node else 0
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), _rs_joint(9) + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), _rs_joint(6) + node_extra, node_color, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs_joint(6) + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _rs_joint(4) + node_extra, node_color, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
