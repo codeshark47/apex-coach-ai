@@ -158,41 +158,84 @@ def _extract_raw_wrist_window(video_path: str, wrist_name: str, br_idx: int,
 def _corroborated_peak_speed_px_s(positions: dict, fps: float) -> Optional[float]:
     """
     Peak frame-to-frame speed (px/s) from raw positions, rejecting
-    ISOLATED single-frame spikes that at least one adjacent frame-pair
-    doesn't corroborate. Verified on real footage this matters: raw
-    (unsmoothed) tracking during a fast, motion-blurred swing showed both
-    genuine sustained bursts (several consecutive frames all elevated)
-    AND isolated one-frame jumps that snapped straight back on the very
-    next frame — a classic signature of a tracking glitch, not real
-    motion. Trusting the single fastest raw frame without this check
-    would risk reporting a number built on a glitch, not a delivery.
+    tracking-glitch spikes that don't correspond to real, directed
+    motion. Verified on real footage this matters: raw (unsmoothed) wrist
+    tracking during a fast, motion-blurred swing shows both genuine
+    sustained bursts (several consecutive frames moving steadily in one
+    direction) AND isolated one-frame glitches where the tracked point
+    jumps away then snaps straight back on the very next frame.
+
+    TWO BUGS FIXED HERE, both found from one real reported case (a
+    correctly-calibrated setup still reporting ~600km/h — physically
+    impossible; fastest recorded deliveries are ~161km/h):
+
+    1. The corroboration test itself was wrong. A jump-then-snap-back
+       glitch produces TWO large, adjacent frame-to-frame speeds of
+       similar magnitude — the "out" hop and the "back" hop. The old
+       check only asked "is a neighboring hop's speed comparably large?"
+       — and two hops of a single glitch are, by construction, always
+       comparable in magnitude to EACH OTHER. So the exact glitch shape
+       this function's docstring describes was never actually caught.
+       Fixed with a physically-grounded test: pair each hop with an
+       adjacent one and compare NET displacement (straight-line, start
+       to end of the pair) against PATH length (sum of the two hops'
+       individual magnitudes). Real directed motion covers roughly as
+       much net ground as its path length suggests; an out-and-back
+       glitch's net displacement collapses toward zero while its path
+       length stays large — THAT mismatch is what actually identifies a
+       "snapped straight back" glitch. Verified directly: constructing
+       exactly this glitch shape, the old check kept it, this one
+       rejects it and correctly recovers the genuine (much slower)
+       background motion instead.
+
+    2. When NOTHING in the window is corroborated (a window that's pure
+       noise from end to end — exactly the case this function exists to
+       catch), the old code fell back to `max(speeds.values())`: the
+       single WORST, least-trustworthy reading in the entire window,
+       with zero filtering. That's backwards — total corroboration
+       failure is the strongest possible signal the data is unreliable,
+       so this returns None (a real "no reliable reading here" signal
+       the caller acts on) instead of silently handing back the exact
+       kind of glitch this check was built to reject.
     """
     frames = sorted(positions.keys())
-    speeds = {}
+    hops = {}
     for i in range(len(frames) - 1):
         f0, f1 = frames[i], frames[i + 1]
         if f1 - f0 != 1:
             continue
         x0, y0, _ = positions[f0]
         x1, y1, _ = positions[f1]
-        speeds[f0] = math.hypot(x1 - x0, y1 - y0) * fps
+        hops[f0] = (x1 - x0, y1 - y0)
 
-    if not speeds:
+    if not hops:
         return None
 
-    keys = sorted(speeds.keys())
+    speeds = {k: math.hypot(*v) * fps for k, v in hops.items()}
     CORROBORATION_FRACTION = 0.5
+
+    def _is_directed_pair(k_a: int, k_b: int) -> bool:
+        """k_a, k_b are adjacent hop-start frames with k_b == k_a + 1,
+        together covering a contiguous 3-frame span."""
+        dxa, dya = hops[k_a]
+        dxb, dyb = hops[k_b]
+        path = math.hypot(dxa, dya) + math.hypot(dxb, dyb)
+        if path == 0:
+            return True
+        net = math.hypot(dxa + dxb, dya + dyb)
+        return net >= CORROBORATION_FRACTION * path
+
     corroborated = []
-    for i, k in enumerate(keys):
-        neighbors = []
-        if i > 0:
-            neighbors.append(speeds[keys[i - 1]])
-        if i < len(keys) - 1:
-            neighbors.append(speeds[keys[i + 1]])
-        if any(n >= speeds[k] * CORROBORATION_FRACTION for n in neighbors):
+    for k in hops:
+        neighbors = [k2 for k2 in (k - 1, k + 1) if k2 in hops]
+        is_corroborated = any(
+            speeds[k2] >= CORROBORATION_FRACTION * speeds[k] and _is_directed_pair(*sorted((k, k2)))
+            for k2 in neighbors
+        )
+        if is_corroborated:
             corroborated.append(speeds[k])
 
-    return max(corroborated) if corroborated else max(speeds.values())
+    return max(corroborated) if corroborated else None
 
 
 def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
@@ -260,17 +303,33 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
                 peak_px_per_s = None
 
         if peak_px_per_s is None:
+            # BUG FIX: this fallback used to take a raw, unprotected max()
+            # over every frame-to-frame speed in the window — exactly the
+            # same "trust the single worst reading" mistake fixed in
+            # _corroborated_peak_speed_px_s above, just on smoothed data
+            # instead of raw. Smoothing alone doesn't reliably prevent a
+            # spurious spike (a 5-frame rolling mean still passes through
+            # a large chunk of a genuine one-frame tracking glitch), so
+            # this path gets the identical corroboration check.
             x, y = _wrist_pixel_series(df, bowling_arm, frame_width, frame_height)
             lo = max(0, br_idx - window)
             hi = min(len(df) - 1, br_idx + window)
             if hi - lo < 2:
                 return {"status": "error", "message": "Insufficient frames around BR for a velocity estimate."}
-            dt_frame = 1.0 / fps
-            frame_speeds_px_s = []
-            for i in range(lo, hi):
-                d = math.hypot(x[i + 1] - x[i], y[i + 1] - y[i])
-                frame_speeds_px_s.append(d / dt_frame)
-            peak_px_per_s = max(frame_speeds_px_s)
+            positions = {i: (x[i], y[i], None) for i in range(lo, hi + 1)}
+            peak_px_per_s = _corroborated_peak_speed_px_s(positions, fps)
+
+        if peak_px_per_s is None:
+            return {
+                "status": "error",
+                "message": (
+                    "Tracking around release was too unstable for a reliable "
+                    "speed estimate — no consistent frame-to-frame motion was "
+                    "found (common with heavy motion blur right at release). "
+                    "Double-check the confirmed release point, or re-shoot at "
+                    "a higher shutter speed / frame rate if possible."
+                ),
+            }
 
         mps = peak_px_per_s * meters_per_pixel
         kmh = mps * 3.6
