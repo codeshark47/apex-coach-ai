@@ -233,10 +233,23 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     click_widget_key = (
         f"{key_prefix}_zoomclick_widget_{crop_x0}_{crop_y0}_{crop_w}_{crop_h}_{click_gen}"
     )
+    # BUG FIX (reported directly: the image "wouldn't load" until zoomed in
+    # and back out): streamlit_image_coordinates defaults to PNG with ZERO
+    # compression for any PIL image passed in. Verified directly — a
+    # realistic 960x540 photographic frame (post the MAX_DISPLAY_DIM
+    # downscale above) serializes to ~2MB of base64 text as PNG regardless
+    # of compress_level (photographic noise doesn't deflate well), versus
+    # ~375KB as JPEG at quality=80 — a >5x smaller payload stuffed into a
+    # single WebSocket message on every render. That gap, not the pixel
+    # count, is what stalled the first paint until zooming forced a
+    # smaller (cropped) image through. No precision is lost by this — the
+    # click-to-pixel math only depends on displayed dimensions, never on
+    # image encoding quality.
     with _framed_image_container():
         click = streamlit_image_coordinates(
             display_img, key=click_widget_key,
-            use_column_width="always"
+            use_column_width="always",
+            image_format="JPEG", jpeg_quality=80,
         )
 
     if click is None:
@@ -978,6 +991,9 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
                         st.session_state.calibration = calibration
                         st.session_state.calib_points = []
                         st.success(f"Calibrated: {calibration.meters_per_pixel:.6f} m/px")
+                        warning = cal.implausibility_warning(calibration, pil_img.width)
+                        if warning:
+                            st.warning(warning)
                     except ValueError as e:
                         st.error(str(e))
         else:

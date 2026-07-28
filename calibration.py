@@ -23,6 +23,7 @@ delivery.
 import math
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import streamlit as st
@@ -171,4 +172,41 @@ def compute_scale(point_a_px, point_b_px, real_world_distance_m: float,
         reference_distance_m=real_world_distance_m,
         point_a_px=tuple(point_a_px),
         point_b_px=tuple(point_b_px),
+    )
+
+
+def implausibility_warning(calibration: Calibration, frame_width_px: int) -> Optional[str]:
+    """
+    Real coach-reported bug: a "popping crease to popping crease" (20.12m)
+    calibration came out to 0.457 m/px, which back-calculates to the two
+    clicked points being only ~44px apart in the frame — nowhere near
+    "full pitch in frame" as that preset promises (almost certainly one
+    or both clicks landed on the wrong thing, or the reference wasn't
+    fully in frame).
+
+    compute_scale itself can't catch this — it has no idea what the two
+    points were SUPPOSED to be, only the distance actually clicked. This
+    only flags the specific pattern of a genuinely LONG real-world
+    distance (>= 2m, which rules out legitimate close-up single-stump
+    shots) mapped to a suspiciously SHORT pixel span (< 15% of the frame
+    width — a genuine "full pitch in frame" shot should span most of the
+    frame, comfortably above this) — advisory only, since an unusual but
+    correct camera setup is still possible. Returns a warning string, or
+    None if it looks fine. Verified directly against the reported case:
+    20.12m mapped to a 44px span is ~5% of a typical 848px-wide frame,
+    well under this threshold.
+    """
+    if calibration.reference_distance_m < 2.0:
+        return None
+    implied_dist_px = calibration.reference_distance_m / calibration.meters_per_pixel
+    if implied_dist_px >= 0.15 * frame_width_px:
+        return None
+    return (
+        f"⚠️ Your two clicked points are only ~{implied_dist_px:.0f}px apart in a "
+        f"{frame_width_px}px-wide frame, but you entered "
+        f"{calibration.reference_distance_m}m of real-world distance — that's an "
+        f"unusually large scale. This usually means the two points weren't actually "
+        f"on opposite ends of the reference (e.g. both stumps sets not both clearly "
+        f"in frame, or a misclick). Reset points above and try again, zooming in for "
+        f"precision on each click, before trusting this calibration for speed."
     )
