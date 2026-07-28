@@ -166,14 +166,26 @@ def render_annotated_video(video_path: str, output_path: str,
     # UNIFIED BROADCAST PALETTE: one clean look across the whole skeleton
     # (was: green legs, white upper body, orange joints — a color-by-limb
     # scheme with no real informational purpose that read as a debug
-    # overlay rather than a broadcast graphic). Matches a commercial
-    # reference sample: bold white bones with a soft dark contact-shadow
-    # for legibility on any background, and cyan joints with a white
-    # outline ring so they read as clean dots rather than tiny smudges.
+    # overlay rather than a broadcast graphic).
+    #
+    # RECOLORED to match a coach-supplied reference image directly (teal
+    # bones, a bronze/copper joint ring around a white center) instead of
+    # the earlier white-bones/white-ring look — bones now share the same
+    # cyan/teal accent already used elsewhere in this overlay (the chart
+    # line, timeline ticks, event badges), so the whole graphic reads as
+    # one cohesive palette rather than two different looks bolted
+    # together. The dark contact-shadow behind every bone (for legibility
+    # against any background, including a bright sky) is unchanged.
     BONE_SHADOW = (25, 25, 25)
-    BONE_CORE = (245, 245, 245)
-    JOINT_OUTLINE = (255, 255, 255)
+    BONE_CORE = (235, 195, 50)
+    JOINT_OUTLINE = (90, 140, 200)
     JOINT_CORE = (235, 195, 50)
+    # Default (non-hero) joint CENTER fill — separate from JOINT_CORE
+    # specifically because JOINT_CORE is also reused for unrelated chrome
+    # (chart line, ticks, badges) that this reference gives no guidance
+    # on and isn't meant to change; only the skeleton's own joint centers
+    # move to white to match the reference.
+    JOINT_FILL = (255, 255, 255)
 
     # SUBJECT-SIZE SCALE: every fixed pixel size below (joint radius, bone
     # width) was tuned against a 1080x1920 test clip. A prior fix scaled
@@ -658,7 +670,7 @@ def render_annotated_video(video_path: str, output_path: str,
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), spine_color, 3, cv2.LINE_AA)
                         _core_r, _outline_r = _rs_joint()
                         cv2.circle(frame, (sx1, sy1), _outline_r, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _core_r, JOINT_CORE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _core_r, JOINT_FILL, -1, cv2.LINE_AA)
             except Exception:
                 pass
 
@@ -729,7 +741,7 @@ def render_annotated_video(video_path: str, output_path: str,
                     nx = int(float(row[f"{node}_x"]) * width)
                     ny = int(float(row[f"{node}_y"]) * height)
                     is_hero_node = node in _hero_joint_nodes
-                    node_color = _hero_color if is_hero_node else JOINT_CORE
+                    node_color = _hero_color if is_hero_node else JOINT_FILL
                     node_extra = _hero_node_size_extra if is_hero_node else 0
                     if 0 < nx < width and 0 < ny < height:
                         _core_r, _outline_r = _rs_joint()
