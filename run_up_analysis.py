@@ -34,7 +34,6 @@ Three things this produces, each with an explicit honesty boundary:
 """
 
 import math
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -103,7 +102,20 @@ def _detect_contacts_for_foot(y_series: np.ndarray, fps: float,
     if n < 5:
         return []
 
-    window = max(2, int(fps * 0.05))
+    # BUG FIX: was max(2, int(fps * 0.05)) — at every real frame rate this
+    # app has ever actually seen (25fps, 27fps, 30fps), fps*0.05 rounds
+    # down to 0 or 1, so this was ALWAYS floored to 2. Verified directly:
+    # a window of 2 finds ZERO peaks even on a perfectly clean, noise-free
+    # synthetic stride signal (sine wave, unambiguous 6 real peaks) — near
+    # a true peak a curve is locally flat, so a point only 2 frames away
+    # is barely lower than the peak itself, and doesn't clear the
+    # prominence margin below. A window of 3 correctly finds all 6 peaks
+    # on that same synthetic signal with no false positives. This is very
+    # likely why run-up analysis has looked broken on real footage — not
+    # occasionally, but on nearly every clip, since real footage is
+    # almost always in the 25-30fps range where this was silently
+    # guaranteed to floor to the too-small value.
+    window = max(3, int(fps * 0.05))
     min_sep_frames = max(1, int(fps * min_separation_s))
 
     # Minimum prominence: peak must rise above its window edges by at
