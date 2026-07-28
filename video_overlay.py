@@ -219,24 +219,23 @@ def render_annotated_video(video_path: str, output_path: str,
     # scheme with no real informational purpose that read as a debug
     # overlay rather than a broadcast graphic).
     #
-    # RECOLORED to match a coach-supplied reference image directly (teal
-    # bones, a bronze/copper joint ring around a white center) instead of
-    # the earlier white-bones/white-ring look — bones now share the same
-    # cyan/teal accent already used elsewhere in this overlay (the chart
-    # line, timeline ticks, event badges), so the whole graphic reads as
-    # one cohesive palette rather than two different looks bolted
-    # together. The dark contact-shadow behind every bone (for legibility
-    # against any background, including a bright sky) is unchanged.
+    # RECOLORED to the coach's own exact spec (hex/RGB converted to OpenCV
+    # BGR by the coach directly): #2C657B bones, a #BB9792 copper joint
+    # ring around a #FDFEFD white center. Bones are now their own distinct
+    # tone rather than reusing the JOINT_CORE chart accent — the coach's
+    # palette treats bones and the chart/ticks/badge accent as separate
+    # colors, unlike the previous "share one cyan for everything" design.
+    # The dark contact-shadow behind every bone (for legibility against
+    # any background, including a bright sky) is unchanged.
     BONE_SHADOW = (25, 25, 25)
-    BONE_CORE = (235, 195, 50)
-    JOINT_OUTLINE = (90, 140, 200)
+    BONE_CORE = (123, 101, 44)
+    JOINT_OUTLINE = (146, 151, 187)
     JOINT_CORE = (235, 195, 50)
     # Default (non-hero) joint CENTER fill — separate from JOINT_CORE
     # specifically because JOINT_CORE is also reused for unrelated chrome
-    # (chart line, ticks, badges) that this reference gives no guidance
-    # on and isn't meant to change; only the skeleton's own joint centers
-    # move to white to match the reference.
-    JOINT_FILL = (255, 255, 255)
+    # (chart line, ticks, badges) the coach's color spec doesn't cover;
+    # only the skeleton's own joint centers use the new white.
+    JOINT_FILL = (253, 254, 253)
 
     # SUBJECT-SIZE SCALE: every fixed pixel size below (joint radius, bone
     # width) was tuned against a 1080x1920 test clip. A prior fix scaled
@@ -342,6 +341,32 @@ def render_annotated_video(video_path: str, output_path: str,
     joint_nodes = ["LEFT_KNEE", "RIGHT_KNEE", "LEFT_HIP", "RIGHT_HIP",
                    "LEFT_WRIST", "RIGHT_WRIST", "LEFT_ANKLE", "RIGHT_ANKLE",
                    "LEFT_SHOULDER", "RIGHT_SHOULDER", "NOSE"]
+    _arm_fallback_triples = [
+        ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
+        ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
+    ]
+
+    # SIDE-ON ONLY: don't draw the non-bowling arm at all. Real,
+    # coach-reported bug: side-on filming is done from the bowling-arm
+    # side specifically so THAT arm's full swing is visible — which means
+    # the OTHER arm is largely hidden behind the torso from the camera's
+    # own perspective. MediaPipe still outputs a "best guess" position for
+    # an arm it can't actually see, and that guess is unreliable. Verified
+    # directly on a real release frame: the visible (bowling) arm tracked
+    # correctly, high and extended, while the hidden arm's guessed elbow
+    # bent to a position matching nothing actually visible in the shot —
+    # reading as a phantom "third arm" with a bend that was never really
+    # there. Front/rear view is unaffected: both arms are genuinely
+    # visible side by side from that angle, so both stay drawn.
+    if camera_angle == "side_on":
+        _hidden_arm_side = "RIGHT" if bowling_arm == "left" else "LEFT"
+        _hidden_arm_bones = {
+            (f"{_hidden_arm_side}_SHOULDER", f"{_hidden_arm_side}_ELBOW"),
+            (f"{_hidden_arm_side}_ELBOW", f"{_hidden_arm_side}_WRIST"),
+        }
+        connections = [c for c in connections if c not in _hidden_arm_bones]
+        joint_nodes = [n for n in joint_nodes if n != f"{_hidden_arm_side}_WRIST"]
+        _arm_fallback_triples = [t for t in _arm_fallback_triples if not t[0].startswith(_hidden_arm_side)]
 
     total_frames = int(df["frame"].max()) + 1 if len(df) else 0
 
@@ -748,10 +773,7 @@ def render_annotated_video(video_path: str, output_path: str,
                 # specific case keeps every visible joint attached to the
                 # skeleton — straight instead of bent, which is honest (no real
                 # elbow position is invented) rather than fabricated.
-                for shoulder, elbow, wrist in (
-                    ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
-                    ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
-                ):
+                for shoulder, elbow, wrist in _arm_fallback_triples:
                     try:
                         if pd.isna(row[f"{elbow}_x"]) and not pd.isna(row[f"{shoulder}_x"]) and not pd.isna(row[f"{wrist}_x"]):
                             xA = int(float(row[f"{shoulder}_x"]) * width)
