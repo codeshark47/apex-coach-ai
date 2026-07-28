@@ -1061,7 +1061,7 @@ else:
     uploaded_rear = st.sidebar.file_uploader("📹 Rear-View Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="rear")
 
 
-def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
+def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: str = None):
     """
     One-time-per-video step: save the upload, show a scrubbable reference
     frame, and have the coach click directly on the bowler. Returns
@@ -1072,29 +1072,60 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str):
     automatic guess, the coach tells the app who to track, once, and
     main.py's seeded tracker just follows whoever's torso stays closest
     to that identity frame to frame.
+
+    save_key: the STREAM identifier ("single"/"side"/"rear") the on-disk
+    reference copy is saved under — defaults to key_prefix, which is
+    correct for the primary seed call. BUG FIX (reported directly as a
+    real, noticeable loading delay between seed-confirmation steps):
+    render_extra_seed_ui calls this once per extra slot with a DIFFERENT
+    key_prefix each time (…_extra0, _extra1, _extra2), and every one of
+    those was writing its OWN full copy of the SAME uploaded video to
+    disk — up to 4 byte-for-byte-identical copies of a possibly
+    multi-MB file, purely from opening a slot that hadn't even been
+    clicked in yet. Passing the stream's real save_key here means every
+    slot for the same video reads/writes exactly one shared file, while
+    each slot still keeps its OWN independent click/point state via
+    key_prefix — reset in slot 2 can never affect slot 3's marker.
     """
     if uploaded_file is None:
         return None, 0
 
+    save_key = save_key or key_prefix
     file_identity = f"{uploaded_file.name}_{uploaded_file.size}"
     point_key = f"{key_prefix}_seed_point"
     frame_key = f"{key_prefix}_seed_frame"
     identity_key = f"{key_prefix}_seed_identity"
-    ref_path_key = f"{key_prefix}_seed_ref_path"
+    shared_ref_identity_key = f"_{save_key}_shared_seed_ref_identity"
+    # Deliberately the SAME name the old key_prefix-scoped version used
+    # (e.g. "single_seed_ref_path") — several places further down the
+    # file read this directly by that exact string (single_ref_path,
+    # side_ref_path, rear_ref_path), all keyed only by the stream's
+    # save_key, never by an extra-seed slot's key_prefix. Keeping the
+    # identical name here means every one of those call sites keeps
+    # working with zero changes, instead of silently reading a stale/
+    # missing key the moment this got scoped to save_key.
+    shared_ref_path_key = f"{save_key}_seed_ref_path"
 
-    if st.session_state.get(identity_key) != file_identity:
-        # New file uploaded (or first time) — reset any prior click and
-        # cache a temp copy on disk so we can pull reference frames from it.
+    if st.session_state.get(shared_ref_identity_key) != file_identity:
+        # New file uploaded (or first time this save_key has seen it) —
+        # cache ONE temp copy on disk, shared by every seed slot for this
+        # same stream, so we can pull reference frames from it.
         os.makedirs("input", exist_ok=True)
-        ref_path = os.path.abspath(os.path.join("input", f"_seed_ref_{key_prefix}_{uploaded_file.name}"))
+        ref_path = os.path.abspath(os.path.join("input", f"_seed_ref_{save_key}_{uploaded_file.name}"))
         with open(ref_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
+        st.session_state[shared_ref_identity_key] = file_identity
+        st.session_state[shared_ref_path_key] = ref_path
+
+    if st.session_state.get(identity_key) != file_identity:
+        # Still per-slot: a genuinely new file must reset THIS slot's own
+        # click state, independent of whether the shared copy above was
+        # just (re)written or already existed from an earlier slot.
         st.session_state[identity_key] = file_identity
-        st.session_state[ref_path_key] = ref_path
         st.session_state[point_key] = None
         st.session_state[frame_key] = 0
 
-    ref_path = st.session_state[ref_path_key]
+    ref_path = st.session_state[shared_ref_path_key]
     total_frames = cal.get_frame_count(ref_path)
 
     # Rendered in the MAIN content area (not the sidebar) — the sidebar is
@@ -1210,7 +1241,8 @@ def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
                 "confirmation above, just at a different point in the clip."
             )
             point, frame_idx = render_bowler_seed_ui(uploaded_file, f"{key_prefix}_extra{i}",
-                                                       f"{label} — {ordinal} confirmation")
+                                                       f"{label} — {ordinal} confirmation",
+                                                       save_key=key_prefix)
             if point is not None:
                 extra_seeds.append((frame_idx, point))
         # Reveal the NEXT slot only once this one is actually filled in —
@@ -1219,6 +1251,45 @@ def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
         if point is None:
             break
     return extra_seeds if extra_seeds else None
+
+
+def seeds_ready_for_extraction(key_prefix: str, seed_point, seed_frame, extra_seeds: list) -> bool:
+    """
+    Gates the expensive extraction/event-detection stage behind an
+    explicit "done adding seeds" confirmation, but ONLY once a coach has
+    started adding extra confirmations — reported directly: adding an
+    extra seed kicked off a visible re-extraction ("loading"), and Ball
+    Release Frame (and the rest) confirmed further down the page would
+    silently change value while the coach was still deciding whether to
+    add another seed, before they'd even reached that section. A single
+    seed (the common case, no reported problem) is untouched — this
+    only activates once extra_seeds is non-empty, exactly the point
+    where the previous behavior became reactive and confusing.
+
+    Returns True when it's safe to proceed with (seed_point, seed_frame,
+    extra_seeds) exactly as currently set — either because there are no
+    extra seeds to wait on, or because the coach explicitly confirmed
+    this exact seed set is final. Returns False (and renders a
+    "Continue" button) while still waiting on that confirmation — the
+    caller should skip extraction/downstream UI entirely in that case.
+    """
+    if not extra_seeds:
+        return True
+
+    pending_identity = f"{seed_point}_{seed_frame}_{extra_seeds}"
+    locked_key = f"_{key_prefix}_seeds_locked_identity"
+    if st.session_state.get(locked_key) == pending_identity:
+        return True
+
+    st.info(
+        "📍 Add another confirmation above if tracking still needs it, or continue "
+        "below when you're done — this waits for you to finish instead of "
+        "re-running tracking after every single confirmation."
+    )
+    if st.button("✅ Done adding tracking confirmations — continue", key=f"{key_prefix}_seeds_continue"):
+        st.session_state[locked_key] = pending_identity
+        st.rerun()
+    return False
 
 
 single_seed_point, single_seed_frame = (None, 0)
@@ -1247,7 +1318,8 @@ else:
 confirmed_angle_functional = None   # "side_on" | "front_or_rear" — feeds the actual computation
 confirmed_angle_label = None        # "side_on" | "front" | "rear" | "unknown" — for captions + logging
 
-if camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None:
+if (camera_mode == "Single Camera" and uploaded_single is not None and single_seed_point is not None
+        and seeds_ready_for_extraction("single", single_seed_point, single_seed_frame, single_extra_seeds)):
     single_ref_path = st.session_state.get("single_seed_ref_path")
     # Includes bowling-arm, seed choices, AND the sidebar angle override —
     # any of these changing (coach corrects the arm, adds a second seed,
@@ -1588,8 +1660,17 @@ rear_stage12_result = None
 side_confirmed_events = None
 rear_confirmed_events = None
 
+# Evaluated as two separate statements, NOT chained with `and` in the
+# if-condition below — Python's and short-circuits, which would mean
+# the rear stream's own "done adding seeds?" prompt never even renders
+# whenever the side stream still has one pending. Each stream needs its
+# continue-button shown independently of the other's state.
+side_seeds_ready = seeds_ready_for_extraction("side", side_seed_point, side_seed_frame, side_extra_seeds)
+rear_seeds_ready = seeds_ready_for_extraction("rear", rear_seed_point, rear_seed_frame, rear_extra_seeds)
+
 if (camera_mode != "Single Camera" and uploaded_side is not None and uploaded_rear is not None
-        and side_seed_point is not None and rear_seed_point is not None):
+        and side_seed_point is not None and rear_seed_point is not None
+        and side_seeds_ready and rear_seeds_ready):
     side_ref_path = st.session_state.get("side_seed_ref_path")
     rear_ref_path = st.session_state.get("rear_seed_ref_path")
 
