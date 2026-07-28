@@ -1981,7 +1981,12 @@ if st.session_state.get("pending_result_payload") is not None:
                     st.warning(f"Speed estimate unavailable: {speed_result['message']}")
 
             st.divider()
-            with st.expander("🏃 Run-Up Analysis", expanded=False):
+            # Expanded by default — was collapsed, which combined with the
+            # peak-detection bug (see run_up_analysis.py) to make this
+            # section effectively invisible even after the underlying data
+            # started working. A coach shouldn't have to know to click
+            # into a collapsed section to find out this feature exists.
+            with st.expander("🏃 Run-Up Analysis", expanded=True):
                 if run_up_result is None:
                     st.info("Run-up data unavailable — landmark file not found.")
                 elif run_up_result["status"] != "success":
