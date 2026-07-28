@@ -915,6 +915,27 @@ def transcode_to_h264(input_path: str) -> str:
     return input_path
 
 
+def landmarks_csv_path(camera_mode: str, output_dir: str = "output") -> str:
+    """
+    Single source of truth for where each pipeline's per-frame landmark
+    CSV lives, so downstream readers can't drift out of sync with what
+    each orchestrator actually writes.
+
+    BUG FIX (found during a broader audit): streamlit_app.py's Speed
+    Estimation / Run-Up Analysis section hardcoded "landmarks.csv" for
+    BOTH Single and Dual Camera results, but dual_camera_orchestrator.py
+    has always written "landmarks_side.csv"/"landmarks_rear.csv" instead
+    — it never writes "landmarks.csv" at all. In Dual Camera mode this
+    meant Speed/Run-Up either silently vanished entirely (the file never
+    existed) or, worse, silently read a STALE "landmarks.csv" left over
+    from an earlier Single Camera run in the same running app instance —
+    computing Dual Camera's speed/run-up numbers from a completely
+    different, unrelated delivery's tracking data with no warning at all.
+    """
+    filename = "landmarks_side.csv" if camera_mode == "Dual Camera" else "landmarks.csv"
+    return os.path.join(output_dir, filename)
+
+
 def extract_and_detect_events(video_path: str,
                                output_dir: str = "output",
                                bowling_arm_override: str = None,

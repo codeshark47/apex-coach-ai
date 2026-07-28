@@ -269,7 +269,21 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                 "value": clean_numeric(head_stability.get("deviation_index") or head_stability.get("value")),
                 "tier": head_stability.get("tier", "Unknown"),
                 "status": head_stability.get("status", "error")
-            }
+            },
+            # BUG FIX (found during a broader audit): this used to only
+            # exist at the TOP level of this return dict. Single Camera's
+            # equivalent (orchestrator.py's run_complete_bowling_analysis)
+            # nests it HERE, inside biomechanical_metrics — and
+            # streamlit_app.py reads it via metrics.get("bowling_arm_detected")
+            # where metrics IS biomechanical_metrics. For Dual Camera that
+            # always silently returned None, meaning: (a) speed estimation
+            # never received the already-confirmed bowling arm and fell
+            # back to its own internal auto-detection instead — able to
+            # disagree with the arm the rest of the report is built on —
+            # and (b) the "Bowling arm (auto-detected/manually selected)"
+            # caption never displayed at all. Kept at the top level too,
+            # for anything else that might read it from there.
+            "bowling_arm_detected": bowling_arm,
         },
         "annotated_video_output": web_safe_video,
         "rear_annotated_video_output": rear_web_safe_video

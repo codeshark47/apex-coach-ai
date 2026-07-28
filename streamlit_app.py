@@ -29,7 +29,6 @@ import profile_store as store
 import data_quality as dq
 import run_up_analysis as rua
 import click_widget_state
-import camera_angle_detection as cad
 
 
 def _render_frame_jump_box(slider_key: str, min_value: int, max_value: int):
@@ -2032,7 +2031,7 @@ if st.session_state.get("pending_result_payload") is not None:
             # --- SPEED (only if calibrated) ---
             speed_result = None
             height_absolute_result = None
-            landmarks_csv = os.path.join("output", "landmarks.csv")
+            landmarks_csv = o.landmarks_csv_path(active_camera_mode)
             if os.path.exists(landmarks_csv):
                 landmarks_df = pd.read_csv(landmarks_csv)
                 cap_w, cap_h = 1920, 1080  # overwritten below if we can read real dims

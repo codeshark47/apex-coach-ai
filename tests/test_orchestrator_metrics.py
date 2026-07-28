@@ -22,6 +22,8 @@ confirmed bugs found on real footage this session:
     searching further out for a frame that was actually usable.
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -186,3 +188,24 @@ class TestFindGroundedReferenceNear:
         ])
         ref = o._find_grounded_reference_near(df, frame_idx=10, bowling_arm="right", max_search=3)
         assert ref is None
+
+
+class TestLandmarksCsvPath:
+    """Regression test for a real bug found during a broader audit:
+    streamlit_app.py hardcoded "output/landmarks.csv" for Speed
+    Estimation / Run-Up Analysis regardless of camera mode, but Dual
+    Camera's pipeline never writes that file — only
+    "landmarks_side.csv"/"landmarks_rear.csv". This either silently hid
+    Speed/Run-Up entirely in Dual Camera mode, or worse, silently read a
+    STALE landmarks.csv left over from an earlier Single Camera run in
+    the same session — computing Dual Camera's numbers from a
+    completely different, unrelated delivery."""
+
+    def test_dual_camera_uses_the_side_stream_csv(self):
+        assert o.landmarks_csv_path("Dual Camera") == os.path.join("output", "landmarks_side.csv")
+
+    def test_single_camera_uses_the_single_stream_csv(self):
+        assert o.landmarks_csv_path("Single Camera") == os.path.join("output", "landmarks.csv")
+
+    def test_respects_a_custom_output_dir(self):
+        assert o.landmarks_csv_path("Dual Camera", output_dir="tmp_out") == os.path.join("tmp_out", "landmarks_side.csv")
