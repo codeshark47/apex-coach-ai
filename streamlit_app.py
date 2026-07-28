@@ -28,6 +28,7 @@ import calibration as cal
 import profile_store as store
 import data_quality as dq
 import run_up_analysis as rua
+import click_widget_state
 import camera_angle_detection as cad
 
 
@@ -212,7 +213,26 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     # jump box above) forces a genuinely new widget instance whenever the
     # displayed image changes, so a click can never be misattributed to
     # the wrong crop.
-    click_widget_key = f"{key_prefix}_zoomclick_widget_{crop_x0}_{crop_y0}_{crop_w}_{crop_h}"
+    #
+    # SECOND BUG FIX (reported directly: "reset" doesn't reset; a
+    # misclicked point stays forever no matter what): at the DEFAULT zoom
+    # level (1x, no zoom — every call site's starting state, and where
+    # calibration stays permanently since it never enables zoom at all),
+    # crop_w/crop_h always equal the full image size, so crop_x0/crop_y0
+    # are ALWAYS (0, 0) regardless of marker_point or extra_markers — the
+    # key above never changes when a point is added, moved, or cleared.
+    # Streamlit then replays the component's last-known click value on
+    # every rerun a "Reset" button causes, which immediately re-appends
+    # the very point that was just supposedly cleared. See
+    # click_widget_state.py's docstring for the full reasoning — pulled
+    # out to its own module since streamlit_app.py can't be imported in
+    # a test (it runs UI code at import time).
+    click_gen = click_widget_state.next_click_generation(
+        st.session_state, key_prefix, marker_point, extra_markers
+    )
+    click_widget_key = (
+        f"{key_prefix}_zoomclick_widget_{crop_x0}_{crop_y0}_{crop_w}_{crop_h}_{click_gen}"
+    )
     with _framed_image_container():
         click = streamlit_image_coordinates(
             display_img, key=click_widget_key,
