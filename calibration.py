@@ -120,7 +120,15 @@ def extract_reference_frame(video_path: str, frame_index: int = 0):
     return _extract_reference_frame_cached(video_path, frame_index, _file_signature(video_path))
 
 
-@st.cache_data(show_spinner=False)
+# BUG FIX: this cache had no eviction policy at all — Streamlit Cloud runs
+# ONE shared process for every visitor (not one per coach), so every
+# distinct frame anyone ever scrubbed to, on any video, since the last
+# reboot stayed resident forever as a multi-MB decoded array. Confirmed
+# directly: the live app hit Streamlit Cloud's "gone over its resource
+# limits" memory cap during ordinary testing. max_entries/ttl bound the
+# worst case (~30 frames x a few MB each) while still keeping the whole
+# point of this cache — instant re-clicks within one coach's own session.
+@st.cache_data(show_spinner=False, max_entries=30, ttl=1800)
 def _extract_reference_frame_cached(video_path: str, frame_index: int, file_mtime: float):
     # file_mtime must NOT start with an underscore — see the identical note
     # in _get_frame_count_cached above for why.
