@@ -23,6 +23,8 @@ can never collapse into the core, and the whole marker keeps shrinking
 with distance instead of hitting the old floor's wall.
 """
 
+import pandas as pd
+
 import video_overlay as vo
 
 
@@ -65,3 +67,50 @@ class TestJointMarkerRadii:
         core_r, outline_r = vo.joint_marker_radii(4, render_scale=0.65)
         node_extra = 3
         assert (outline_r + node_extra) > (core_r + node_extra)
+
+
+def _torso_row(shoulder_w, hip_w, torso_h, shoulder_y=0.3, hip_y=None):
+    """A minimal row with just the 8 landmark columns
+    torso_shape_is_plausible needs, laid out so shoulder/hip width and
+    torso height come out to the requested normalized (0-1) values."""
+    if hip_y is None:
+        hip_y = shoulder_y + torso_h
+    return pd.Series({
+        "LEFT_SHOULDER_x": 0.5 - shoulder_w / 2, "LEFT_SHOULDER_y": shoulder_y,
+        "RIGHT_SHOULDER_x": 0.5 + shoulder_w / 2, "RIGHT_SHOULDER_y": shoulder_y,
+        "LEFT_HIP_x": 0.5 - hip_w / 2, "LEFT_HIP_y": hip_y,
+        "RIGHT_HIP_x": 0.5 + hip_w / 2, "RIGHT_HIP_y": hip_y,
+    })
+
+
+class TestTorsoShapeIsPlausible:
+    """Regression test for a real bug found from a coach-downloaded
+    rear-view clip: a bowler bending over to pick up the ball (small,
+    distant, a hard case for pose estimation) produced a MediaPipe
+    reading with shoulders/hips splayed nearly 3x wider than the torso
+    is tall — drawn as-is, with no plausibility check at all, as a
+    bizarre "tent/spider" shape instead of a body."""
+
+    def test_normal_standing_pose_is_plausible(self):
+        row = _torso_row(shoulder_w=0.15, hip_w=0.12, torso_h=0.2)
+        assert vo.torso_shape_is_plausible(row) is True
+
+    def test_real_reported_case_is_rejected(self):
+        """The exact regression: shoulders/hips ~3x the torso height —
+        physically impossible for any human pose."""
+        row = _torso_row(shoulder_w=0.45, hip_w=0.45, torso_h=0.15)
+        assert vo.torso_shape_is_plausible(row) is False
+
+    def test_bent_over_but_still_human_pose_is_plausible(self):
+        """A real bent-over pose compresses torso height without
+        blowing shoulder/hip width out sideways — must not be rejected
+        just for being bent over."""
+        row = _torso_row(shoulder_w=0.14, hip_w=0.11, torso_h=0.09)
+        assert vo.torso_shape_is_plausible(row) is True
+
+    def test_missing_landmarks_default_to_plausible(self):
+        """Not enough data to judge either way — must not become a new
+        reason frames go missing beyond the specific failure this
+        guards against."""
+        row = pd.Series({"LEFT_SHOULDER_x": 0.4, "LEFT_SHOULDER_y": 0.3})
+        assert vo.torso_shape_is_plausible(row) is True

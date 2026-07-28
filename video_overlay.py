@@ -21,6 +21,7 @@ rear-view footage) except for two explicitly-scoped additions:
      unified palette below.
 """
 
+import math
 import os
 
 import cv2
@@ -63,6 +64,56 @@ def joint_marker_radii(base_core_px: int, render_scale: float,
     core_r = max(core_floor_px, int(round(base_core_px * render_scale)))
     gap = max(1, int(round(ring_gap_px * render_scale)))
     return core_r, core_r + gap
+
+
+def torso_shape_is_plausible(row, max_width_to_height_ratio: float = 1.8) -> bool:
+    """
+    Sanity-checks ONE frame's shoulder/hip landmarks before a skeleton is
+    drawn from them. Verified on a real coach-downloaded rear-view clip:
+    a bowler bending over to pick up the ball — small and distant in
+    frame, a genuinely hard case for pose estimation (self-occlusion,
+    tiny pixel footprint) — produced a MediaPipe reading with shoulders
+    and hips splayed out nearly 3x wider than the torso is tall. That's
+    physically impossible for any human pose, even bent fully over, but
+    there was no check at all on whether the drawn shape was even
+    physically possible — it rendered as a bizarre "tent/spider" shape
+    instead of a body, which is what actually read as broken, not a
+    wrong-person tracking issue (there wasn't one).
+
+    Compares the wider of (shoulder width, hip width) against the
+    shoulder-to-hip torso length. Real human proportions keep this
+    ratio well under the ceiling regardless of pose — shoulders/hips
+    don't fan out sideways beyond roughly the torso's own length no
+    matter how someone bends. The default ceiling (1.8) is deliberately
+    generous: it's tuned to catch a clear tracking failure (the observed
+    case was closer to 3.0) without risking discarding a real frame just
+    because an athlete is broad-shouldered or turned at an angle.
+
+    Returns True (assume plausible) when there isn't enough landmark
+    data to judge either way — this check exists to catch a specific,
+    confirmed failure mode, not to become a new reason frames go
+    missing.
+    """
+    cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
+            "LEFT_HIP_x", "LEFT_HIP_y", "RIGHT_HIP_x", "RIGHT_HIP_y"]
+    if any(pd.isna(row.get(c)) for c in cols):
+        return True
+
+    ls = (float(row["LEFT_SHOULDER_x"]), float(row["LEFT_SHOULDER_y"]))
+    rs = (float(row["RIGHT_SHOULDER_x"]), float(row["RIGHT_SHOULDER_y"]))
+    lh = (float(row["LEFT_HIP_x"]), float(row["LEFT_HIP_y"]))
+    rh = (float(row["RIGHT_HIP_x"]), float(row["RIGHT_HIP_y"]))
+
+    shoulder_w = math.hypot(ls[0] - rs[0], ls[1] - rs[1])
+    hip_w = math.hypot(lh[0] - rh[0], lh[1] - rh[1])
+    mid_shoulder = ((ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2)
+    mid_hip = ((lh[0] + rh[0]) / 2, (lh[1] + rh[1]) / 2)
+    torso_h = math.hypot(mid_shoulder[0] - mid_hip[0], mid_shoulder[1] - mid_hip[1])
+
+    if torso_h < 1e-6:
+        return True
+
+    return (max(shoulder_w, hip_w) / torso_h) <= max_width_to_height_ratio
 
 
 def _hex_to_bgr(hex_color: str) -> tuple:
@@ -617,138 +668,149 @@ def render_annotated_video(video_path: str, output_path: str,
             torso_x_vals = [float(row[c]) for c in torso_x_cols if not pd.isna(row[c])]
             if torso_x_vals:
                 last_known_bowler_x = sum(torso_x_vals) / len(torso_x_vals)
-            for partA, partB in connections:
-                try:
-                    if pd.isna(row[f"{partA}_x"]) or pd.isna(row[f"{partB}_x"]):
-                        continue
-                    xA = int(float(row[f"{partA}_x"]) * width)
-                    yA = int(float(row[f"{partA}_y"]) * height)
-                    xB = int(float(row[f"{partB}_x"]) * width)
-                    yB = int(float(row[f"{partB}_y"]) * height)
-                    is_hero_bone = (
-                        (partA, partB) in (_lead_hip_knee, _lead_knee_ankle) if _is_side_on_module
-                        else (partA, partB) in (_shoulder_line, _hip_line)
-                    )
-                    bone_color = _hero_color if is_hero_bone else BONE_CORE
-                    bone_extra = _hero_extra_px if is_hero_bone else 0
-                    if (0 < xA < width and 0 < yA < height and
-                            0 < xB < width and 0 < yB < height):
-                        cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6) + bone_extra, cv2.LINE_AA)
-                        cv2.line(frame, (xA, yA), (xB, yB), bone_color, _rs_bone_core(3) + bone_extra, cv2.LINE_AA)
-                except Exception:
-                    continue
 
-            # SPINE: MediaPipe has no single spine landmark, so this is a
-            # virtual centerline from the shoulder midpoint to the hip
-            # midpoint. Without it the torso was just a hollow box (shoulder
-            # line + two side lines + hip line) with nothing down the
-            # middle, which is what made the skeleton look unrigged/amateur
-            # rather than like a proper body frame.
-            #
-            # SIDE-ON MODULE ONLY: colored by trunk_lean's own
-            # classification — the secondary highlight alongside the lead
-            # knee for this module (both are sagittal-plane bends best
-            # measured side-on). Front-or-rear leaves it the neutral
-            # palette, same reasoning as the knee bones above: trunk lean
-            # isn't this module's hero metric.
-            try:
-                spine_cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
-                              "LEFT_HIP_x", "LEFT_HIP_y", "RIGHT_HIP_x", "RIGHT_HIP_y"]
-                if not any(pd.isna(row[c]) for c in spine_cols):
-                    neck_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
-                    neck_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
-                    midhip_x = (float(row["LEFT_HIP_x"]) + float(row["RIGHT_HIP_x"])) / 2
-                    midhip_y = (float(row["LEFT_HIP_y"]) + float(row["RIGHT_HIP_y"])) / 2
-                    sx1, sy1 = int(neck_x * width), int(neck_y * height)
-                    sx2, sy2 = int(midhip_x * width), int(midhip_y * height)
-                    if _is_side_on_module:
-                        _, spine_color = _tier_and_color("trunk_lean", _row_trunk_lean(row))
-                    else:
-                        spine_color = BONE_CORE
-                    if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
-                        cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
-                        cv2.line(frame, (sx1, sy1), (sx2, sy2), spine_color, 3, cv2.LINE_AA)
-                        _core_r, _outline_r = _rs_joint()
-                        cv2.circle(frame, (sx1, sy1), _outline_r, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _core_r, JOINT_FILL, -1, cv2.LINE_AA)
-            except Exception:
-                pass
-
-            # LIMB FALLBACK: when the middle joint (elbow/knee) isn't tracked
-            # — verified directly on real footage that this happens on
-            # essentially every frame of a fast, motion-blurred arm swing —
-            # the normal two-segment connection (shoulder-elbow, elbow-wrist)
-            # both get skipped, but the wrist/ankle joint DOT still gets
-            # drawn on its own with nothing connecting it to the body. That
-            # floating, disconnected dot is exactly what read as "loose" /
-            # not attached to the bowler rather than a genuine limb. Drawing
-            # a direct shoulder-to-wrist (or hip-to-ankle) line in that
-            # specific case keeps every visible joint attached to the
-            # skeleton — straight instead of bent, which is honest (no real
-            # elbow position is invented) rather than fabricated.
-            for shoulder, elbow, wrist in (
-                ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
-                ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
-            ):
-                try:
-                    if pd.isna(row[f"{elbow}_x"]) and not pd.isna(row[f"{shoulder}_x"]) and not pd.isna(row[f"{wrist}_x"]):
-                        xA = int(float(row[f"{shoulder}_x"]) * width)
-                        yA = int(float(row[f"{shoulder}_y"]) * height)
-                        xB = int(float(row[f"{wrist}_x"]) * width)
-                        yB = int(float(row[f"{wrist}_y"]) * height)
+            # BUG FIX: real coach-reported case — a bent-over, small/distant
+            # figure produced shoulder/hip landmarks splayed nearly 3x wider
+            # than the torso is tall, drawing as an anatomically impossible
+            # "tent/spider" shape instead of a body. See
+            # torso_shape_is_plausible's docstring for the full story.
+            # Skipping the skeleton entirely for a frame like this (rare —
+            # this is a specific tracking-failure signature, not ordinary
+            # noise) is an honest gap; drawing it anyway is a wrong-looking
+            # graphic presented as real.
+            if torso_shape_is_plausible(row):
+                for partA, partB in connections:
+                    try:
+                        if pd.isna(row[f"{partA}_x"]) or pd.isna(row[f"{partB}_x"]):
+                            continue
+                        xA = int(float(row[f"{partA}_x"]) * width)
+                        yA = int(float(row[f"{partA}_y"]) * height)
+                        xB = int(float(row[f"{partB}_x"]) * width)
+                        yB = int(float(row[f"{partB}_y"]) * height)
+                        is_hero_bone = (
+                            (partA, partB) in (_lead_hip_knee, _lead_knee_ankle) if _is_side_on_module
+                            else (partA, partB) in (_shoulder_line, _hip_line)
+                        )
+                        bone_color = _hero_color if is_hero_bone else BONE_CORE
+                        bone_extra = _hero_extra_px if is_hero_bone else 0
                         if (0 < xA < width and 0 < yA < height and
                                 0 < xB < width and 0 < yB < height):
-                            cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
-                            cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
-                except Exception:
-                    continue
-
-            for hip, knee, ankle in (
-                ("LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"),
-                ("RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"),
-            ):
-                try:
-                    if pd.isna(row[f"{knee}_x"]) and not pd.isna(row[f"{hip}_x"]) and not pd.isna(row[f"{ankle}_x"]):
-                        xA = int(float(row[f"{hip}_x"]) * width)
-                        yA = int(float(row[f"{hip}_y"]) * height)
-                        xB = int(float(row[f"{ankle}_x"]) * width)
-                        yB = int(float(row[f"{ankle}_y"]) * height)
-                        if (0 < xA < width and 0 < yA < height and
-                                0 < xB < width and 0 < yB < height):
-                            cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
-                            cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
-                except Exception:
-                    continue
-
-            _hero_joint_nodes = (
-                {f"{_chart_lead_side}_KNEE"} if _is_side_on_module
-                else {"LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"}
-            )
-            # BUG FIX: front-or-rear used to also apply the same size bump
-            # as the single lead-knee dot to all FOUR shoulder/hip joints
-            # at once. One enlarged, isolated knee dot reads fine — four
-            # enlarged dots clustered into the much smaller shoulder/hip
-            # span (verified on real footage: they visually merged into
-            # oversized blobs covering the whole torso) does not. The bone
-            # lines already carry the color/thickness "vector axis"
-            # highlight for this module — the dots only need the color,
-            # not extra size on top of it.
-            _hero_node_size_extra = _hero_extra_px if _is_side_on_module else 0
-            for node in joint_nodes:
-                try:
-                    if pd.isna(row[f"{node}_x"]):
+                            cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6) + bone_extra, cv2.LINE_AA)
+                            cv2.line(frame, (xA, yA), (xB, yB), bone_color, _rs_bone_core(3) + bone_extra, cv2.LINE_AA)
+                    except Exception:
                         continue
-                    nx = int(float(row[f"{node}_x"]) * width)
-                    ny = int(float(row[f"{node}_y"]) * height)
-                    is_hero_node = node in _hero_joint_nodes
-                    node_color = _hero_color if is_hero_node else JOINT_FILL
-                    node_extra = _hero_node_size_extra if is_hero_node else 0
-                    if 0 < nx < width and 0 < ny < height:
-                        _core_r, _outline_r = _rs_joint()
-                        cv2.circle(frame, (nx, ny), _outline_r + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), _core_r + node_extra, node_color, -1, cv2.LINE_AA)
+
+                # SPINE: MediaPipe has no single spine landmark, so this is a
+                # virtual centerline from the shoulder midpoint to the hip
+                # midpoint. Without it the torso was just a hollow box (shoulder
+                # line + two side lines + hip line) with nothing down the
+                # middle, which is what made the skeleton look unrigged/amateur
+                # rather than like a proper body frame.
+                #
+                # SIDE-ON MODULE ONLY: colored by trunk_lean's own
+                # classification — the secondary highlight alongside the lead
+                # knee for this module (both are sagittal-plane bends best
+                # measured side-on). Front-or-rear leaves it the neutral
+                # palette, same reasoning as the knee bones above: trunk lean
+                # isn't this module's hero metric.
+                try:
+                    spine_cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
+                                  "LEFT_HIP_x", "LEFT_HIP_y", "RIGHT_HIP_x", "RIGHT_HIP_y"]
+                    if not any(pd.isna(row[c]) for c in spine_cols):
+                        neck_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
+                        neck_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
+                        midhip_x = (float(row["LEFT_HIP_x"]) + float(row["RIGHT_HIP_x"])) / 2
+                        midhip_y = (float(row["LEFT_HIP_y"]) + float(row["RIGHT_HIP_y"])) / 2
+                        sx1, sy1 = int(neck_x * width), int(neck_y * height)
+                        sx2, sy2 = int(midhip_x * width), int(midhip_y * height)
+                        if _is_side_on_module:
+                            _, spine_color = _tier_and_color("trunk_lean", _row_trunk_lean(row))
+                        else:
+                            spine_color = BONE_CORE
+                        if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
+                            cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
+                            cv2.line(frame, (sx1, sy1), (sx2, sy2), spine_color, 3, cv2.LINE_AA)
+                            _core_r, _outline_r = _rs_joint()
+                            cv2.circle(frame, (sx1, sy1), _outline_r, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                            cv2.circle(frame, (sx1, sy1), _core_r, JOINT_FILL, -1, cv2.LINE_AA)
                 except Exception:
-                    continue
+                    pass
+
+                # LIMB FALLBACK: when the middle joint (elbow/knee) isn't tracked
+                # — verified directly on real footage that this happens on
+                # essentially every frame of a fast, motion-blurred arm swing —
+                # the normal two-segment connection (shoulder-elbow, elbow-wrist)
+                # both get skipped, but the wrist/ankle joint DOT still gets
+                # drawn on its own with nothing connecting it to the body. That
+                # floating, disconnected dot is exactly what read as "loose" /
+                # not attached to the bowler rather than a genuine limb. Drawing
+                # a direct shoulder-to-wrist (or hip-to-ankle) line in that
+                # specific case keeps every visible joint attached to the
+                # skeleton — straight instead of bent, which is honest (no real
+                # elbow position is invented) rather than fabricated.
+                for shoulder, elbow, wrist in (
+                    ("LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"),
+                    ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
+                ):
+                    try:
+                        if pd.isna(row[f"{elbow}_x"]) and not pd.isna(row[f"{shoulder}_x"]) and not pd.isna(row[f"{wrist}_x"]):
+                            xA = int(float(row[f"{shoulder}_x"]) * width)
+                            yA = int(float(row[f"{shoulder}_y"]) * height)
+                            xB = int(float(row[f"{wrist}_x"]) * width)
+                            yB = int(float(row[f"{wrist}_y"]) * height)
+                            if (0 < xA < width and 0 < yA < height and
+                                    0 < xB < width and 0 < yB < height):
+                                cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
+                                cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
+                    except Exception:
+                        continue
+
+                for hip, knee, ankle in (
+                    ("LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"),
+                    ("RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"),
+                ):
+                    try:
+                        if pd.isna(row[f"{knee}_x"]) and not pd.isna(row[f"{hip}_x"]) and not pd.isna(row[f"{ankle}_x"]):
+                            xA = int(float(row[f"{hip}_x"]) * width)
+                            yA = int(float(row[f"{hip}_y"]) * height)
+                            xB = int(float(row[f"{ankle}_x"]) * width)
+                            yB = int(float(row[f"{ankle}_y"]) * height)
+                            if (0 < xA < width and 0 < yA < height and
+                                    0 < xB < width and 0 < yB < height):
+                                cv2.line(frame, (xA, yA), (xB, yB), BONE_SHADOW, _rs_bone_shadow(6), cv2.LINE_AA)
+                                cv2.line(frame, (xA, yA), (xB, yB), BONE_CORE, _rs_bone_core(3), cv2.LINE_AA)
+                    except Exception:
+                        continue
+
+                _hero_joint_nodes = (
+                    {f"{_chart_lead_side}_KNEE"} if _is_side_on_module
+                    else {"LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"}
+                )
+                # BUG FIX: front-or-rear used to also apply the same size bump
+                # as the single lead-knee dot to all FOUR shoulder/hip joints
+                # at once. One enlarged, isolated knee dot reads fine — four
+                # enlarged dots clustered into the much smaller shoulder/hip
+                # span (verified on real footage: they visually merged into
+                # oversized blobs covering the whole torso) does not. The bone
+                # lines already carry the color/thickness "vector axis"
+                # highlight for this module — the dots only need the color,
+                # not extra size on top of it.
+                _hero_node_size_extra = _hero_extra_px if _is_side_on_module else 0
+                for node in joint_nodes:
+                    try:
+                        if pd.isna(row[f"{node}_x"]):
+                            continue
+                        nx = int(float(row[f"{node}_x"]) * width)
+                        ny = int(float(row[f"{node}_y"]) * height)
+                        is_hero_node = node in _hero_joint_nodes
+                        node_color = _hero_color if is_hero_node else JOINT_FILL
+                        node_extra = _hero_node_size_extra if is_hero_node else 0
+                        if 0 < nx < width and 0 < ny < height:
+                            _core_r, _outline_r = _rs_joint()
+                            cv2.circle(frame, (nx, ny), _outline_r + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                            cv2.circle(frame, (nx, ny), _core_r + node_extra, node_color, -1, cv2.LINE_AA)
+                    except Exception:
+                        continue
 
         # Composited BEFORE the chart panel overwrites the bottom of the
         # frame, and anchored bottom-right of the VIDEO area specifically
