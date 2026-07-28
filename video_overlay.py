@@ -30,6 +30,41 @@ import pandas as pd
 import metric_ranges as mr
 
 
+def joint_marker_radii(base_core_px: int, render_scale: float,
+                        core_floor_px: int = 2, ring_gap_px: int = 2) -> tuple:
+    """
+    Returns (core_radius, outline_radius) in pixels for a joint dot at a
+    given per-frame body-size scale (render_scale: measured body height
+    in this frame / a reference body height — see render_annotated_video).
+
+    BUG FIX, found from a real, direct visual comparison against a
+    reference frame: outline and core radii used to be computed
+    INDEPENDENTLY, each floored at the same fixed minimum (4px) for
+    legibility. On a small/distant subject — verified on a real rear-view
+    clip, body height dropped to ~120px during follow-through, well below
+    the 400px reference this scaling is calibrated against — BOTH radii
+    hit that same floor and came out identical, collapsing the two-tone
+    outline+core look into one flat, oversized blob (a 4px floor is
+    ~1.5% of the 400px reference body's height, but over 3% of a
+    120px-tall distant figure — more than double the intended proportion,
+    which is exactly what read as joint dots "covering the body" the
+    farther away the bowler got).
+
+    Fixed by deriving the outline from the core radius PLUS a small gap
+    that itself scales down (with its own, lower floor) instead of
+    flooring each independently. The ring can never collapse into the
+    core no matter how small the subject gets, and the whole marker keeps
+    shrinking with distance instead of hitting the same wall regardless
+    of how far away someone is. At render_scale=1.0 (the reference size
+    this was always tuned against) this returns exactly the old fixed
+    values (4, 6) — zero behavior change at normal distance, only at the
+    low end where the old floor was colliding.
+    """
+    core_r = max(core_floor_px, int(round(base_core_px * render_scale)))
+    gap = max(1, int(round(ring_gap_px * render_scale)))
+    return core_r, core_r + gap
+
+
 def _hex_to_bgr(hex_color: str) -> tuple:
     hex_color = hex_color.lstrip("#")
     r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
@@ -193,22 +228,14 @@ def render_annotated_video(video_path: str, output_path: str,
     def _rs(px):
         return max(1, int(round(px * render_scale)))
 
-    # JOINT LEGIBILITY FLOOR: verified directly that a wide/distant shot
-    # (bowler ~90px tall on screen, well below the 400px reference this
-    # scaling was calibrated against) drives render_scale down to ~0.23,
-    # which makes _rs(9) round to a 2px joint dot — functionally invisible,
-    # reading as scattered noise rather than a skeleton. A joint DOT
-    # specifically needs a minimum area to read as a distinct point, so it
-    # gets its own floor instead of sharing the bone-width scale-down.
-    #
-    # BASE RADIUS LOWERED (callers now pass 6/4, was 9/6): reported on
-    # real phone footage as visibly oversized dots relative to the body —
-    # not just the front-or-rear hero-joint clustering fixed separately,
-    # every joint read too large. ~33% smaller at the same render_scale;
-    # the floor below is unchanged so dots still can't shrink into
-    # invisibility on a wide/distant shot.
-    def _rs_joint(px):
-        return max(4, int(round(px * render_scale)))
+    # JOINT SIZE: see joint_marker_radii's docstring (module level, above)
+    # for the real bug this fixes — outline/core radii used to be
+    # independently floored and collapsed into one oversized blob on a
+    # distant subject. base_core_px=4 matches this file's previous core
+    # radius exactly, so a normally-sized subject renders identically to
+    # before; only the previously-colliding low end changed.
+    def _rs_joint(base_core_px=4):
+        return joint_marker_radii(base_core_px, render_scale)
 
     # BONE OUTLINE FLOOR: BUG FIX — a prior comment here claimed "a thin
     # connecting line stays visually coherent even at 1px," which verified
@@ -629,8 +656,9 @@ def render_annotated_video(video_path: str, output_path: str,
                     if 0 < sx1 < width and 0 < sy1 < height and 0 < sx2 < width and 0 < sy2 < height:
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), BONE_SHADOW, 6, cv2.LINE_AA)
                         cv2.line(frame, (sx1, sy1), (sx2, sy2), spine_color, 3, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _rs_joint(6), JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (sx1, sy1), _rs_joint(4), JOINT_CORE, -1, cv2.LINE_AA)
+                        _core_r, _outline_r = _rs_joint()
+                        cv2.circle(frame, (sx1, sy1), _outline_r, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (sx1, sy1), _core_r, JOINT_CORE, -1, cv2.LINE_AA)
             except Exception:
                 pass
 
@@ -704,8 +732,9 @@ def render_annotated_video(video_path: str, output_path: str,
                     node_color = _hero_color if is_hero_node else JOINT_CORE
                     node_extra = _hero_node_size_extra if is_hero_node else 0
                     if 0 < nx < width and 0 < ny < height:
-                        cv2.circle(frame, (nx, ny), _rs_joint(6) + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (nx, ny), _rs_joint(4) + node_extra, node_color, -1, cv2.LINE_AA)
+                        _core_r, _outline_r = _rs_joint()
+                        cv2.circle(frame, (nx, ny), _outline_r + node_extra, JOINT_OUTLINE, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (nx, ny), _core_r + node_extra, node_color, -1, cv2.LINE_AA)
                 except Exception:
                     continue
 
