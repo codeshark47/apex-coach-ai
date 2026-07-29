@@ -1286,6 +1286,16 @@ def seeds_ready_for_extraction(key_prefix: str, seed_point, seed_frame, extra_se
     confirmation — the caller should skip extraction/downstream UI
     entirely in that case.
     """
+    if seed_point is None:
+        # Nothing placed yet for this stream — BUG FOUND directly from a
+        # coach screenshot: the side/rear calls below run unconditionally
+        # (see the comment above them), so without this check, the
+        # "confirm tracking point(s)" prompt rendered for BOTH streams
+        # even in Single Camera mode with no video uploaded at all, since
+        # side_seed_point/rear_seed_point default to None there and never
+        # get set. Nothing to confirm yet means nothing to render.
+        return True
+
     is_ready, pending_identity = click_widget_state.seed_confirmation_status(
         st.session_state, key_prefix, seed_point, seed_frame, extra_seeds
     )
