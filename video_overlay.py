@@ -395,27 +395,21 @@ def render_annotated_video(video_path: str, output_path: str,
         ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
     ]
 
-    # SIDE-ON ONLY: don't draw the non-bowling arm at all. Real,
-    # coach-reported bug: side-on filming is done from the bowling-arm
-    # side specifically so THAT arm's full swing is visible — which means
-    # the OTHER arm is largely hidden behind the torso from the camera's
-    # own perspective. MediaPipe still outputs a "best guess" position for
-    # an arm it can't actually see, and that guess is unreliable. Verified
-    # directly on a real release frame: the visible (bowling) arm tracked
-    # correctly, high and extended, while the hidden arm's guessed elbow
-    # bent to a position matching nothing actually visible in the shot —
-    # reading as a phantom "third arm" with a bend that was never really
-    # there. Front/rear view is unaffected: both arms are genuinely
-    # visible side by side from that angle, so both stay drawn.
-    if camera_angle == "side_on":
-        _hidden_arm_side = "RIGHT" if bowling_arm == "left" else "LEFT"
-        _hidden_arm_bones = {
-            (f"{_hidden_arm_side}_SHOULDER", f"{_hidden_arm_side}_ELBOW"),
-            (f"{_hidden_arm_side}_ELBOW", f"{_hidden_arm_side}_WRIST"),
-        }
-        connections = [c for c in connections if c not in _hidden_arm_bones]
-        joint_nodes = [n for n in joint_nodes if n != f"{_hidden_arm_side}_WRIST"]
-        _arm_fallback_triples = [t for t in _arm_fallback_triples if not t[0].startswith(_hidden_arm_side)]
+    # POLICY REVERSED, found from direct coach feedback: side-on used to
+    # unconditionally hide the non-bowling arm on EVERY frame (the theory
+    # being it's occluded behind the torso from that camera angle, so any
+    # reading for it is unreliable). That traded "never show a wrong arm"
+    # for "never show that arm at all, even on the many frames where it's
+    # actually tracked fine" — reported directly as the skeleton looking
+    # permanently incomplete, the same complaint that came in separately
+    # for front/rear view (where a single bad frame's phantom segment,
+    # not the whole arm, was the problem). Both camera angles now use the
+    # SAME policy: draw an arm segment whenever it exists and passes
+    # limb_segment_is_plausible below, camera angle no longer decides
+    # this at all. A genuinely occluded/mistracked side-on arm can still
+    # get caught by that per-segment check on the frames where it's
+    # actually wrong — it just isn't blanket-suppressed on every frame
+    # regardless of whether that frame's reading was fine.
 
     total_frames = int(df["frame"].max()) + 1 if len(df) else 0
 
