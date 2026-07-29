@@ -47,3 +47,42 @@ def next_click_generation(session_state, key_prefix: str, marker_point, extra_ma
         session_state[gen_key] = session_state.get(gen_key, 0) + 1
         session_state[token_key] = token
     return session_state[gen_key]
+
+
+def seed_confirmation_status(session_state, key_prefix: str, seed_point, seed_frame, extra_seeds: list):
+    """
+    Returns (is_ready: bool, pending_identity: str) for the seed-
+    placement confirmation gate — is_ready=True means the coach already
+    explicitly confirmed this EXACT (seed_point, seed_frame, extra_seeds)
+    combination, so the caller can safely proceed to the expensive
+    extraction stage.
+
+    BUG FIX, found from a real production crash: this gate used to
+    return "ready" immediately whenever extra_seeds was empty — i.e. the
+    single-seed case (the common one, used by every analysis) had NO
+    gate at all. Every click adjusting the primary seed point's
+    placement (coaches naturally click a few times to get it precise)
+    changed the pending identity and re-triggered a full video
+    extraction. This was believed harmless when first found (just
+    "annoying/slow"), but is now confirmed to be a real memory leak, not
+    just wasted time: repeated PoseLandmarker creation within one
+    process was measured directly to permanently leak ~30-40MB per
+    extraction call, even after .close() and gc.collect() — a live
+    session's server log showed 11 separate extraction passes within 90
+    seconds of ordinary seed placement, and the app was OOM-killed by
+    Streamlit Cloud shortly after. Every seed configuration — including
+    a single point with no extra confirmations — now requires one
+    explicit confirmation before extraction runs, closing off the most
+    direct, reproducible way a coach could unknowingly trigger repeated
+    leaking extraction passes.
+    """
+    pending_identity = f"{seed_point}_{seed_frame}_{extra_seeds}"
+    locked_key = f"_{key_prefix}_seeds_locked_identity"
+    is_ready = session_state.get(locked_key) == pending_identity
+    return is_ready, pending_identity
+
+
+def lock_seed_confirmation(session_state, key_prefix: str, pending_identity: str):
+    """Records that the coach has confirmed this exact seed configuration
+    is final — called from the "Continue" button's on-click handling."""
+    session_state[f"_{key_prefix}_seeds_locked_identity"] = pending_identity

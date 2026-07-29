@@ -1271,38 +1271,34 @@ def render_extra_seed_ui(uploaded_file, key_prefix: str, label: str):
 def seeds_ready_for_extraction(key_prefix: str, seed_point, seed_frame, extra_seeds: list) -> bool:
     """
     Gates the expensive extraction/event-detection stage behind an
-    explicit "done adding seeds" confirmation, but ONLY once a coach has
-    started adding extra confirmations — reported directly: adding an
-    extra seed kicked off a visible re-extraction ("loading"), and Ball
-    Release Frame (and the rest) confirmed further down the page would
-    silently change value while the coach was still deciding whether to
-    add another seed, before they'd even reached that section. A single
-    seed (the common case, no reported problem) is untouched — this
-    only activates once extra_seeds is non-empty, exactly the point
-    where the previous behavior became reactive and confusing.
+    explicit confirmation from the coach — see
+    click_widget_state.seed_confirmation_status for the real production
+    crash that made this apply to EVERY seed configuration, not just
+    when extra confirmations are added (a prior version of this
+    docstring described the single-seed case as "the common case, no
+    reported problem" — that's no longer true now that repeated
+    extraction is confirmed to leak real memory, not just cost time).
 
     Returns True when it's safe to proceed with (seed_point, seed_frame,
-    extra_seeds) exactly as currently set — either because there are no
-    extra seeds to wait on, or because the coach explicitly confirmed
-    this exact seed set is final. Returns False (and renders a
-    "Continue" button) while still waiting on that confirmation — the
-    caller should skip extraction/downstream UI entirely in that case.
+    extra_seeds) exactly as currently set, because the coach explicitly
+    confirmed this exact configuration is final. Returns False (and
+    renders a "Continue" button) while still waiting on that
+    confirmation — the caller should skip extraction/downstream UI
+    entirely in that case.
     """
-    if not extra_seeds:
-        return True
-
-    pending_identity = f"{seed_point}_{seed_frame}_{extra_seeds}"
-    locked_key = f"_{key_prefix}_seeds_locked_identity"
-    if st.session_state.get(locked_key) == pending_identity:
+    is_ready, pending_identity = click_widget_state.seed_confirmation_status(
+        st.session_state, key_prefix, seed_point, seed_frame, extra_seeds
+    )
+    if is_ready:
         return True
 
     st.info(
-        "📍 Add another confirmation above if tracking still needs it, or continue "
-        "below when you're done — this waits for you to finish instead of "
-        "re-running tracking after every single confirmation."
+        "📍 Happy with the marker placement? Add another confirmation above if "
+        "tracking still needs it, or confirm below to continue — this waits for "
+        "you to finish instead of re-running tracking after every click."
     )
-    if st.button("✅ Done adding tracking confirmations — continue", key=f"{key_prefix}_seeds_continue"):
-        st.session_state[locked_key] = pending_identity
+    if st.button("✅ Confirm tracking point(s) — continue", key=f"{key_prefix}_seeds_continue"):
+        click_widget_state.lock_seed_confirmation(st.session_state, key_prefix, pending_identity)
         st.rerun()
     return False
 
