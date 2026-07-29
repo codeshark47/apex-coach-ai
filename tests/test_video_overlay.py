@@ -147,3 +147,28 @@ class TestLimbSegmentIsPlausible:
         """Can't judge without a usable body-size reference — must not
         become a new reason frames go missing."""
         assert vo.limb_segment_is_plausible((0.1, 0.1), (0.9, 0.9), torso_h=0.0) is True
+
+
+class TestBodySizeIsPlausible:
+    """Regression test for a real bug found on a real clip: a run of
+    frames during run-up had every landmark (nose, shoulders, hips,
+    knees, ankles) collapse into a ~17x11 pixel box — an estimated body
+    height of only ~11px — with proportions that still passed
+    torso_shape_is_plausible's RATIO check since everything shrank
+    together. Confirmed against real footage across this project: the
+    smallest LEGITIMATE body height ever measured (a genuinely small/
+    distant figure) was ~67px."""
+
+    def test_real_reported_collapse_case_is_rejected(self):
+        assert vo.body_size_is_plausible(11.0) is False
+
+    def test_smallest_known_legitimate_body_height_is_plausible(self):
+        assert vo.body_size_is_plausible(67.0) is True
+
+    def test_typical_body_height_is_plausible(self):
+        assert vo.body_size_is_plausible(300.0) is True
+
+    def test_none_defaults_to_plausible(self):
+        """Can't judge without a usable measurement — must not become a
+        new reason frames go missing."""
+        assert vo.body_size_is_plausible(None) is True

@@ -115,6 +115,39 @@ def limb_segment_is_plausible(p_a, p_b, torso_h: float, max_len_to_torso_ratio: 
     return seg_len <= max_len_to_torso_ratio * torso_h
 
 
+def body_size_is_plausible(body_height_px, min_height_px: float = 30.0) -> bool:
+    """
+    Sanity-checks that a frame's estimated body height is at least a
+    minimum plausible size — a DIFFERENT failure mode than
+    torso_shape_is_plausible's width/height RATIO check catches: a fully
+    collapsed reading where every landmark (shoulders, hips, knees,
+    ankles) clusters into a tiny handful of pixels, with proportions
+    that still look "fine" by ratio alone since everything shrank
+    together, not just one part relative to another.
+
+    Verified directly on a real clip: a run of frames during run-up had
+    an estimated body height (nose-to-ankle span) of only ~10-15px —
+    nose, both shoulders, both hips, both knees, and both ankles were
+    all crammed within roughly a 17x11 pixel box, no bigger than a coin
+    on screen, with no meaningful vertical ordering between hip/knee/
+    ankle at all — nowhere near the real, much larger tracked figure
+    visible elsewhere in the same actual frame.
+
+    The default floor (30px) sits with real margin on both sides:
+    comfortably below the smallest LEGITIMATE body height measured on
+    real footage across this project (~67px, a genuinely small/distant
+    figure — see _estimate_body_height_px's own docstring), and well
+    above the confirmed collapse case (~11px).
+
+    Returns True (assume plausible) when body_height_px is None/unusable
+    — this check exists to catch a specific, confirmed failure mode, not
+    to become a new reason frames go missing.
+    """
+    if body_height_px is None:
+        return True
+    return body_height_px >= min_height_px
+
+
 def torso_shape_is_plausible(row, max_width_to_height_ratio: float = 1.8) -> bool:
     """
     Sanity-checks ONE frame's shoulder/hip landmarks before a skeleton is
@@ -742,11 +775,20 @@ def render_annotated_video(video_path: str, output_path: str,
             # than the torso is tall, drawing as an anatomically impossible
             # "tent/spider" shape instead of a body. See
             # torso_shape_is_plausible's docstring for the full story.
+            #
+            # SECOND, DIFFERENT failure mode found later the same day: a
+            # fully COLLAPSED reading where every landmark clusters into a
+            # tiny handful of pixels — proportions still look "fine" (ratio
+            # check above passes) since everything shrank together, not
+            # just one part relative to another. body_size_is_plausible
+            # catches this using the SAME body-height estimate already
+            # computed above for render_scale, no extra work needed.
+            #
             # Skipping the skeleton entirely for a frame like this (rare —
-            # this is a specific tracking-failure signature, not ordinary
+            # both are specific tracking-failure signatures, not ordinary
             # noise) is an honest gap; drawing it anyway is a wrong-looking
             # graphic presented as real.
-            if torso_shape_is_plausible(row):
+            if torso_shape_is_plausible(row) and body_size_is_plausible(_frame_body_height_px):
                 # PER-LIMB PLAUSIBILITY: separate from torso_shape_is_plausible
                 # above (which only judges shoulder/hip WIDTH). Verified on a
                 # real coach-downloaded rear-view clip: during a fast, motion-
