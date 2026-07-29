@@ -114,3 +114,36 @@ class TestTorsoShapeIsPlausible:
         guards against."""
         row = pd.Series({"LEFT_SHOULDER_x": 0.4, "LEFT_SHOULDER_y": 0.3})
         assert vo.torso_shape_is_plausible(row) is True
+
+
+class TestLimbSegmentIsPlausible:
+    """Regression test for a real bug found on a coach-downloaded
+    rear/front-view clip: during a fast, motion-blurred release swing,
+    the bowling arm tracked correctly (raised high, holding the ball)
+    while the OTHER arm's wrist floated to a position with nothing
+    visible there in the real frame — connected by a bone segment far
+    longer than any real arm segment, reading as a phantom second limb.
+    Front/rear view can't just hide the "other" arm like side-on does
+    (both are genuinely visible from that angle), so this checks each
+    arm segment's own length instead."""
+
+    def test_normal_forearm_length_is_plausible(self):
+        # torso_h=0.2 (typical); a forearm ~0.5x torso length is normal.
+        assert vo.limb_segment_is_plausible((0.5, 0.4), (0.55, 0.5), torso_h=0.2) is True
+
+    def test_real_reported_case_floating_wrist_is_rejected(self):
+        """A wrist floating far from the elbow/shoulder — segment length
+        several times the torso height — must be rejected."""
+        shoulder = (0.5, 0.3)
+        floating_wrist = (0.5, 0.9)  # 0.6 away vertically alone
+        assert vo.limb_segment_is_plausible(shoulder, floating_wrist, torso_h=0.2) is False
+
+    def test_fully_extended_arm_is_still_plausible(self):
+        """A real, fully extended arm (e.g. reaching overhead at
+        release) must not be rejected just for being long."""
+        assert vo.limb_segment_is_plausible((0.5, 0.3), (0.5, 0.55), torso_h=0.2) is True
+
+    def test_zero_torso_height_defaults_to_plausible(self):
+        """Can't judge without a usable body-size reference — must not
+        become a new reason frames go missing."""
+        assert vo.limb_segment_is_plausible((0.1, 0.1), (0.9, 0.9), torso_h=0.0) is True

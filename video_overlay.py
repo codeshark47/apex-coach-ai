@@ -66,6 +66,55 @@ def joint_marker_radii(base_core_px: int, render_scale: float,
     return core_r, core_r + gap
 
 
+def _torso_height(row) -> float:
+    """
+    Shoulder-to-hip distance in the same units as the raw landmark
+    columns (normalized 0-1 * frame dimension, whatever the caller's row
+    already is in) — the shared size reference used by both
+    torso_shape_is_plausible and limb_segment_is_plausible below.
+    Returns 0.0 if there isn't enough landmark data to compute it (both
+    callers treat that as "can't judge, assume plausible").
+    """
+    cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
+            "LEFT_HIP_x", "LEFT_HIP_y", "RIGHT_HIP_x", "RIGHT_HIP_y"]
+    if any(pd.isna(row.get(c)) for c in cols):
+        return 0.0
+    mid_shoulder_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
+    mid_shoulder_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
+    mid_hip_x = (float(row["LEFT_HIP_x"]) + float(row["RIGHT_HIP_x"])) / 2
+    mid_hip_y = (float(row["LEFT_HIP_y"]) + float(row["RIGHT_HIP_y"])) / 2
+    return math.hypot(mid_shoulder_x - mid_hip_x, mid_shoulder_y - mid_hip_y)
+
+
+def limb_segment_is_plausible(p_a, p_b, torso_h: float, max_len_to_torso_ratio: float = 1.5) -> bool:
+    """
+    Sanity-checks ONE bone segment's length (e.g. shoulder-to-elbow)
+    against the body's own scale, before it's drawn. Verified on a real
+    coach-downloaded rear-view clip: during a fast, motion-blurred
+    release swing, the bowling arm tracked correctly (raised high,
+    holding the ball) while the OTHER arm's wrist landmark floated to a
+    position with nothing visible there in the real frame — connected
+    by a bone segment far longer than any real human arm segment could
+    be, reading as a second, phantom limb rather than a body.
+
+    A single upper-arm or forearm segment is normally well under the
+    torso's own length (torso ~30% of height, a full arm ~35-45%, so
+    either HALF of an arm is usually 60-75% of torso length at most).
+    The default ceiling (1.5x torso length) is deliberately generous —
+    well above any real segment, even significantly foreshortened or
+    extended — while still catching a segment that's clearly not
+    attached to a real, visible limb.
+
+    Returns True (assume plausible) when torso_h can't be computed —
+    this check exists to catch a specific, confirmed failure mode, not
+    to become a new reason frames go missing.
+    """
+    if torso_h < 1e-6:
+        return True
+    seg_len = math.hypot(p_a[0] - p_b[0], p_a[1] - p_b[1])
+    return seg_len <= max_len_to_torso_ratio * torso_h
+
+
 def torso_shape_is_plausible(row, max_width_to_height_ratio: float = 1.8) -> bool:
     """
     Sanity-checks ONE frame's shoulder/hip landmarks before a skeleton is
@@ -704,10 +753,32 @@ def render_annotated_video(video_path: str, output_path: str,
             # noise) is an honest gap; drawing it anyway is a wrong-looking
             # graphic presented as real.
             if torso_shape_is_plausible(row):
+                # PER-LIMB PLAUSIBILITY: separate from torso_shape_is_plausible
+                # above (which only judges shoulder/hip WIDTH). Verified on a
+                # real coach-downloaded rear-view clip: during a fast, motion-
+                # blurred release swing, the bowling arm tracked correctly
+                # (raised high, holding the ball) while the OTHER arm's wrist
+                # floated to a position with nothing visible there in the real
+                # frame — a bone segment far longer than any real arm segment,
+                # reading as a second, phantom limb. Front/rear view can't just
+                # hide the "other" arm like side-on does (both are genuinely
+                # visible from this angle) — this checks each arm segment's
+                # own length instead, so only the one implausible bone gets
+                # skipped, not the whole limb or the whole skeleton.
+                _torso_h_for_limbs = _torso_height(row)
+                _arm_segment_bones = {
+                    ("LEFT_SHOULDER", "LEFT_ELBOW"), ("LEFT_ELBOW", "LEFT_WRIST"),
+                    ("RIGHT_SHOULDER", "RIGHT_ELBOW"), ("RIGHT_ELBOW", "RIGHT_WRIST"),
+                }
                 for partA, partB in connections:
                     try:
                         if pd.isna(row[f"{partA}_x"]) or pd.isna(row[f"{partB}_x"]):
                             continue
+                        if (partA, partB) in _arm_segment_bones:
+                            norm_a = (float(row[f"{partA}_x"]), float(row[f"{partA}_y"]))
+                            norm_b = (float(row[f"{partB}_x"]), float(row[f"{partB}_y"]))
+                            if not limb_segment_is_plausible(norm_a, norm_b, _torso_h_for_limbs):
+                                continue
                         xA = int(float(row[f"{partA}_x"]) * width)
                         yA = int(float(row[f"{partA}_y"]) * height)
                         xB = int(float(row[f"{partB}_x"]) * width)
@@ -776,6 +847,14 @@ def render_annotated_video(video_path: str, output_path: str,
                 for shoulder, elbow, wrist in _arm_fallback_triples:
                     try:
                         if pd.isna(row[f"{elbow}_x"]) and not pd.isna(row[f"{shoulder}_x"]) and not pd.isna(row[f"{wrist}_x"]):
+                            norm_shoulder = (float(row[f"{shoulder}_x"]), float(row[f"{shoulder}_y"]))
+                            norm_wrist = (float(row[f"{wrist}_x"]), float(row[f"{wrist}_y"]))
+                            # Same phantom-limb guard as the main connections
+                            # loop above — a missing elbow makes this the
+                            # ONLY check standing between a floating wrist
+                            # and a fabricated-looking direct line to it.
+                            if not limb_segment_is_plausible(norm_shoulder, norm_wrist, _torso_h_for_limbs):
+                                continue
                             xA = int(float(row[f"{shoulder}_x"]) * width)
                             yA = int(float(row[f"{shoulder}_y"]) * height)
                             xB = int(float(row[f"{wrist}_x"]) * width)
