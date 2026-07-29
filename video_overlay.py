@@ -478,8 +478,32 @@ def render_annotated_video(video_path: str, output_path: str,
         tier = mr.classify(metric_key, float(value))
         return tier, TIER_COLORS_BGR[tier]
 
+    # BUG FIX, found auditing the skeleton-collapse fix above: a fully
+    # collapsed landmark reading (every joint crammed into a tiny handful
+    # of pixels) no longer draws a garbage skeleton, but the CHART line
+    # (Lead Knee Angle / Hip-Shoulder Separation) is computed by the three
+    # row-value functions below, entirely separately from that drawing
+    # gate — so the exact same bad frames were still feeding wild, noisy
+    # angle readings into the chart. Verified directly on the real clip
+    # the collapse was found on: knee angle swung 88.7 -> 83.3 -> 72.3 ->
+    # 40.8 -> 16.7 -> 121.8 -> 137.2 degrees across a handful of
+    # consecutive frames during ordinary running — a leg cannot actually
+    # move like that frame to frame, this is pure noise from a near-zero-
+    # length hip-knee-ankle triangle amplifying tiny measurement error
+    # into huge angle swings. All three row functions now return NaN for
+    # an untrustworthy frame instead of a real-looking but meaningless
+    # number — the existing interpolate() call in _interpolated_array
+    # already smooths over genuinely-missing frames the same way, so this
+    # is the same handling, just extended to cover this failure mode too.
+    def _row_pose_is_trustworthy(r):
+        if not torso_shape_is_plausible(r):
+            return False
+        return body_size_is_plausible(_estimate_body_height_px(r))
+
     def _row_knee_angle(r):
         try:
+            if not _row_pose_is_trustworthy(r):
+                return np.nan
             h = np.array([float(r[f"{_chart_lead_side}_HIP_x"]), float(r[f"{_chart_lead_side}_HIP_y"])])
             k = np.array([float(r[f"{_chart_lead_side}_KNEE_x"]), float(r[f"{_chart_lead_side}_KNEE_y"])])
             a = np.array([float(r[f"{_chart_lead_side}_ANKLE_x"]), float(r[f"{_chart_lead_side}_ANKLE_y"])])
@@ -498,6 +522,8 @@ def render_annotated_video(video_path: str, output_path: str,
     # frame), so the color drawn here can never disagree with the report.
     def _row_trunk_lean(r):
         try:
+            if not _row_pose_is_trustworthy(r):
+                return np.nan
             mid_hip_x = (float(r["LEFT_HIP_x"]) + float(r["RIGHT_HIP_x"])) / 2
             mid_hip_y = (float(r["LEFT_HIP_y"]) + float(r["RIGHT_HIP_y"])) / 2
             mid_sh_x = (float(r["LEFT_SHOULDER_x"]) + float(r["RIGHT_SHOULDER_x"])) / 2
@@ -512,6 +538,8 @@ def render_annotated_video(video_path: str, output_path: str,
     # (arctan2 + wraparound-safe fold into [0, 90]) for the same reason.
     def _row_hip_shoulder_separation(r):
         try:
+            if not _row_pose_is_trustworthy(r):
+                return np.nan
             shoulder_angle = np.degrees(np.arctan2(
                 float(r["LEFT_SHOULDER_y"]) - float(r["RIGHT_SHOULDER_y"]),
                 float(r["LEFT_SHOULDER_x"]) - float(r["RIGHT_SHOULDER_x"])
