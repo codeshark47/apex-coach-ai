@@ -1,16 +1,28 @@
 """
 ball_tracking/training/prepare_dataset.py
 
-Converts the verified ball_tracking_labels rows (real coach-circled
-positions, already filtered for detection-radius consistency) into a
-YOLO-format dataset: one image + one label .txt per labeled frame.
+Converts verified ball_tracking_labels rows into a YOLO-format dataset:
+one image + one label .txt per labeled frame.
+
+ONLY uses rows with labeled_by='direct_click_v1' (see
+ball_tracking/label_tool.py) — the earlier CapCut-circle workflow
+(labeled_by='auto_extracted_from_marker_v1') was abandoned 2026-08-02
+after discovering it poisoned the training images: the coach's drawn
+circle is burned directly into the source video's pixels, so every
+training image had a bright, solid-colored, consistently-shaped ring
+sitting on the ball. An inpainting attempt removed the ring's color but
+left a locally-smoothed patch the model learned to detect instead
+(confirmed directly: a trained checkpoint's predicted box sat exactly
+on the inpainting scar, not the ball, and metrics were unchanged before
+and after inpainting). Filtering to direct_click_v1 at the query level
+means old, compromised rows can never silently leak back into training
+just because they're still sitting in the table — there is no
+per-filename exclusion list to remember to update.
 
 Box source: ball_tracking_labels only stores a center (x, y) — the
 matching radius comes from ball_tracking_runs.raw_candidates for the
-same (clip, frame), which IS the coach's actual drawn circle size. A
-box built from [x-r, y-r, x+r, y+r] is an approximation (the true ball
-edges aren't the same as the marker circle's edges), but it's a real,
-non-fabricated bound derived from the coach's own annotation, not a
+same (clip, frame) — for direct_click_v1 rows, this is the radius the
+coach set once per clip in label_tool.py's size-calibration step, not a
 guessed constant.
 
 SPLIT: by CLIP, not by random frame. Frames within one clip share the
@@ -18,23 +30,10 @@ same background/lighting, so a random-frame split would let the model
 "see" near-duplicate scenes in both train and val and look like it
 generalizes when it's really just memorizing.
 
-VAL CLIP CHOICE — changed 2026-07-28: originally held out the
-third-party Instagram clip (9.26.48 PM) as the toughest generalization
-test. Verified directly (loaded the first training checkpoint and
-compared its predictions against the stored labels frame by frame) that
-a long stretch of THAT clip's labels are wrong — extract_marker_positions
-locked onto a different reddish object on the left side of that scene
-for ~80 consecutive frames and never found the coach's actual circle,
-and the size-consistency filter didn't catch it because the false match
-happened to be a similar size. Near-zero validation metrics through
-epoch 22 of the first training run were at least partly an artifact of
-scoring against these wrong labels, not necessarily the model failing to
-generalize. Swapped to 12.34.34 AM.mp4, which got an exhaustive
-multi-checkpoint visual verification earlier and came back 100% correct
-— a held-out clip is only an honest test if its own labels are trusted.
-The Instagram clip still needs a manual relabel/exclusion pass before
-it's safe to use for training OR validation; it's currently just left
-out of both until that happens.
+VAL_CLIPS is intentionally empty right now — the old validation clip
+belonged to the abandoned workflow. Set this once a genuinely different
+clip (ideally a different scene/location) has been labeled with the new
+tool; main() warns loudly if no val images get written.
 
 Usage:
     python ball_tracking/training/prepare_dataset.py
@@ -49,13 +48,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import profile_store as store
 
-VAL_CLIPS = {"WhatsApp Video 2026-07-27 at 12.34.34 AM.mp4"}
+VALID_LABELED_BY = "direct_click_v1"
 
-# Confirmed (2026-07-28) to have a long stretch of mislabeled frames — see
-# the module docstring. Excluded from BOTH splits, not just moved out of
-# val, so its wrong labels don't corrupt training either. Remove from
-# here once it's been manually relabeled or the bad frame range dropped.
-EXCLUDED_CLIPS = {"WhatsApp Video 2026-07-27 at 9.26.48 PM.mp4"}
+# Set once a clip (ideally a different scene) has been labeled with the
+# new tool — see module docstring.
+VAL_CLIPS = set()
 
 SEARCH_DIRS = [
     "C:/Users/Shoaib/Downloads",
@@ -65,12 +62,15 @@ SEARCH_DIRS = [
 OUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset")
 
 
-def _fetch_all(client, table, columns):
+def _fetch_all(client, table, columns, filters=None):
     rows = []
     start = 0
     page_size = 1000
     while True:
-        result = client.table(table).select(columns).range(start, start + page_size - 1).execute()
+        query = client.table(table).select(columns)
+        for col, val in (filters or {}).items():
+            query = query.eq(col, val)
+        result = query.range(start, start + page_size - 1).execute()
         page = result.data or []
         rows.extend(page)
         if len(page) < page_size:
@@ -90,7 +90,10 @@ def _find_video(filename):
 def main():
     client = store.get_client()
 
-    labels = _fetch_all(client, "ball_tracking_labels", "source_video_filename,frame_index,ball_x_px,ball_y_px")
+    labels = _fetch_all(
+        client, "ball_tracking_labels", "source_video_filename,frame_index,ball_x_px,ball_y_px",
+        filters={"labeled_by": VALID_LABELED_BY},
+    )
     runs = _fetch_all(client, "ball_tracking_runs", "source_video_filename,raw_candidates")
     radius_lookup = {}
     for r in runs:
@@ -107,10 +110,8 @@ def main():
         os.makedirs(os.path.join(OUT_ROOT, "labels", split), exist_ok=True)
 
     total_written = 0
+    total_val_written = 0
     for filename, rows in by_clip.items():
-        if filename in EXCLUDED_CLIPS:
-            print(f"EXCLUDED (known bad labels, see docstring): {filename}")
-            continue
         split = "val" if filename in VAL_CLIPS else "train"
         video_path = _find_video(filename)
         if video_path is None:
@@ -147,6 +148,8 @@ def main():
                         f.write(f"0 {x_center_n:.6f} {y_center_n:.6f} {w_n:.6f} {h_n:.6f}\n")
                     written_this_clip += 1
                     total_written += 1
+                    if split == "val":
+                        total_val_written += 1
             idx += 1
         cap.release()
         print(f"{filename[:50]:50} -> {split:5} | {written_this_clip} frames written")
@@ -163,6 +166,12 @@ def main():
 
     print(f"\nTotal images written: {total_written}")
     print(f"Dataset config: {yaml_path}")
+    if total_val_written == 0:
+        print(
+            "\nWARNING: no validation images written (VAL_CLIPS is empty or its clip(s) "
+            "have no labels yet). Training will fail/be meaningless without a val set — "
+            "set VAL_CLIPS to at least one labeled clip before running train_yolo.py."
+        )
 
 
 if __name__ == "__main__":
