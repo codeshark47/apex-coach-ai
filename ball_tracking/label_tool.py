@@ -52,7 +52,20 @@ SEARCH_DIRS = [
 # not the coach's own footage, and not even real bowling footage (a
 # competitor's equipment setup video, downloaded via a video-ripping
 # service as a product reference, not training material).
-EXCLUDED_FILENAMES = {"vidssave.com Fulltrack AI - How to Set Up + Equipment Needed 720P.mp4"}
+EXCLUDED_FILENAMES = {
+    "vidssave.com Fulltrack AI - How to Set Up + Equipment Needed 720P.mp4",
+    # Confirmed by direct visual inspection (2026-08-02) to be pre-processed
+    # analysis output — skeleton overlay + "Analysis Phase: ..." text burned
+    # in — despite having no filename pattern in common with the app's own
+    # "Annotated_*" exports (shared through some route that stripped the
+    # original name to a hash). A content-based auto-scan for this was
+    # attempted and abandoned — too many false positives (e.g. ordinary
+    # bright sky triggering a "white text banner" check) to trust; see the
+    # in-app "does this look right?" confirmation step instead.
+    "161faba7ab0673e9c72eb0f69588f54e.mp4",
+    "59f53f357cbf020127bf08311934b554.mp4",
+    "c261db899adb35ca76504fd7e0c582c2.mp4",
+}
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v")
 
 # BUG FOUND: the Downloads folder is shared with the main app's own
@@ -219,11 +232,40 @@ def main():
         st.session_state.label_tool_frame_ptr = 0
         st.session_state.label_tool_radius = None
         st.session_state.label_tool_history = []  # for undo: list of (frame_idx, had_ball)
+        st.session_state.label_tool_video_confirmed = False
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     cap.release()
+
+    # ONE-TIME SAFETY CHECK per video, before any labeling starts: found
+    # directly (2026-08-02) that some files in this folder are the main
+    # app's own pre-processed analysis output (skeleton + phase-label text
+    # burned in) despite having no filename in common with the app's own
+    # "Annotated_*" export convention — shared through some route that
+    # stripped the original name. A pixel-color auto-scan for this was
+    # tried and abandoned (too many false positives, e.g. bright sky
+    # mistaken for a text banner) — a human's one-second glance at the
+    # first frame is far more reliable than that heuristic turned out to be.
+    if not st.session_state.get("label_tool_video_confirmed"):
+        first_frame = _load_frame(video_path, 0)
+        if first_frame is not None:
+            st.image(first_frame, caption="First frame of this clip", width=500)
+        st.warning(
+            "⚠️ Quick check before labeling: does this look like RAW footage "
+            "(no skeleton, no dots, no text overlay)? If it already has "
+            "analysis graphics drawn on it, don't label it — pick a different video."
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("✅ Yes, this is raw footage — start labeling", use_container_width=True):
+                st.session_state.label_tool_video_confirmed = True
+                st.rerun()
+        with col_b:
+            if st.button("🚫 No, this is a processed video — skip it", use_container_width=True):
+                st.error(f"Noted — pick a different video from the sidebar. ({video_name} skipped)")
+        return
 
     sample_n = st.sidebar.number_input(
         "Label every Nth frame", min_value=1, max_value=10, value=SAMPLE_EVERY_N_FRAMES,
