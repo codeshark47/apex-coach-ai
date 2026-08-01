@@ -689,7 +689,7 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
         f"<b>Target Athlete:</b> {bowler_name} | "
         f"<b>Date:</b> {current_date} | "
         f"<b>Camera Mode:</b> {camera_mode} | "
-        f"<b>Status:</b> Certified Telemetry Data",
+        f"<b>Status:</b> AI-Assisted Biomechanical Estimate",
         body_style
     ))
     story.append(Spacer(1, 15))
@@ -786,7 +786,7 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
     story.append(Spacer(1, 25))
     story.append(Paragraph("—" * 60, body_style))
     story.append(Paragraph("<b>Shoaib Nazar</b>, Founder | Apex Coach AI", bold_body))
-    story.append(Paragraph("Automated Digital Lab Performance Report", body_style))
+    story.append(Paragraph("Automated Video-Based Coaching Report", body_style))
 
     doc.build(story)
     buffer.seek(0)
