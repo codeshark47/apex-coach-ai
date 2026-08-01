@@ -844,6 +844,81 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     )
 
 
+def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1920, max_height: int = 1080) -> None:
+    """
+    Writes an uploaded video to dest_path, downscaled to fit within
+    max_width x max_height (preserving aspect ratio, never upscaling a
+    smaller source) and re-encoded to H.264 via ffmpeg.
+
+    BUG FOUND from a real device test: a native 4K (2160x3840) HEVC
+    recording straight off a phone camera crashed the app during
+    Execute Analysis. Every clip tested before that had gone through
+    WhatsApp first, which re-compresses to well under 1080p — this
+    pipeline had never actually been asked to decode/process a full-
+    resolution native recording. MediaPipe, OpenCV, and ffmpeg all pay a
+    per-frame cost proportional to pixel count (4K is ~4x the pixels of
+    1080p, ~16x of 720p), and nothing capped that anywhere. Downscaling
+    once, upfront, fixes every downstream step at once instead of
+    patching each one individually.
+
+    Falls back to writing the original file untouched if ffmpeg isn't
+    available or the transcode fails, rather than failing outright —
+    same reasoning as transcode_to_h264.
+    """
+    import shutil
+    import tempfile
+
+    dest_dir = os.path.dirname(dest_path) or "."
+    os.makedirs(dest_dir, exist_ok=True)
+    raw_fd, raw_path = tempfile.mkstemp(
+        suffix=os.path.splitext(uploaded_file.name)[1] or ".mp4", dir=dest_dir
+    )
+    os.close(raw_fd)
+    with open(raw_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        print(
+            "WARNING: ffmpeg not found on PATH. Uploaded video will be used at "
+            "its original resolution, which may be slow or memory-heavy for "
+            "large 4K+ recordings. Install ffmpeg and ensure it's on PATH to fix this."
+        )
+        os.replace(raw_path, dest_path)
+        return
+
+    cmd = [
+        ffmpeg_bin, "-y", "-i", raw_path,
+        "-vf", f"scale={max_width}:{max_height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+        "-crf", "23", "-preset", "fast",
+        "-an", dest_path,
+    ]
+
+    try:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            startupinfo=startupinfo, timeout=180,
+        )
+        if result.returncode != 0 or not os.path.exists(dest_path):
+            print(
+                f"WARNING: video downscale failed (exit code {result.returncode}): "
+                f"{result.stderr.decode(errors='ignore')[:300]} — using original resolution."
+            )
+            os.replace(raw_path, dest_path)
+        else:
+            os.remove(raw_path)
+    except Exception as e:
+        monitoring.capture(e)
+        print(f"WARNING: video downscale raised an exception: {e} — using original resolution.")
+        os.replace(raw_path, dest_path)
+
+
 def transcode_to_h264(input_path: str) -> str:
     """
     Transcodes mp4v video to H264 for browser playback using ffmpeg.

@@ -209,3 +209,57 @@ class TestLandmarksCsvPath:
 
     def test_respects_a_custom_output_dir(self):
         assert o.landmarks_csv_path("Dual Camera", output_dir="tmp_out") == os.path.join("tmp_out", "landmarks_side.csv")
+
+
+class _FakeUploadedFile:
+    """Minimal stand-in for Streamlit's UploadedFile — just enough for
+    save_uploaded_video_capped, which only touches .name and .getbuffer()."""
+
+    def __init__(self, name: str, content: bytes):
+        self.name = name
+        self._content = content
+
+    def getbuffer(self):
+        return self._content
+
+
+class TestSaveUploadedVideoCapped:
+    """Regression test for a real production crash found from a coach's
+    device test: a native 4K (2160x3840) HEVC recording straight off a
+    phone camera crashed the app during Execute Analysis — every clip
+    tested before that had gone through WhatsApp first, which
+    re-compresses to well under 1080p, so this pipeline had never
+    actually been asked to decode/process a full-resolution native
+    recording. MediaPipe/OpenCV/ffmpeg all pay a per-frame cost
+    proportional to pixel count, and nothing capped that anywhere.
+
+    ffmpeg itself isn't available in this test environment, so these
+    cover the one behavior that's safe and meaningful to verify without
+    it: never fail outright, never silently drop the coach's video, even
+    if the downscale step itself can't run."""
+
+    def test_falls_back_to_original_bytes_when_ffmpeg_is_missing(self, tmp_path, monkeypatch):
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda name: None)
+
+        content = b"not a real video, just bytes to prove passthrough"
+        fake_file = _FakeUploadedFile("clip.mp4", content)
+        dest = str(tmp_path / "saved.mp4")
+
+        o.save_uploaded_video_capped(fake_file, dest)
+
+        assert os.path.exists(dest)
+        with open(dest, "rb") as f:
+            assert f.read() == content
+
+    def test_creates_the_destination_directory_if_missing(self, tmp_path, monkeypatch):
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda name: None)
+
+        content = b"video bytes"
+        fake_file = _FakeUploadedFile("clip.mov", content)
+        dest = str(tmp_path / "nested" / "dir" / "saved.mp4")
+
+        o.save_uploaded_video_capped(fake_file, dest)
+
+        assert os.path.exists(dest)
