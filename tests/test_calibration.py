@@ -50,6 +50,30 @@ class TestImplausibilityWarning:
         warning = cal.implausibility_warning(calibration, frame_width_px=848)
         assert warning is None
 
+    def test_short_distance_mapped_to_long_pixel_span_is_flagged(self):
+        """The mirror-image mistake: a short real-world distance (stump
+        width) entered against two points that are actually far apart on
+        screen — meters_per_pixel comes out too small, which would
+        UNDERESTIMATE every speed computed from it. Must be flagged."""
+        calibration = cal.compute_scale(
+            point_a_px=(50, 300), point_b_px=(700, 300),
+            real_world_distance_m=0.2286, reference_label="stump width",
+        )
+        warning = cal.implausibility_warning(calibration, frame_width_px=848)
+        assert warning is not None
+
+    def test_moderate_close_up_shot_of_a_longer_reference_is_not_flagged(self):
+        """A longer reference distance (e.g. crease-to-crease) clicked at
+        a moderate, plausible pixel span — not a full-frame shot, but not
+        suspiciously tiny either — must not be flagged in either
+        direction."""
+        calibration = cal.compute_scale(
+            point_a_px=(300, 300), point_b_px=(500, 300),
+            real_world_distance_m=5.0, reference_label="custom",
+        )
+        warning = cal.implausibility_warning(calibration, frame_width_px=848)
+        assert warning is None
+
 
 class TestReferenceFrameCacheIsBounded:
     def test_cache_has_a_bounded_entry_count(self):

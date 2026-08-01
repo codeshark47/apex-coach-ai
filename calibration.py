@@ -186,27 +186,59 @@ def implausibility_warning(calibration: Calibration, frame_width_px: int) -> Opt
 
     compute_scale itself can't catch this — it has no idea what the two
     points were SUPPOSED to be, only the distance actually clicked. This
-    only flags the specific pattern of a genuinely LONG real-world
-    distance (>= 2m, which rules out legitimate close-up single-stump
-    shots) mapped to a suspiciously SHORT pixel span (< 15% of the frame
-    width — a genuine "full pitch in frame" shot should span most of the
-    frame, comfortably above this) — advisory only, since an unusual but
-    correct camera setup is still possible. Returns a warning string, or
-    None if it looks fine. Verified directly against the reported case:
-    20.12m mapped to a 44px span is ~5% of a typical 848px-wide frame,
-    well under this threshold.
+    checks TWO symmetric failure patterns, both advisory only (an
+    unusual but correct camera setup is still possible in either
+    direction):
+
+    1. A genuinely LONG real-world distance (>= 2m, ruling out
+       legitimate close-up single-stump shots) mapped to a suspiciously
+       SHORT pixel span (< 15% of frame width) — meters_per_pixel comes
+       out too LARGE, which OVERESTIMATES every speed computed from it.
+       Verified directly against the reported case: 20.12m mapped to a
+       44px span is ~5% of a typical 848px-wide frame, well under this
+       threshold.
+
+    2. The mirror image, found while investigating reports of the SAME
+       calibrated setup also sometimes reporting implausibly SLOW speeds
+       (5-20km/h — implausible for genuine bowling effort): a short
+       real-world distance (<= 0.5m, e.g. stump width, 22.86cm) mapped
+       to a suspiciously LONG pixel span (> 60% of frame width) —
+       meters_per_pixel comes out too SMALL, which UNDERESTIMATES every
+       speed computed from it. This happens if the coach clicks two
+       points that are genuinely far apart on screen (e.g. actually
+       spanning most of the pitch) while entering a small reference
+       distance meant for something much closer together (e.g. a single
+       stump's width) — same root mistake as pattern 1, opposite
+       direction, opposite effect on the resulting speed.
+
+    Returns a warning string, or None if it looks fine.
     """
-    if calibration.reference_distance_m < 2.0:
+    if calibration.meters_per_pixel <= 0:
         return None
     implied_dist_px = calibration.reference_distance_m / calibration.meters_per_pixel
-    if implied_dist_px >= 0.15 * frame_width_px:
-        return None
-    return (
-        f"⚠️ Your two clicked points are only ~{implied_dist_px:.0f}px apart in a "
-        f"{frame_width_px}px-wide frame, but you entered "
-        f"{calibration.reference_distance_m}m of real-world distance — that's an "
-        f"unusually large scale. This usually means the two points weren't actually "
-        f"on opposite ends of the reference (e.g. both stumps sets not both clearly "
-        f"in frame, or a misclick). Reset points above and try again, zooming in for "
-        f"precision on each click, before trusting this calibration for speed."
-    )
+
+    if calibration.reference_distance_m >= 2.0 and implied_dist_px < 0.15 * frame_width_px:
+        return (
+            f"⚠️ Your two clicked points are only ~{implied_dist_px:.0f}px apart in a "
+            f"{frame_width_px}px-wide frame, but you entered "
+            f"{calibration.reference_distance_m}m of real-world distance — that's an "
+            f"unusually large scale, which would make speed estimates come out too "
+            f"FAST. This usually means the two points weren't actually on opposite "
+            f"ends of the reference (e.g. both stumps sets not both clearly in frame, "
+            f"or a misclick). Reset points above and try again, zooming in for "
+            f"precision on each click, before trusting this calibration for speed."
+        )
+
+    if calibration.reference_distance_m <= 0.5 and implied_dist_px > 0.6 * frame_width_px:
+        return (
+            f"⚠️ Your two clicked points are ~{implied_dist_px:.0f}px apart — over half "
+            f"of this {frame_width_px}px-wide frame — but you entered only "
+            f"{calibration.reference_distance_m}m of real-world distance — that's an "
+            f"unusually small scale, which would make speed estimates come out too "
+            f"SLOW. This usually means the two points are further apart on screen than "
+            f"the short real-world distance you entered actually covers (e.g. clicked "
+            f"across most of the pitch while entering a single stump's width). Reset "
+            f"points above and try again before trusting this calibration for speed."
+        )
+
+    return None

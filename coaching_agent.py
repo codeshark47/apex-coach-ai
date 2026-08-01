@@ -159,7 +159,10 @@ Separate the two sections with exactly one line containing only: ---
 
 SECTION 1 — BIOMECHANICAL NARRATIVE ASSESSMENT:
 Write 4-5 sentences analyzing the full kinetic chain from BFC through ball release.
-Reference actual measured values and their ZONE. Explicitly call out any missing data (N/A) without fabricating values.
+Reference each metric by name and its ZONE (OPTIMAL/ACCEPTABLE/CRITICAL) only — do NOT restate the
+exact numeric value yourself. The precise figures are already shown in the table directly above this
+narrative in the final report; a value you restate from memory risks not matching the table exactly,
+which has happened before and undermines trust in the whole report. Explicitly call out any missing data (N/A) without fabricating values.
 Clearly distinguish between what requires immediate correction (CRITICAL zone) versus what requires monitoring (ACCEPTABLE zone).
 
 SECTION 2 — PRESCRIBED DRILLS:

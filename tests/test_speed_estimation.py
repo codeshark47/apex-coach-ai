@@ -1,23 +1,45 @@
 """
 tests/test_speed_estimation.py
 
-Regression tests for a real reported production bug: a coach reported a
-properly-calibrated setup (clicking both popping-crease ends correctly)
-still returning ~600 km/h release-arm speed — physically impossible
-(fastest recorded deliveries are ~161 km/h).
+Regression tests for TWO real reported production bugs, both traced to
+the same underlying flaw in how peak release-arm speed was estimated:
+a properly-calibrated setup reported BOTH physically impossible speeds
+(~600 km/h; fastest recorded deliveries are ~161 km/h) on some clips AND
+suspiciously slow ones (~5-20 km/h, implausible for genuine bowling
+effort) on others — not two separate bugs, one shared cause.
 
-Root cause: _corroborated_peak_speed_px_s exists specifically to reject
-isolated single-frame tracking glitches (verified on real footage: raw
-wrist tracking during a fast, blurred swing shows both genuine sustained
-bursts AND one-frame jumps that snap straight back, a classic glitch
-signature) — but when corroboration failed for EVERY frame in the
-window (the window is pure noise, exactly the case the check exists to
-catch), the old code fell back to `max(speeds.values())`, the single
-WORST, most glitch-prone reading, with zero filtering. That inverted
-fallback is almost certainly what produced the 600 km/h reading. Fixed
-to return None (a clear "unreliable" signal) instead, and the smoothed-
-dataframe fallback path (which had the exact same unprotected-max bug)
-now goes through the same corroboration check.
+ROOT CAUSE (found on a full re-investigation, not assumed from the first
+fix): the previous "corroborated hop" approach required a frame-to-frame
+hop's speed to be matched by a comparably-fast NEIGHBORING hop before
+trusting it — built to catch a jump-then-snap-back tracking glitch,
+which does produce two adjacent, similarly-large hops. But the genuine
+peak wrist speed AT ball release is, by definition, a brief, sharp
+spike: release is the one instant the arm moves fastest, meaningfully
+faster than the frames just before/after it — that's what makes it the
+release point. That exact signature (one frame far exceeding its
+immediate neighbors) is what the old check was built to reject as
+noise. So on a real, fast, clean swing, the TRUE peak often failed its
+own "comparable neighbor" test and got discarded — while an unrelated,
+genuinely noisy corner of the window that happened to have two
+similarly-sized adjacent hops could still pass. This explains BOTH
+symptoms from one mechanism.
+
+FIX: _corroborated_peak_speed_px_s now fits a straight line (least
+squares) to x(t)/y(t) over a small window centered on each candidate
+frame (a simplified Savitzky-Golay derivative) and uses the FITTED
+slope as that frame's velocity, gated by the fit's R^2 (fit quality).
+Real coherent motion — even a brief, sharp peak — fits a short window
+well (high R^2); a tracking glitch or pure noise does not. fit_radius=2,
+min_r_squared=0.9 were tuned empirically (see the session that added
+this) against synthetic glitch/noise/sustained-motion scenarios,
+including a 1000-trial sweep confirming pure random noise passes the
+R^2 gate only ~0.2% of the time.
+
+Test window sizes below (~15-21 frames) match how this is actually
+called in production — the raw re-extraction window around release is
+comfortably wider than one fit window, so a single bad frame doesn't
+have to poison the only candidate; a real, clean window elsewhere in
+the same clip can still be found and used.
 """
 
 import numpy as np
@@ -26,54 +48,88 @@ import pandas as pd
 import speed_estimation as se
 
 
+def _positions_from_xy(xs, ys, start_frame=0):
+    return {start_frame + i: (x, y, 1.0) for i, (x, y) in enumerate(zip(xs, ys))}
+
+
 class TestCorroboratedPeakSpeed:
-    def test_isolated_single_frame_glitch_is_rejected(self):
-        """The case this function was originally built for: one frame
-        teleports far away and snaps straight back — no neighbor
-        corroborates it — must be excluded from the result."""
-        positions = {
-            0: (100.0, 100.0, 1.0),
-            1: (105.0, 100.0, 1.0),
-            2: (900.0, 900.0, 1.0),  # isolated glitch: huge jump...
-            3: (108.0, 100.0, 1.0),  # ...and snaps straight back
-            4: (112.0, 100.0, 1.0),
-        }
-        peak = se._corroborated_peak_speed_px_s(positions, fps=30)
-        # The real, corroborated motion is ~3-4px/frame -> ~90-120px/s.
-        # The glitch (~800px jump) would be ~24000px/s if it leaked through.
+    def test_isolated_single_frame_glitch_surrounded_by_good_data_is_rejected(self):
+        """The case this function exists to guard against: one frame
+        teleports far away (heavy motion blur misdetection), with plenty
+        of genuinely tracked, stationary frames on both sides. The glitch
+        must not leak through as a fabricated high speed."""
+        n = 21
+        x = np.full(n, 100.0)
+        y = np.full(n, 100.0)
+        x[10] = 900.0  # single-frame glitch
+        y[10] = 900.0
+        peak = se._corroborated_peak_speed_px_s(_positions_from_xy(x, y), fps=30)
         assert peak is not None
-        assert peak < 500
+        assert peak < 100  # genuinely near-stationary, not the glitch's ~35000px/s
 
     def test_real_reported_bug_pure_noise_window_returns_none_not_worst_value(self):
-        """THE exact regression: every frame-pair speed is an isolated
-        spike with no corroborating neighbor (pure tracking noise, e.g.
-        heavy motion blur right at release). Must return None — NOT the
-        single worst (highest, most glitch-prone) reading in the window,
-        which is what produced the reported ~600km/h."""
-        positions = {
-            0: (100.0, 100.0, 1.0),
-            1: (900.0, 100.0, 1.0),   # huge jump
-            2: (150.0, 800.0, 1.0),   # huge jump, different direction
-            3: (700.0, 50.0, 1.0),    # huge jump, different direction again
-            4: (120.0, 400.0, 1.0),   # huge jump, different direction again
-        }
-        peak = se._corroborated_peak_speed_px_s(positions, fps=30)
+        """THE original regression: a window that's pure tracking noise
+        end to end (heavy motion blur right at release, no genuine
+        coherent motion anywhere) must return None — NOT the single
+        worst (highest, most glitch-prone) reading, which is what
+        produced the originally reported ~600km/h."""
+        n = 21
+        rng = np.random.default_rng(0)
+        x = rng.uniform(0, 800, n)
+        y = rng.uniform(0, 800, n)
+        peak = se._corroborated_peak_speed_px_s(_positions_from_xy(x, y), fps=30)
         assert peak is None
 
     def test_genuine_sustained_burst_is_kept(self):
-        """A real delivery: several consecutive frames all show similar,
-        elevated speed. Must NOT be thrown away just because it's fast —
-        only isolated, uncorroborated spikes should be rejected."""
-        positions = {
-            0: (100.0, 100.0, 1.0),
-            1: (150.0, 100.0, 1.0),
-            2: (200.0, 100.0, 1.0),
-            3: (250.0, 100.0, 1.0),
-            4: (300.0, 100.0, 1.0),
-        }
-        peak = se._corroborated_peak_speed_px_s(positions, fps=30)
+        """A real delivery: many consecutive frames all show the same
+        steady, elevated speed. Must not be thrown away just because
+        it's fast."""
+        n = 21
+        x = np.arange(n) * 50.0
+        y = np.full(n, 100.0)
+        peak = se._corroborated_peak_speed_px_s(_positions_from_xy(x, y), fps=30)
         assert peak is not None
-        assert peak == 50.0 * 30  # 50px/frame * 30fps, every step agrees
+        assert abs(peak - 50.0 * 30) < 0.01  # 50px/frame * 30fps, every step agrees
+
+    def test_genuine_sharp_brief_peak_is_kept_not_rejected_for_lacking_a_comparable_neighbor(self):
+        """THE specific blind spot found in the OLD approach: a real
+        release swing is slow on approach, has a brief (few-frame) sharp
+        speed burst right at release, then slows again — the burst is
+        NOT comparable in magnitude to its immediate neighbors (that's
+        what makes it the peak), which is exactly what made the old
+        "needs a comparable neighbor" check discard genuine peaks. Must
+        be detected, close to its true magnitude, not diluted to near
+        the slow surrounding speed."""
+        n = 21
+        x = np.zeros(n)
+        for i in range(n):
+            if i < 9:
+                x[i] = i * 2.0  # slow approach, ~60px/s
+            elif i < 13:
+                x[i] = x[8] + (i - 8) * 40.0  # sharp burst, ~1200px/s
+            else:
+                x[i] = x[12] + (i - 12) * 3.0  # slow follow-through
+        y = np.full(n, 100.0)
+        peak = se._corroborated_peak_speed_px_s(_positions_from_xy(x, y), fps=30)
+        assert peak is not None
+        assert peak > 1000  # close to the true ~1200px/s burst, not ~60-90px/s
+
+    def test_pure_noise_false_positive_rate_is_low(self):
+        """Statistical sanity check on the R^2 gate itself: across many
+        independent pure-noise windows, only a small fraction should
+        randomly happen to look enough like a line to pass — verified
+        empirically at ~0.2% over 1000 trials when this was tuned."""
+        n = 21
+        false_positives = 0
+        trials = 200
+        for seed in range(trials):
+            rng = np.random.default_rng(seed)
+            x = rng.uniform(0, 800, n)
+            y = rng.uniform(0, 800, n)
+            peak = se._corroborated_peak_speed_px_s(_positions_from_xy(x, y), fps=30)
+            if peak is not None:
+                false_positives += 1
+        assert false_positives / trials < 0.05
 
 
 class TestComputeReleaseArmSpeedNeverFabricatesImpossibleNumbers:

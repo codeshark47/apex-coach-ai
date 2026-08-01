@@ -155,87 +155,105 @@ def _extract_raw_wrist_window(video_path: str, wrist_name: str, br_idx: int,
     return positions
 
 
-def _corroborated_peak_speed_px_s(positions: dict, fps: float) -> Optional[float]:
+def _fit_slope_and_r_squared(t: np.ndarray, values: np.ndarray) -> tuple:
     """
-    Peak frame-to-frame speed (px/s) from raw positions, rejecting
-    tracking-glitch spikes that don't correspond to real, directed
-    motion. Verified on real footage this matters: raw (unsmoothed) wrist
-    tracking during a fast, motion-blurred swing shows both genuine
-    sustained bursts (several consecutive frames moving steadily in one
-    direction) AND isolated one-frame glitches where the tracked point
-    jumps away then snaps straight back on the very next frame.
+    Least-squares slope of values vs t, and the fit's R^2 (1.0 = every
+    point sits exactly on the line, 0.0 = no better than a flat mean).
+    A constant (zero-variance) input is treated as a perfect fit with
+    zero slope — genuinely stationary, not evidence of bad tracking.
+    """
+    if np.allclose(values, values[0]):
+        return 0.0, 1.0
+    slope, intercept = np.polyfit(t, values, 1)
+    predicted = slope * t + intercept
+    ss_res = np.sum((values - predicted) ** 2)
+    ss_tot = np.sum((values - np.mean(values)) ** 2)
+    r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 1.0
+    return float(slope), float(r_squared)
 
-    TWO BUGS FIXED HERE, both found from one real reported case (a
-    correctly-calibrated setup still reporting ~600km/h — physically
-    impossible; fastest recorded deliveries are ~161km/h):
 
-    1. The corroboration test itself was wrong. A jump-then-snap-back
-       glitch produces TWO large, adjacent frame-to-frame speeds of
-       similar magnitude — the "out" hop and the "back" hop. The old
-       check only asked "is a neighboring hop's speed comparably large?"
-       — and two hops of a single glitch are, by construction, always
-       comparable in magnitude to EACH OTHER. So the exact glitch shape
-       this function's docstring describes was never actually caught.
-       Fixed with a physically-grounded test: pair each hop with an
-       adjacent one and compare NET displacement (straight-line, start
-       to end of the pair) against PATH length (sum of the two hops'
-       individual magnitudes). Real directed motion covers roughly as
-       much net ground as its path length suggests; an out-and-back
-       glitch's net displacement collapses toward zero while its path
-       length stays large — THAT mismatch is what actually identifies a
-       "snapped straight back" glitch. Verified directly: constructing
-       exactly this glitch shape, the old check kept it, this one
-       rejects it and correctly recovers the genuine (much slower)
-       background motion instead.
+def _corroborated_peak_speed_px_s(positions: dict, fps: float,
+                                   fit_radius: int = 2, min_r_squared: float = 0.9) -> Optional[float]:
+    """
+    Peak velocity (px/s) from raw per-frame positions, using a locally
+    fitted straight line (least squares) instead of a single frame-to-
+    frame hop — a real, structural blind spot was found in the previous
+    "corroborated hop" approach this replaces, from real reported cases
+    where a correctly-calibrated setup reported BOTH physically
+    impossible speeds (~600km/h; fastest recorded deliveries are
+    ~161km/h) on some clips AND suspiciously slow ones (~5-20km/h,
+    implausible for genuine bowling effort) on others.
 
-    2. When NOTHING in the window is corroborated (a window that's pure
-       noise from end to end — exactly the case this function exists to
-       catch), the old code fell back to `max(speeds.values())`: the
-       single WORST, least-trustworthy reading in the entire window,
-       with zero filtering. That's backwards — total corroboration
-       failure is the strongest possible signal the data is unreliable,
-       so this returns None (a real "no reliable reading here" signal
-       the caller acts on) instead of silently handing back the exact
-       kind of glitch this check was built to reject.
+    THE BLIND SPOT: the old method required a hop's speed to be matched
+    by a comparably-fast NEIGHBORING hop before trusting it — built to
+    catch a jump-then-snap-back tracking glitch, which does produce two
+    adjacent, similarly-large hops. But the genuine peak wrist speed AT
+    ball release is, by definition, a brief, sharp spike: release is the
+    one instant the arm moves fastest, meaningfully faster than the
+    frames just before/after it — that's what makes it the release
+    point. That exact signature (one frame far exceeding its immediate
+    neighbors) is what the old check was built to reject as noise. So on
+    a real, fast, clean swing, the TRUE peak often failed its own
+    "comparable neighbor" test and got discarded — while an unrelated,
+    genuinely noisy corner of the window that happened to have two
+    similarly-sized adjacent hops could still pass. This is consistent
+    with results swinging wildly between too-fast (a glitch that DID
+    corroborate itself) and too-slow (the real peak rejected, a weaker
+    reading accepted instead) — not two separate bugs, one shared cause.
+
+    THE FIX: for each candidate center frame, fit a straight line (least
+    squares) to x(t) and y(t) separately over a small window of
+    `2*fit_radius+1` consecutive frames centered on it, and use the
+    FITTED slope as that frame's velocity — a standard technique
+    (equivalent to a simplified Savitzky-Golay derivative) for
+    estimating the derivative of a noisy signal. Real physical motion is
+    locally smooth even during rapid acceleration, so a short window's
+    true trend is well approximated by a line; a single erratic frame
+    corrupts that line's RESIDUAL rather than silently passing through
+    unquestioned like a raw two-point difference would. R^2 (fit
+    quality, the weaker of the x/y axes) gates which candidates are
+    trusted: genuine coherent motion fits a line well (high R^2); a
+    window containing a tracking glitch, or pure noise, does not (low
+    R^2). The reported peak is the highest velocity among windows
+    meeting min_r_squared — if none do, returns None (an honest "no
+    reliable window" signal), never the least-trustworthy reading.
+
+    Needs at least 2*fit_radius+1 frames of raw positions to evaluate
+    even one candidate window; the caller should pass a raw-position
+    window comfortably wider than that (e.g. the ~80ms-either-side
+    window already used around release) so multiple candidate centers
+    exist and a glitch in one doesn't have to poison the only option.
     """
     frames = sorted(positions.keys())
-    hops = {}
-    for i in range(len(frames) - 1):
-        f0, f1 = frames[i], frames[i + 1]
-        if f1 - f0 != 1:
-            continue
-        x0, y0, _ = positions[f0]
-        x1, y1, _ = positions[f1]
-        hops[f0] = (x1 - x0, y1 - y0)
-
-    if not hops:
+    span = 2 * fit_radius + 1
+    if len(frames) < span:
         return None
 
-    speeds = {k: math.hypot(*v) * fps for k, v in hops.items()}
-    CORROBORATION_FRACTION = 0.5
+    frame_to_xy = {f: (positions[f][0], positions[f][1]) for f in frames}
+    best_speed = None
 
-    def _is_directed_pair(k_a: int, k_b: int) -> bool:
-        """k_a, k_b are adjacent hop-start frames with k_b == k_a + 1,
-        together covering a contiguous 3-frame span."""
-        dxa, dya = hops[k_a]
-        dxb, dyb = hops[k_b]
-        path = math.hypot(dxa, dya) + math.hypot(dxb, dyb)
-        if path == 0:
-            return True
-        net = math.hypot(dxa + dxb, dya + dyb)
-        return net >= CORROBORATION_FRACTION * path
+    for center in frames:
+        window_frames = [center + d for d in range(-fit_radius, fit_radius + 1)]
+        if any(f not in frame_to_xy for f in window_frames):
+            continue
 
-    corroborated = []
-    for k in hops:
-        neighbors = [k2 for k2 in (k - 1, k + 1) if k2 in hops]
-        is_corroborated = any(
-            speeds[k2] >= CORROBORATION_FRACTION * speeds[k] and _is_directed_pair(*sorted((k, k2)))
-            for k2 in neighbors
-        )
-        if is_corroborated:
-            corroborated.append(speeds[k])
+        t = np.array(window_frames, dtype=float) / fps
+        xs = np.array([frame_to_xy[f][0] for f in window_frames])
+        ys = np.array([frame_to_xy[f][1] for f in window_frames])
 
-    return max(corroborated) if corroborated else None
+        vx, r2_x = _fit_slope_and_r_squared(t, xs)
+        vy, r2_y = _fit_slope_and_r_squared(t, ys)
+        # The weaker of the two axes' fits — a good fit on x alone
+        # doesn't matter if y is scattered noise (or vice versa).
+        r2 = min(r2_x, r2_y)
+        if r2 < min_r_squared:
+            continue
+
+        speed = math.hypot(vx, vy)
+        if best_speed is None or speed > best_speed:
+            best_speed = speed
+
+    return best_speed
 
 
 def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
