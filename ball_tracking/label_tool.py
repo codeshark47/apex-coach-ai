@@ -101,6 +101,53 @@ def _already_labeled_counts(client) -> dict:
     return counts
 
 
+def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
+                 total_frames: int, frame_idx: int, x: float, y: float, radius: float):
+    """
+    One ball_tracking_runs row per clip, merging each newly-labeled
+    frame's position/radius into its raw_candidates dict.
+
+    BUG FOUND: ball_tracking_runs has no unique constraint on
+    source_video_filename alone (only ball_tracking_labels does, on
+    (source_video_filename, frame_index)) — an upsert with
+    on_conflict="source_video_filename" fails outright with a real
+    Postgres error ("no unique or exclusion constraint matching the ON
+    CONFLICT specification"), not something that can be swallowed or
+    retried. Read-then-insert-or-update explicitly instead, rather than
+    requiring a schema migration before labeling can even start — a
+    single coach clicking through frames one at a time has no real
+    concurrent-write risk here.
+    """
+    existing = (
+        client.table("ball_tracking_runs")
+        .select("id,raw_candidates,frames_with_candidates")
+        .eq("source_video_filename", video_name)
+        .execute()
+    )
+    candidate = {"x_px": x, "y_px": y, "radius_px": radius}
+
+    if existing.data:
+        row = existing.data[0]
+        raw_candidates = row.get("raw_candidates") or {}
+        raw_candidates[str(frame_idx)] = candidate
+        client.table("ball_tracking_runs").update({
+            "raw_candidates": raw_candidates,
+            "frames_with_candidates": len(raw_candidates),
+        }).eq("id", row["id"]).execute()
+    else:
+        client.table("ball_tracking_runs").insert({
+            "source_video_filename": video_name,
+            "camera_setup_label": "direct_click_v1",
+            "detector_name": "human_click",
+            "fps": fps,
+            "frame_width": frame_w,
+            "frame_height": frame_h,
+            "total_frames": total_frames,
+            "frames_with_candidates": 1,
+            "raw_candidates": {str(frame_idx): candidate},
+        }).execute()
+
+
 def _load_frame(video_path: str, frame_idx: int):
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -234,17 +281,7 @@ def main():
                 "notes": "Directly clicked by the coach on the original, unmarked frame — "
                          "no drawn marker ever existed on this video's pixels.",
             }, on_conflict="source_video_filename,frame_index").execute()
-            client.table("ball_tracking_runs").upsert({
-                "source_video_filename": video_name,
-                "camera_setup_label": "direct_click_v1",
-                "detector_name": "human_click",
-                "fps": fps,
-                "frame_width": orig_w,
-                "frame_height": frame_rgb.shape[0],
-                "total_frames": total_frames,
-                "frames_with_candidates": 1,
-                "raw_candidates": {str(frame_idx): {"x_px": x, "y_px": y, "radius_px": radius}},
-            }, on_conflict="source_video_filename").execute()
+            _upsert_run(client, video_name, fps, orig_w, frame_rgb.shape[0], total_frames, frame_idx, x, y, radius)
             st.session_state.label_tool_history.append((frame_idx, True))
             st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             del st.session_state[pending_point_key]
