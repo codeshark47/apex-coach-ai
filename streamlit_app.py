@@ -1062,6 +1062,33 @@ camera_angle_override = {
     "Side-on": "side_on",
     "Rear-view / Front-on": "front_or_rear",
 }[camera_angle_choice]
+
+
+def _reject_if_empty_upload(uploaded_file):
+    """
+    Real failure mode found from a coach's screen recording + device
+    testing across iPhone/Samsung vs. Pixel/Infinix: iCloud "Optimize
+    Storage" and Samsung Cloud both keep only a low-res stub on-device
+    for videos backed up to the cloud, silently fetching the real file
+    only when something tries to read it. Pixel/Infinix don't do this
+    by default — matching why only iPhone/Samsung ever showed the
+    problem. A stub handed to the browser before it's finished
+    resolving can surface here as a 0-byte (or near-zero) upload rather
+    than the picker failing to attach anything at all. Catch it with a
+    specific, actionable message instead of letting it fail silently
+    downstream.
+    """
+    if uploaded_file is not None and uploaded_file.size < 1024:
+        st.sidebar.error(
+            "⚠️ This video came through as (almost) empty. If it's backed up to "
+            "iCloud or Samsung Cloud, your phone may not have downloaded the full "
+            "file yet — open it once in your Gallery/Photos app until it fully "
+            "plays, then upload it again."
+        )
+        return True
+    return False
+
+
 st.sidebar.divider()
 st.sidebar.header("📁 Upload Video")
 uploaded_side = None
@@ -1070,10 +1097,24 @@ uploaded_single = None
 
 if camera_mode == "Single Camera":
     uploaded_single = st.sidebar.file_uploader("Bowling Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"])
+    st.sidebar.caption(
+        "📱 Video not attaching after a few tries? If it's backed up to iCloud/"
+        "Samsung Cloud, open it fully in your Gallery app first, then retry here."
+    )
+    if _reject_if_empty_upload(uploaded_single):
+        uploaded_single = None
 else:
     st.sidebar.info("Upload both angles for maximum accuracy. Events are detected independently on each stream.")
     uploaded_side = st.sidebar.file_uploader("📹 Side-On Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="side")
     uploaded_rear = st.sidebar.file_uploader("📹 Rear-View Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="rear")
+    st.sidebar.caption(
+        "📱 Video not attaching after a few tries? If it's backed up to iCloud/"
+        "Samsung Cloud, open it fully in your Gallery app first, then retry here."
+    )
+    if _reject_if_empty_upload(uploaded_side):
+        uploaded_side = None
+    if _reject_if_empty_upload(uploaded_rear):
+        uploaded_rear = None
 
 
 def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: str = None):
