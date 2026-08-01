@@ -55,6 +55,14 @@ SEARCH_DIRS = [
 EXCLUDED_FILENAMES = {"vidssave.com Fulltrack AI - How to Set Up + Equipment Needed 720P.mp4"}
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v")
 
+# BUG FOUND: the Downloads folder is shared with the main app's own
+# generated output (skeleton-overlay analysis result videos), not just
+# raw source footage — these have the skeleton, phase labels, and chart
+# panel burned into every frame, exactly the "burned-in artifact" problem
+# this whole tool exists to avoid. Filtered out by the same naming
+# convention the main app already uses for every one of these exports.
+EXCLUDED_PREFIXES = ("Annotated_",)
+
 SAMPLE_EVERY_N_FRAMES = 3
 MAX_DISPLAY_WIDTH = 960
 DEFAULT_RADIUS_FRACTION = 0.02  # of frame width — first-frame starting guess only
@@ -69,6 +77,8 @@ def _discover_videos() -> list:
             continue
         for name in os.listdir(d):
             if name in EXCLUDED_FILENAMES:
+                continue
+            if name.startswith(EXCLUDED_PREFIXES):
                 continue
             if not name.lower().endswith(VIDEO_EXTENSIONS):
                 continue
