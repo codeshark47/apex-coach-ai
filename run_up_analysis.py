@@ -76,7 +76,18 @@ def _get_series(df: pd.DataFrame, col: str, frame_width: int, frame_height: int,
     # performance in that same test while still declining to bridge truly
     # extreme gaps (subject leaving frame for a long stretch).
     limit = max(8, int(fps * 0.4))
-    series = df[col].interpolate(method="linear", limit=limit, limit_direction="both")
+    # BUG FOUND during a broader audit: missing limit_area="inside" meant
+    # a leading or trailing run of NaN (e.g. the bowler not yet
+    # confidently detected at the very start of the run-up — exactly the
+    # scenario this function's own docstring above describes as common)
+    # got filled with a frozen, fabricated value copied from the nearest
+    # real detection, up to the full limit (~12 frames at 30fps) — the
+    # same "flat line erases a genuine footfall peak" failure mode this
+    # rewrite was built to fix for interior gaps, just left open at the
+    # clip's edges. limit_area="inside" only fills a gap with real data
+    # bracketing it on BOTH sides, matching main.py's equivalent fix.
+    series = df[col].interpolate(method="linear", limit=limit, limit_direction="both",
+                                  limit_area="inside")
     return series.values * scale
 
 

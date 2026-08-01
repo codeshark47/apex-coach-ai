@@ -128,6 +128,35 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, fps, lo_bound, hi_bound
     return result
 
 
+def smooth_without_resurrecting_gaps(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """
+    Rolling-mean smoothing that never fills in a position that was
+    genuinely missing beforehand.
+
+    BUG FOUND during a broader audit: a plain
+    rolling(window, center=True, min_periods=1).mean() will happily
+    average whatever non-NaN values fall in its window even when only
+    1-2 of them are real — which silently RESURRECTS frames an earlier
+    interpolate(..., limit_area="inside") step correctly left as genuine
+    NaN (a real tracking gap longer than its fill limit, deliberately
+    left unpatched so downstream code treats it as missing, not guessed).
+    Verified directly: a 21-frame real gap came out of interpolate()
+    correctly NaN from a couple frames in, but the rolling mean alone
+    filled those frames with fabricated values derived from just 1-2
+    real neighbors — extending the "fabricated data" zone ~2 frames
+    deeper into every long gap than intended, with no error or flag
+    anywhere downstream that would catch it.
+
+    Smoothing must only ever refine data that's actually present, never
+    manufacture data that isn't — this remembers which positions were
+    NaN before smoothing and forces them back to NaN after, regardless
+    of what the rolling mean computed for them.
+    """
+    pre_smoothing_nan_mask = df.isna()
+    smoothed = df.rolling(window=window, center=True, min_periods=1).mean()
+    return smoothed.where(~pre_smoothing_nan_mask)
+
+
 def extract_video_landmarks(video_path: str, output_csv_path: str,
                              seed_point: tuple = None,
                              seed_frame_index: int = 0,
@@ -446,9 +475,13 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
     # identity-switching risk from last night's heuristics. Now runs on
     # outlier-cleaned data (above), so it's smoothing real motion instead
     # of also having to absorb occasional bad-frame spikes.
-    output_df[landmark_cols] = output_df[landmark_cols].rolling(
-        window=5, center=True, min_periods=1
-    ).mean()
+    #
+    # BUG FOUND during a broader audit, fixed in smooth_without_resurrecting_gaps
+    # below: a plain rolling(..., min_periods=1).mean() silently RESURRECTS
+    # frames the interpolate step above correctly left as genuine NaN (a
+    # real gap longer than gap_fill_limit, deliberately NOT patched) — see
+    # that function's docstring for the verified real-footage detail.
+    output_df[landmark_cols] = smooth_without_resurrecting_gaps(output_df[landmark_cols])
 
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
     output_df.to_csv(output_csv_path, index=False)

@@ -214,6 +214,24 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     trunk_lean_val  = clean_numeric(lean_analysis.get("trunk_lean_degrees") or lean_analysis.get("degrees"))
     knee_bracing_val = clean_numeric(knee_analysis.get("front_knee_angle") or knee_analysis.get("degrees"))
 
+    # ANATOMICAL PLAUSIBILITY GUARD (knee bracing only) — BUG FOUND during
+    # a broader audit: orchestrator.py's Single Camera path has had this
+    # guard for a while (a human knee cannot physically be at ~0 degrees
+    # mid-delivery; a near-zero reading here means the hip/knee/ankle
+    # landmarks collapsed onto nearly the same point from a tracking
+    # failure, and arccos(~1) returned ~0 as a pure math artifact, not a
+    # real measurement), but Dual Camera computed the identical value
+    # from the same underlying calculate_knee_bracing() and never applied
+    # it — a collapsed-landmark artifact that Single Camera would report
+    # as "no data" was instead shown here as a real, severe (red/Critical)
+    # finding. Same threshold as orchestrator.py, same reasoning: not a
+    # cited biomechanics constant, just basic human anatomy. Deliberately
+    # NOT applied to trunk_lean — 0 degrees of trunk lean is a real,
+    # genuinely ideal result there.
+    KNEE_ANGLE_IMPLAUSIBLE_THRESHOLD = 5.0  # degrees
+    if knee_bracing_val is not None and knee_bracing_val < KNEE_ANGLE_IMPLAUSIBLE_THRESHOLD:
+        knee_bracing_val = None
+
     return {
         "status": "success",
         "camera_mode": "dual",

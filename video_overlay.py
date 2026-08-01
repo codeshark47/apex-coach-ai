@@ -115,6 +115,41 @@ def limb_segment_is_plausible(p_a, p_b, torso_h: float, max_len_to_torso_ratio: 
     return seg_len <= max_len_to_torso_ratio * torso_h
 
 
+_ARM_SEGMENT_BONES = (
+    ("LEFT_SHOULDER", "LEFT_ELBOW"), ("LEFT_ELBOW", "LEFT_WRIST"),
+    ("RIGHT_SHOULDER", "RIGHT_ELBOW"), ("RIGHT_ELBOW", "RIGHT_WRIST"),
+)
+
+
+def implausible_arm_nodes(row, torso_h: float) -> set:
+    """
+    Which arm joint NODES (elbow/wrist) sit at the far end of an
+    implausible bone segment, for this one frame — the distal joint of
+    any arm bone limb_segment_is_plausible rejects.
+
+    BUG FOUND during a broader audit: the skeleton-drawing loop already
+    used limb_segment_is_plausible to skip drawing an implausible arm
+    BONE (see that function's docstring for the real phantom-wrist case
+    this guards against), but the separate joint-DOT drawing loop only
+    checked for NaN, not plausibility — so a mistracked wrist's
+    connecting bone was correctly suppressed while its own dot still
+    rendered at that same implausible position: a floating,
+    disconnected marker instead of a full phantom limb, but still a
+    visibly wrong, unflagged artifact drawn as if real. Callers should
+    skip drawing any joint dot in the returned set, the same frame its
+    connecting bone(s) get skipped.
+    """
+    implausible = set()
+    for part_a, part_b in _ARM_SEGMENT_BONES:
+        if pd.isna(row.get(f"{part_a}_x")) or pd.isna(row.get(f"{part_b}_x")):
+            continue
+        norm_a = (float(row[f"{part_a}_x"]), float(row[f"{part_a}_y"]))
+        norm_b = (float(row[f"{part_b}_x"]), float(row[f"{part_b}_y"]))
+        if not limb_segment_is_plausible(norm_a, norm_b, torso_h):
+            implausible.add(part_b)
+    return implausible
+
+
 def body_size_is_plausible(body_height_px, min_height_px: float = 30.0) -> bool:
     """
     Sanity-checks that a frame's estimated body height is at least a
@@ -830,18 +865,29 @@ def render_annotated_video(video_path: str, output_path: str,
                 # own length instead, so only the one implausible bone gets
                 # skipped, not the whole limb or the whole skeleton.
                 _torso_h_for_limbs = _torso_height(row)
-                _arm_segment_bones = {
-                    ("LEFT_SHOULDER", "LEFT_ELBOW"), ("LEFT_ELBOW", "LEFT_WRIST"),
-                    ("RIGHT_SHOULDER", "RIGHT_ELBOW"), ("RIGHT_ELBOW", "RIGHT_WRIST"),
-                }
+                _arm_segment_bones = set(_ARM_SEGMENT_BONES)
+                # BUG FOUND during a broader audit: this loop correctly
+                # skips drawing an implausible arm BONE (limb_segment_is_
+                # plausible), but the separate joint-dot loop further down
+                # only checks for NaN, not plausibility — so the exact
+                # phantom-wrist case this guard exists for (a mistracked
+                # wrist floating far from the elbow/shoulder during a
+                # blurred release swing) had its connecting bone correctly
+                # suppressed while the wrist's own dot still rendered at
+                # that same implausible position: a floating, disconnected
+                # marker instead of a full phantom limb, but still a
+                # visibly wrong, unflagged artifact drawn as if real.
+                # implausible_arm_nodes computes this once (see its own
+                # docstring); the joint loop below skips drawing anything
+                # in the result the same frame its connecting bone(s) get
+                # skipped here.
+                _implausible_nodes = implausible_arm_nodes(row, _torso_h_for_limbs)
                 for partA, partB in connections:
                     try:
                         if pd.isna(row[f"{partA}_x"]) or pd.isna(row[f"{partB}_x"]):
                             continue
                         if (partA, partB) in _arm_segment_bones:
-                            norm_a = (float(row[f"{partA}_x"]), float(row[f"{partA}_y"]))
-                            norm_b = (float(row[f"{partB}_x"]), float(row[f"{partB}_y"]))
-                            if not limb_segment_is_plausible(norm_a, norm_b, _torso_h_for_limbs):
+                            if partB in _implausible_nodes:
                                 continue
                         xA = int(float(row[f"{partA}_x"]) * width)
                         yA = int(float(row[f"{partA}_y"]) * height)
@@ -918,6 +964,7 @@ def render_annotated_video(video_path: str, output_path: str,
                             # ONLY check standing between a floating wrist
                             # and a fabricated-looking direct line to it.
                             if not limb_segment_is_plausible(norm_shoulder, norm_wrist, _torso_h_for_limbs):
+                                _implausible_nodes.add(wrist)
                                 continue
                             xA = int(float(row[f"{shoulder}_x"]) * width)
                             yA = int(float(row[f"{shoulder}_y"]) * height)
@@ -963,7 +1010,7 @@ def render_annotated_video(video_path: str, output_path: str,
                 _hero_node_size_extra = _hero_extra_px if _is_side_on_module else 0
                 for node in joint_nodes:
                     try:
-                        if pd.isna(row[f"{node}_x"]):
+                        if pd.isna(row[f"{node}_x"]) or node in _implausible_nodes:
                             continue
                         nx = int(float(row[f"{node}_x"]) * width)
                         ny = int(float(row[f"{node}_y"]) * height)

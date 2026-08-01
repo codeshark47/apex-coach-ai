@@ -189,7 +189,15 @@ def describe_range(metric_key: str) -> str:
         return f"{v * 100:.0f}%" if r.unit == "%" else f"{v}{r.unit}"
 
     if r.kind == "higher_better":
-        return (f"- {r.label}: Optimal {fv(r.green[0])}-{fv(r.green[1])} | "
+        # BUG FIX: this used to render the green band as CLOSED
+        # ("Optimal 85%-130%"), implying a ceiling — but classify() for
+        # "higher_better" has no ceiling on purpose (see release_height's
+        # own comment: a high ratio from a tall/leaping bowler is a real,
+        # legitimate trait, not a fault). A value like 145% used to show
+        # as "OPTIMAL" right next to a range string that visibly excluded
+        # it — self-contradictory in the same report row. Open-ended,
+        # matching what display_optimal already correctly says.
+        return (f"- {r.label}: Optimal {fv(r.green[0])}+ | "
                 f"Acceptable {fv(r.amber[0])}-{fv(r.amber[1])} | "
                 f"Critical below {fv(r.amber[0])}")
     elif r.kind == "lower_better":
@@ -234,8 +242,16 @@ def measurement_warning(metric_key: str, value) -> str:
         return "Value exceeds 45° — possible camera angle artifact. Verify video angle before prescribing corrections."
     if metric_key == "hip_shoulder_separation" and v < 5:
         return "Value below 5° — possible rear-view camera limitation affecting measurement accuracy."
-    if metric_key == "release_height" and v > 1.15:
-        return "Ratio exceeds 1.15 — measurement error likely. Check landmark tracking quality."
+    # NOTE: release_height intentionally has NO warning threshold here.
+    # It used to fire at v > 1.15 — stale from before release_height's
+    # RANGES entry was fixed to kind="higher_better" with no ceiling (a
+    # tall/leaping bowler's high ratio is real, not a fault). That left
+    # a value classify() correctly calls "green" showing this warning
+    # ("measurement error likely") in the same report row. The genuine
+    # implausibility ceiling for this metric lives upstream, in
+    # calculate_release_height_ratio_safe (rejects > 1.30 before a value
+    # ever reaches here) — this function must not re-impose a second,
+    # lower, contradictory one.
     return None
 
 

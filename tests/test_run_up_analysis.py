@@ -38,6 +38,39 @@ def _synthetic_stride_df(fps=30, n_frames=90, cadence_hz=2.0, amplitude=0.05):
     })
 
 
+class TestGetSeriesDoesNotFabricateEdgeGaps:
+    """Regression test for a real bug found during a broader audit:
+    _get_series's interpolate() call had no limit_area="inside", so a
+    leading or trailing run of missing frames (e.g. the bowler not yet
+    confidently detected at the very start of the run-up, a scenario
+    this module's own docstring describes as common) got filled with a
+    frozen, fabricated value copied from the nearest real detection —
+    the same "flat line erases a genuine footfall peak" failure this
+    module was rewritten to fix for interior gaps, just left open at the
+    clip's edges."""
+
+    def test_leading_gap_stays_nan_not_a_frozen_value(self):
+        fps = 30
+        vals = [np.nan] * 10 + list(np.arange(10, 30, dtype=float))
+        df = pd.DataFrame({"LEFT_HEEL_y": vals})
+
+        series = rua._get_series(df, "LEFT_HEEL_y", frame_width=640, frame_height=480,
+                                  is_x=False, fps=fps)
+
+        assert np.isnan(series[:10]).all()
+
+    def test_short_interior_gap_is_still_bridged_normally(self):
+        """The fix must not disable interior gap-filling — only stop
+        fabricating data at the clip's edges."""
+        vals = [10.0, 11.0, 12.0, np.nan, np.nan, 15.0, 16.0]
+        df = pd.DataFrame({"LEFT_HEEL_y": vals})
+
+        series = rua._get_series(df, "LEFT_HEEL_y", frame_width=640, frame_height=480,
+                                  is_x=False, fps=30)
+
+        assert not np.isnan(series[3:5]).any()
+
+
 class TestDetectRunUpStrides:
     def test_clean_synthetic_stride_signal_at_30fps_is_detected(self):
         """The exact regression case: at 30fps (the most common real

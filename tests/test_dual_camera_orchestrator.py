@@ -103,3 +103,64 @@ class TestBowlingArmDetectedIsInBiomechanicalMetrics:
         )
 
         assert result["biomechanical_metrics"]["bowling_arm_detected"] == "left"
+
+
+class TestKneeAngleImplausibilityGuard:
+    """Regression test for a real bug found during a broader audit:
+    orchestrator.py's Single Camera path has long rejected a near-zero
+    knee-bracing reading as a collapsed-landmark tracking artifact (a
+    human knee cannot physically fold to ~0 degrees mid-delivery), but
+    Dual Camera computed the identical value from the same underlying
+    calculate_knee_bracing() and never applied the same guard — a
+    tracking-failure artifact Single Camera would report as "no data"
+    was instead shown here as a real, severe (red/Critical) finding."""
+
+    @_patch_all_collaborators
+    def test_near_zero_knee_angle_is_nulled_not_reported_as_a_real_finding(self, *mocks):
+        events = {"BFC": 0, "FFC": 5, "BR": 10}
+        side_precomputed = {
+            "status": "success", "df": _minimal_df(), "fps": 30,
+            "events": dict(events), "bowling_arm": "right",
+        }
+        rear_precomputed = {
+            "status": "success", "df": _minimal_df(), "fps": 30,
+            "events": dict(events),
+        }
+
+        with patch.object(dco, "calculate_knee_bracing",
+                           return_value={"status": "success", "degrees": 2.3,
+                                         "tier": "Collapsing Knee Joint"}):
+            result = dco.run_dual_camera_analysis(
+                "fake_side.mp4", "fake_rear.mp4",
+                side_precomputed=side_precomputed, rear_precomputed=rear_precomputed,
+            )
+
+        knee = result["biomechanical_metrics"]["front_knee_bracing"]
+        assert knee["degrees"] is None
+        assert knee["status"] == "error"
+
+    @_patch_all_collaborators
+    def test_genuine_low_but_plausible_knee_angle_is_kept(self, *mocks):
+        """A real, if poor, knee-bracing reading (e.g. a collapsing but
+        still anatomically real knee) must not be swept up by the same
+        guard — only genuinely impossible near-zero readings."""
+        events = {"BFC": 0, "FFC": 5, "BR": 10}
+        side_precomputed = {
+            "status": "success", "df": _minimal_df(), "fps": 30,
+            "events": dict(events), "bowling_arm": "right",
+        }
+        rear_precomputed = {
+            "status": "success", "df": _minimal_df(), "fps": 30,
+            "events": dict(events),
+        }
+
+        with patch.object(dco, "calculate_knee_bracing",
+                           return_value={"status": "success", "degrees": 130.0, "tier": "Acceptable"}):
+            result = dco.run_dual_camera_analysis(
+                "fake_side.mp4", "fake_rear.mp4",
+                side_precomputed=side_precomputed, rear_precomputed=rear_precomputed,
+            )
+
+        knee = result["biomechanical_metrics"]["front_knee_bracing"]
+        assert knee["degrees"] == 130.0
+        assert knee["status"] == "success"

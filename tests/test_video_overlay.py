@@ -172,3 +172,55 @@ class TestBodySizeIsPlausible:
         """Can't judge without a usable measurement — must not become a
         new reason frames go missing."""
         assert vo.body_size_is_plausible(None) is True
+
+
+def _row_with_arm(shoulder, elbow, wrist, side="RIGHT", torso_h=0.2):
+    """A minimal row with one arm's three joints plus enough torso
+    landmarks for _torso_height to compute, for implausible_arm_nodes
+    tests. shoulder/elbow/wrist are (x, y) tuples or None to omit."""
+    data = {
+        "LEFT_SHOULDER_x": 0.45, "LEFT_SHOULDER_y": 0.3,
+        "RIGHT_SHOULDER_x": 0.55, "RIGHT_SHOULDER_y": 0.3,
+        "LEFT_HIP_x": 0.45, "LEFT_HIP_y": 0.3 + torso_h,
+        "RIGHT_HIP_x": 0.55, "RIGHT_HIP_y": 0.3 + torso_h,
+    }
+    for name, point in ((f"{side}_SHOULDER", shoulder), (f"{side}_ELBOW", elbow), (f"{side}_WRIST", wrist)):
+        if point is not None:
+            data[f"{name}_x"], data[f"{name}_y"] = point
+        else:
+            data[f"{name}_x"], data[f"{name}_y"] = float("nan"), float("nan")
+    return pd.Series(data)
+
+
+class TestImplausibleArmNodes:
+    """Regression test for a real bug found during a broader audit: the
+    skeleton-drawing loop already skipped an implausible arm BONE via
+    limb_segment_is_plausible, but the separate joint-dot loop only
+    checked for NaN — so a mistracked wrist's connecting bone was
+    correctly suppressed while the wrist's own dot still rendered at
+    that same implausible position. implausible_arm_nodes centralizes
+    the decision both loops now share."""
+
+    def test_phantom_wrist_segment_flags_the_wrist_node(self):
+        row = _row_with_arm(
+            shoulder=(0.55, 0.3), elbow=(0.6, 0.4), wrist=(0.9, 0.9),  # far, implausible
+            side="RIGHT", torso_h=0.2,
+        )
+        flagged = vo.implausible_arm_nodes(row, torso_h=0.2)
+        assert "RIGHT_WRIST" in flagged
+
+    def test_normal_arm_flags_nothing(self):
+        row = _row_with_arm(
+            shoulder=(0.55, 0.3), elbow=(0.6, 0.4), wrist=(0.62, 0.5),
+            side="RIGHT", torso_h=0.2,
+        )
+        flagged = vo.implausible_arm_nodes(row, torso_h=0.2)
+        assert flagged == set()
+
+    def test_missing_landmark_is_not_flagged(self):
+        """Can't judge a segment with a missing endpoint — must not
+        become a new reason a frame's dots go missing."""
+        row = _row_with_arm(shoulder=(0.55, 0.3), elbow=None, wrist=(0.62, 0.5),
+                             side="RIGHT", torso_h=0.2)
+        flagged = vo.implausible_arm_nodes(row, torso_h=0.2)
+        assert flagged == set()

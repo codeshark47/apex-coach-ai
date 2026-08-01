@@ -138,3 +138,37 @@ class TestExtractMetricValue:
 
     def test_missing_metric_dict_returns_none(self):
         assert mr.extract_metric_value({}, "trunk_lean") is None
+
+
+class TestDescribeRangeMatchesClassify:
+    """Regression test for a real bug found in an actual PDF report: a
+    145% release-height reading showed Zone=OPTIMAL (correct — classify()
+    has no ceiling for higher_better) directly next to a range string
+    reading "Optimal 85%-130%" (145% visibly outside it) AND a red
+    "measurement error likely" warning below — three contradictory
+    signals for a value the code was specifically changed to protect
+    from a false flag. describe_range() and measurement_warning() had
+    drifted from classify() when release_height's kind was fixed."""
+
+    def test_higher_better_describes_an_open_ended_optimal_band(self):
+        """Must not show a closed "X%-Y%" range that implies a ceiling
+        classify() doesn't actually enforce."""
+        desc = mr.describe_range("release_height")
+        assert "130%" not in desc
+        assert "85%+" in desc
+
+    def test_a_high_release_height_is_not_contradicted_by_the_range_text(self):
+        value = 1.45
+        assert mr.classify("release_height", value) == "green"
+        desc = mr.describe_range("release_height")
+        # The description must not state an upper bound this green value
+        # falls outside of.
+        assert "130%" not in desc
+
+    def test_high_release_height_no_longer_triggers_a_stale_warning(self):
+        """The real implausibility ceiling for this metric lives upstream
+        (calculate_release_height_ratio_safe, rejects > 1.30 before a
+        value ever reaches here) — this function must not re-impose a
+        second, lower, contradictory one."""
+        assert mr.measurement_warning("release_height", 1.45) is None
+        assert mr.measurement_warning("release_height", 1.18) is None
