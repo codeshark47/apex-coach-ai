@@ -220,11 +220,30 @@ def main():
         st.session_state.label_tool_counts = _already_labeled_counts(client)
     counts = st.session_state.label_tool_counts
 
-    options = [f"{name}  ({counts.get(name, 0)} frames already labeled)" for name, _ in videos]
-    choice_idx = st.sidebar.selectbox(
-        "Pick a video", range(len(options)), format_func=lambda i: options[i], key="label_tool_video_choice"
+    # BUG FOUND directly from a coach report: the selection was stored as
+    # a raw POSITION in the video list, not the filename itself. _discover_
+    # videos() re-scans the actual folders on every single rerun (every
+    # click), so if a new file appeared mid-session (e.g. still downloading
+    # more clips while labeling — confirmed this is what was happening),
+    # the list's order shifts and the same stored position number silently
+    # points at a DIFFERENT video — no re-selection, no warning, just a
+    # different clip on screen. Keying the widget by filename instead means
+    # Streamlit keeps the same clip selected even if the list around it
+    # changes, since it matches by identity, not position.
+    video_names = [name for name, _ in videos]
+    name_to_path = dict(videos)
+    # If the previously-selected file disappeared from the list (moved,
+    # renamed, deleted) between reruns, Streamlit's selectbox raises
+    # outright rather than falling back — clear the stale value first so
+    # it just defaults to the first option instead of crashing.
+    if st.session_state.get("label_tool_video_choice") not in video_names:
+        st.session_state.pop("label_tool_video_choice", None)
+    video_name = st.sidebar.selectbox(
+        "Pick a video", video_names,
+        format_func=lambda name: f"{name}  ({counts.get(name, 0)} frames already labeled)",
+        key="label_tool_video_choice",
     )
-    video_name, video_path = videos[choice_idx]
+    video_path = name_to_path[video_name]
 
     # Reset per-clip session state whenever the chosen video changes.
     if st.session_state.get("label_tool_current_video") != video_name:
