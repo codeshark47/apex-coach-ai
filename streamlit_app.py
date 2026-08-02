@@ -263,6 +263,321 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     return (round(crop_x0 + click_x_in_crop), round(crop_y0 + click_y_in_crop))
 
 
+def render_batting_event_confirmation(stage12_result, ref_path: str, file_identity: str):
+    """
+    Batting equivalent of render_stream_event_confirmation — mandatory
+    STANCE/BACKLIFT/CONTACT confirmation, same reasoning: batting_events.py
+    is a first-pass heuristic (documented in its own module docstring as
+    NOT yet tuned against real batting footage the way bowling's detector
+    was), so nothing here gets trusted without a human looking at it.
+    FOLLOW_THROUGH is not confirmable — it's a video-trim reference only,
+    not used by any metric calculation (see batting_orchestrator.py).
+
+    Returns None until all three are confirmed; once confirmed, returns
+    {"STANCE": int, "BACKLIFT": int, "CONTACT": int,
+    "STANCE_auto_detected": ..., "BACKLIFT_auto_detected": ...,
+    "CONTACT_auto_detected": ..., "CONTACT_auto_confidence": ...}.
+    """
+    stance_key, backlift_key, contact_key = (
+        "_batting_stance_confirmed_frame", "_batting_backlift_confirmed_frame", "_batting_contact_confirmed_frame",
+    )
+    stance_id_key, backlift_id_key, contact_id_key = (
+        "_batting_stance_identity", "_batting_backlift_identity", "_batting_contact_identity",
+    )
+
+    if st.session_state.get(stance_id_key) != file_identity:
+        st.session_state[stance_key] = None
+        st.session_state[stance_id_key] = file_identity
+    if st.session_state.get(backlift_id_key) != file_identity:
+        st.session_state[backlift_key] = None
+        st.session_state[backlift_id_key] = file_identity
+    if st.session_state.get(contact_id_key) != file_identity:
+        st.session_state[contact_key] = None
+        st.session_state[contact_id_key] = file_identity
+
+    stance_auto = backlift_auto = contact_auto = None
+    contact_confidence = None
+    if stage12_result is not None and stage12_result.get("status") == "success":
+        stance_auto = stage12_result["events"].get("STANCE")
+        backlift_auto = stage12_result["events"].get("BACKLIFT")
+        contact_auto = stage12_result["events"].get("CONTACT")
+        contact_confidence = stage12_result["events"].get("CONTACT_confidence")
+
+    total_frames = cal.get_frame_count(ref_path)
+
+    def _confirm_step(label, emoji, auto_frame, session_key, slider_suffix, question, confidence_note=None):
+        with st.expander(f"{emoji} Confirm {label}", expanded=st.session_state.get(session_key) is None):
+            if auto_frame is None:
+                st.error("Couldn't auto-detect this frame at all — scrub manually below.")
+                auto_frame = 0
+            else:
+                note = f" ({confidence_note} confidence)" if confidence_note else ""
+                st.info(f"Algorithm's best guess: **frame {auto_frame}**{note}. This is a first-pass "
+                        f"heuristic, not yet tuned against real batting footage — always check it.")
+            slider_key = f"batting_{slider_suffix}_confirm_slider"
+            _render_frame_jump_box(slider_key, 0, max(total_frames - 1, 0))
+            slider_val = st.slider(
+                f"Scrub to the true {label.lower()} frame",
+                min_value=0, max_value=max(total_frames - 1, 0),
+                value=min(max(auto_frame, 0), max(total_frames - 1, 0)),
+                key=slider_key,
+            )
+            frame_img = cal.extract_reference_frame(ref_path, frame_index=slider_val)
+            if frame_img is not None:
+                with _framed_image_container():
+                    st.image(frame_img, use_column_width=True, caption=f"Frame {slider_val} — {question}")
+            if st.button(f"✅ Confirm this is {label.lower()}", key=f"batting_confirm_{slider_suffix}_button"):
+                st.session_state[session_key] = slider_val
+                st.rerun()
+            if st.session_state.get(session_key) is not None:
+                st.success(f"Confirmed: {label.lower()} at frame {st.session_state[session_key]}.")
+
+    _confirm_step("Stance", "🧍", stance_auto, stance_key, "stance",
+                   "is the batter set in their stance, before any movement, here?")
+    _confirm_step("Backlift (top of swing)", "🏏", backlift_auto, backlift_key, "backlift",
+                   "is the bat at the top of the backlift here?")
+    _confirm_step("Point of Contact", "🎯", contact_auto, contact_key, "contact",
+                   "is this the moment the bat meets the ball?", confidence_note=contact_confidence)
+
+    stance_confirmed = st.session_state.get(stance_key)
+    backlift_confirmed = st.session_state.get(backlift_key)
+    contact_confirmed = st.session_state.get(contact_key)
+    if stance_confirmed is None or backlift_confirmed is None or contact_confirmed is None:
+        return None
+
+    return {
+        "STANCE": stance_confirmed,
+        "BACKLIFT": backlift_confirmed,
+        "CONTACT": contact_confirmed,
+        "STANCE_auto_detected": stance_auto,
+        "BACKLIFT_auto_detected": backlift_auto,
+        "CONTACT_auto_detected": contact_auto,
+        "CONTACT_auto_confidence": contact_confidence,
+    }
+
+
+def render_batting_analysis_ui(player_name: str, history_enabled: bool):
+    """
+    Self-contained Batting Analysis flow — deliberately isolated from
+    every bowling code path below in this file (per the explicit decision
+    to add batting as a separate module, not touch the working, already-
+    verified bowling pipeline). Single camera only: a coach films the
+    batter from behind the stumps, same physical setup already used for
+    several ball-tracking clips — no 3D/dual-camera complexity needed for
+    stance/head/foot/weight-transfer/downswing analysis.
+
+    Called from the top-level "Analysis Type" branch, followed by
+    st.stop() — nothing below that call site in the file executes when
+    Batting Analysis is selected.
+    """
+    import batting_orchestrator as bto
+    import usage_limits
+    from coaching_agent import generate_batting_coaching_report
+
+    st.title("🏏 Batting Analysis")
+    st.caption(
+        "Stance, head position, weight transfer, downswing plane, and top-elbow control — "
+        "from a single phone behind the stumps. First version: see the note below on what's "
+        "measured directly from body pose vs. approximated (no bat-tracking sensor exists yet)."
+    )
+    st.info(
+        "ℹ️ front_foot_alignment, downswing_plane, and top_elbow_angle are derived from body-pose "
+        "landmarks only — downswing_plane specifically uses the midpoint of both wrists as a proxy "
+        "for the bat handle's path, not the bat's actual face angle. Treat borderline readings on "
+        "these three with appropriate caution, same as any first-version metric in this app."
+    )
+
+    uploaded_batting_video = st.sidebar.file_uploader(
+        "Batting Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="batting_video_upload",
+    )
+    if uploaded_batting_video is None:
+        st.warning("👆 Upload a batting video in the sidebar to begin.")
+        return
+
+    file_identity = f"{uploaded_batting_video.name}_{uploaded_batting_video.size}"
+    if st.session_state.get("_batting_ref_identity") != file_identity:
+        os.makedirs("input", exist_ok=True)
+        ref_path = os.path.abspath(os.path.join("input", f"_batting_ref_{uploaded_batting_video.name}"))
+        try:
+            o.save_uploaded_video_capped(uploaded_batting_video, ref_path)
+        except RuntimeError as e:
+            st.error(f"⚠️ {e}")
+            st.stop()
+        st.session_state["_batting_ref_identity"] = file_identity
+        st.session_state["_batting_ref_path"] = ref_path
+        st.session_state["_batting_seed_point"] = None
+        st.session_state["_batting_stage12"] = None
+
+    ref_path = st.session_state["_batting_ref_path"]
+    total_frames = cal.get_frame_count(ref_path)
+
+    with st.expander("🎯 Confirm the batter", expanded=st.session_state.get("_batting_seed_point") is None):
+        st.caption(
+            "Scrub to any frame where the batter is clearly visible, then click directly on them. "
+            "This tells the app exactly who to track — the same reliable identity-tracking fix "
+            "bowling analysis already relies on, instead of guessing."
+        )
+        seed_slider_key = "batting_seed_frame_slider"
+        _render_frame_jump_box(seed_slider_key, 0, max(total_frames - 1, 0))
+        seed_frame_idx = st.slider(
+            "Scrub to a frame where the batter is clearly visible",
+            min_value=0, max_value=max(total_frames - 1, 0),
+            value=0, key=seed_slider_key,
+        )
+        seed_frame_img = cal.extract_reference_frame(ref_path, frame_index=seed_frame_idx)
+        if seed_frame_img is not None:
+            from PIL import Image
+            pil_seed_img = Image.fromarray(seed_frame_img)
+            existing_point = st.session_state.get("_batting_seed_point")
+            new_point = render_zoomable_click_image(
+                pil_seed_img, key_prefix="batting_seed", marker_point=existing_point, marker_color="lime",
+            )
+            if new_point is not None and new_point != existing_point:
+                st.session_state["_batting_seed_point"] = new_point
+                st.session_state["_batting_seed_frame_idx"] = seed_frame_idx
+                st.session_state["_batting_stage12"] = None  # a new seed invalidates any cached stage1+2
+                st.rerun()
+
+    seed_point = st.session_state.get("_batting_seed_point")
+    if seed_point is None:
+        st.warning("👆 Click the batter above to continue.")
+        return
+
+    if st.session_state.get("_batting_stage12") is None:
+        with st.spinner("Tracking the batter and detecting phase events..."):
+            stage12 = bto.extract_and_detect_batting_events(
+                ref_path, output_dir="output",
+                seed_point=seed_point,
+                seed_frame_index=st.session_state.get("_batting_seed_frame_idx", 0),
+            )
+        st.session_state["_batting_stage12"] = stage12
+
+    stage12 = st.session_state["_batting_stage12"]
+    if stage12.get("status") != "success":
+        st.error(f"⚠️ Tracking failed: {stage12.get('message', 'unknown error')}")
+        return
+
+    confirmed_events = render_batting_event_confirmation(stage12, ref_path, file_identity)
+    if confirmed_events is None:
+        st.warning("👆 Confirm Stance, Backlift, and Point of Contact above to enable analysis.")
+        return
+
+    _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
+    _usage = {"remaining": 1, "used": 0, "limit": 1}
+    if not _is_admin_user:
+        _usage = usage_limits.get_usage(st.session_state.auth_user["id"])
+        if _usage["remaining"] <= 0:
+            st.sidebar.error(
+                f"🚫 Free analysis limit reached ({_usage['used']}/{_usage['limit']} today). "
+                "Contact us to unlock unlimited access."
+            )
+        else:
+            st.sidebar.caption(f"🎟️ {_usage['remaining']} of {_usage['limit']} free analyses remaining")
+
+    if _usage["remaining"] <= 0:
+        return
+
+    if st.button("🚀 Execute Batting Analysis", use_container_width=True):
+        with st.spinner("Calculating batting technique metrics..."):
+            stage12_with_overrides = dict(stage12)
+            stage12_with_overrides["events"] = {**stage12["events"], **{
+                "STANCE": confirmed_events["STANCE"],
+                "BACKLIFT": confirmed_events["BACKLIFT"],
+                "CONTACT": confirmed_events["CONTACT"],
+            }}
+            result_payload = bto.run_batting_analysis(ref_path, output_dir="output", precomputed=stage12_with_overrides)
+
+        if result_payload.get("status") != "success":
+            st.error(f"⚠️ Analysis failed: {result_payload.get('message', 'unknown error')}")
+            return
+
+        # Fold the auto-vs-confirmed pairs into the result so they get
+        # saved to history below — same (auto_detected, coach_confirmed)
+        # training-signal pattern already used for bowling's release
+        # point/foot contacts.
+        result_payload["time_indices"]["stance_frame_auto_detected"] = confirmed_events["STANCE_auto_detected"]
+        result_payload["time_indices"]["backlift_frame_auto_detected"] = confirmed_events["BACKLIFT_auto_detected"]
+        result_payload["time_indices"]["contact_frame_auto_detected"] = confirmed_events["CONTACT_auto_detected"]
+        result_payload["time_indices"]["contact_auto_confidence"] = confirmed_events["CONTACT_auto_confidence"]
+
+        st.session_state["_batting_result_payload"] = result_payload
+        if not _is_admin_user:
+            usage_limits.record_usage(st.session_state.auth_user["id"])
+        st.rerun()
+
+    result_payload = st.session_state.get("_batting_result_payload")
+    if result_payload is None:
+        return
+
+    st.divider()
+    st.header("📊 Batting Technique Report")
+
+    metrics = result_payload["biomechanical_metrics"]
+    st.caption(f"Batting hand detected (leading side): **{metrics.get('batting_hand_detected', 'Unknown')}**")
+
+    table_rows = []
+    for mkey, label_key in [
+        ("batting_head_movement", "head_movement"),
+        ("batting_front_foot_alignment", "front_foot_alignment"),
+        ("batting_weight_transfer", "weight_transfer"),
+        ("batting_downswing_plane", "downswing_plane"),
+        ("batting_top_elbow_angle", "top_elbow_angle"),
+    ]:
+        value = mr.extract_batting_metric_value(metrics, mkey)
+        zone = mr.classify(mkey, value)
+        r = mr.RANGES[mkey]
+        table_rows.append({
+            "Metric": r.label,
+            "Value": mr.format_value(mkey, value) if value is not None else "N/A",
+            "Zone": zone.upper(),
+            "Optimal": r.display_optimal,
+        })
+    st.table(pd.DataFrame(table_rows))
+
+    if result_payload.get("annotated_video_output"):
+        st.video(result_payload["annotated_video_output"])
+
+    with st.spinner("Generating expert batting coaching report..."):
+        insights = generate_batting_coaching_report(result_payload)
+    st.subheader("🧠 AI Batting Coach Analysis")
+    st.write(insights.get("narrative_analysis", ""))
+    if insights.get("prescribed_drills"):
+        st.subheader("🏋️ Prescribed Drills")
+        for i, drill in enumerate(insights["prescribed_drills"], 1):
+            st.markdown(f"**Drill {i}:** {drill}")
+
+    clean_slug = player_name.replace(" ", "_")
+    pdf_data = generate_batting_pdf_report(
+        metrics, result_payload["time_indices"], insights, batter_name=player_name,
+    )
+    st.download_button(
+        label="📄 Download Official PDF Report",
+        data=pdf_data,
+        file_name=f"Batting_Report_{clean_slug}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    if history_enabled and not st.session_state.get("batting_history_saved_for_run", False):
+        try:
+            athlete_id = store.get_or_create_athlete(player_name, st.session_state.auth_user["id"])
+            store.save_session(
+                athlete_id=athlete_id,
+                coach_user_id=st.session_state.auth_user["id"],
+                video_filename=os.path.basename(ref_path),
+                camera_mode="Batting - Single Camera",
+                fps=result_payload["video_metadata"]["fps"],
+                metrics=metrics,
+                phase_durations=None,
+                release_arm_speed_kmh=None,
+                speed_status="unavailable",
+            )
+            st.session_state["batting_history_saved_for_run"] = True
+        except Exception as e:
+            monitoring.capture(e)
+            st.warning(f"Could not save this session to athlete history: {e}")
+
+
 def render_stream_event_confirmation(stage12_result, ref_path: str, file_identity: str,
                                       key_prefix: str, bowling_arm: str, stream_label: str):
     """
@@ -793,6 +1108,127 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
     return buffer.getvalue()
 
 
+def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite Athlete"):
+    """
+    Batting equivalent of generate_pdf_report — same reportlab primitives,
+    same visual language, simplified for batting's 5 metrics (no speed/
+    phase-duration section, which doesn't apply to batting analysis).
+    Deliberately builds its own color-coded table with mr.classify/
+    mr.format_value directly rather than reusing pdf_color_ranges.py,
+    which iterates the bowling-only metric set.
+    """
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter,
+                             rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
+    story = []
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'],
+                                  fontSize=22, leading=26, textColor=colors.HexColor('#1A365D'))
+    h2_style = ParagraphStyle('SectionHeader', parent=styles['Heading2'],
+                               fontSize=14, leading=18, textColor=colors.HexColor('#2B6CB0'),
+                               spaceBefore=12, spaceAfter=6)
+    body_style = ParagraphStyle('ReportBody', parent=styles['Normal'],
+                                 fontSize=10, leading=14, textColor=colors.HexColor('#2D3748'))
+    bold_body = ParagraphStyle('ReportBodyBold', parent=body_style, fontName='Helvetica-Bold')
+
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    story.append(Paragraph("APEX COACH AI — BATTING TECHNIQUE REPORT", title_style))
+    story.append(Paragraph(
+        f"<b>Target Athlete:</b> {batter_name} | "
+        f"<b>Date:</b> {current_date} | "
+        f"<b>Batting Hand:</b> {metrics.get('batting_hand_detected', 'Unknown')} | "
+        f"<b>Status:</b> AI-Assisted Biomechanical Estimate",
+        body_style
+    ))
+    story.append(Spacer(1, 15))
+
+    story.append(Paragraph(
+        "front_foot_alignment, downswing_plane, and top_elbow_angle are derived from body-pose "
+        "landmarks only (no bat-tracking sensor) — downswing_plane uses the midpoint of both "
+        "wrists as a proxy for the bat handle's path, not the bat's actual face angle.",
+        ParagraphStyle('Caveat', parent=body_style, fontSize=8, textColor=colors.HexColor('#718096'))
+    ))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Phase Milestones", h2_style))
+    time_rows = [
+        [Paragraph("<b>Phase</b>", bold_body), Paragraph("<b>Frame</b>", bold_body)],
+        ["Stance", f"Frame {frames.get('stance_frame', 'N/A')}"],
+        ["Backlift (top of swing)", f"Frame {frames.get('backlift_frame', 'N/A')}"],
+        ["Point of Contact", f"Frame {frames.get('contact_frame', 'N/A')}"],
+    ]
+    t_time = Table(time_rows, colWidths=[250, 250])
+    t_time.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#EDF2F7')),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E0')),
+        ('PADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(t_time)
+    story.append(Spacer(1, 15))
+
+    story.append(Paragraph("Batting Technique Telemetry", h2_style))
+    story.append(Paragraph(
+        "<i>Reference ranges — Optimal (green) | Acceptable (amber) | Critical (red).</i>",
+        body_style
+    ))
+    story.append(Spacer(1, 6))
+
+    zone_bg = {"green": colors.HexColor('#D9F7E4'), "amber": colors.HexColor('#FFF3D6'),
+               "red": colors.HexColor('#FDE0E0'), "unknown": colors.HexColor('#EDF2F7')}
+    metric_rows = [[Paragraph("<b>Metric</b>", bold_body), Paragraph("<b>Value</b>", bold_body),
+                    Paragraph("<b>Zone</b>", bold_body), Paragraph("<b>Optimal</b>", bold_body)]]
+    row_colors = [colors.HexColor('#EDF2F7')]
+    for mkey in mr.all_batting_metric_keys():
+        value = mr.extract_batting_metric_value(metrics, mkey)
+        zone = mr.classify(mkey, value)
+        r = mr.RANGES[mkey]
+        metric_rows.append([
+            r.label,
+            mr.format_value(mkey, value) if value is not None else "N/A",
+            zone.upper(),
+            r.display_optimal,
+        ])
+        row_colors.append(zone_bg.get(zone, zone_bg["unknown"]))
+
+    t_metrics = Table(metric_rows, colWidths=[190, 100, 90, 120])
+    style_cmds = [
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E0')),
+        ('PADDING', (0, 0), (-1, -1), 6),
+    ]
+    for i, bg in enumerate(row_colors):
+        style_cmds.append(('BACKGROUND', (0, i), (-1, i), bg))
+    t_metrics.setStyle(TableStyle(style_cmds))
+    story.append(t_metrics)
+    story.append(Spacer(1, 15))
+
+    story.append(Paragraph("Autonomous AI Batting Coach Assessment", h2_style))
+    narrative = ai_insights.get("narrative_analysis", "No narrative generated.")
+    narrative = narrative.replace(
+        "SECTION 1 — BATTING TECHNIQUE NARRATIVE ASSESSMENT:", ""
+    ).strip()
+    story.append(Paragraph(narrative, body_style))
+    story.append(Spacer(1, 15))
+
+    story.append(Paragraph("Prescribed Training Drills", h2_style))
+    drills = ai_insights.get("prescribed_drills", [])
+    if drills:
+        for drill in drills:
+            story.append(Paragraph(f"• {drill}", body_style))
+            story.append(Spacer(1, 6))
+    else:
+        story.append(Paragraph("All metrics within acceptable range. No critical interventions required.", body_style))
+
+    story.append(Spacer(1, 25))
+    story.append(Paragraph("—" * 60, body_style))
+    story.append(Paragraph("<b>Shoaib Nazar</b>, Founder | Apex Coach AI", bold_body))
+    story.append(Paragraph("Automated Video-Based Coaching Report", body_style))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # ====================================================================
 # SIDEBAR
 # ====================================================================
@@ -847,6 +1283,21 @@ if history_enabled:
         else:
             st.caption("No athlete profiles yet. Run an analysis to create one.")
 
+st.sidebar.divider()
+
+# ---------------------------------------------------------------
+# ANALYSIS TYPE — batting is a deliberately separate, isolated module
+# (see render_batting_analysis_ui's docstring). Placed here, before
+# Speed Calibration, because batting's 5 metrics need no real-world
+# scale at all — nothing below this branch runs for Batting Analysis.
+# ---------------------------------------------------------------
+st.sidebar.header("🏏 Analysis Type")
+analysis_type = st.sidebar.radio(
+    "What are we analyzing?", ["Bowling Analysis", "Batting Analysis"], key="analysis_type_choice",
+)
+if analysis_type == "Batting Analysis":
+    render_batting_analysis_ui(player_name, history_enabled)
+    st.stop()  # nothing below this renders for Batting Analysis — bowling code path is untouched
 st.sidebar.divider()
 
 # ---------------------------------------------------------------

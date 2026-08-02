@@ -117,7 +117,73 @@ RANGES = {
         amber=(0.02, 0.05),
         display_optimal="0.00–0.02",
     ),
+
+    # --- BATTING METRICS (2026-08-03) ---
+    # Namespaced with a "batting_" prefix, deliberately, so they can never
+    # collide with a bowling key and can never accidentally show up in the
+    # bowling coaching report via all_metric_keys() (see that function's
+    # docstring — it explicitly returns ONLY the original 5 bowling keys,
+    # unchanged, specifically so adding these below carries zero risk to
+    # the existing bowling narrative/PDF). See batting_kinematics.py for
+    # the honesty note on how these thresholds were derived (real
+    # coaching principles, not yet tuned against real batting footage the
+    # way the bowling ranges above were).
+    "batting_head_movement": MetricRange(
+        label="Head Movement (Stance to Contact)",
+        unit="",
+        kind="lower_better",
+        green=(0.0, 0.02),
+        amber=(0.02, 0.05),
+        display_optimal="0.00–0.02",
+    ),
+    "batting_front_foot_alignment": MetricRange(
+        label="Front Foot Alignment",
+        unit="°",
+        kind="lower_better",
+        green=(0.0, 20.0),
+        amber=(20.0, 35.0),
+        display_optimal="0–20°",
+    ),
+    "batting_weight_transfer": MetricRange(
+        label="Weight Transfer Onto Front Foot",
+        unit="%",
+        kind="higher_better",
+        green=(40.0, 200.0),
+        amber=(20.0, 40.0),
+        display_optimal="40%+",
+    ),
+    "batting_downswing_plane": MetricRange(
+        label="Downswing Plane (Straight Bat)",
+        unit="°",
+        kind="band",
+        green=(10.0, 35.0),
+        amber=(5.0, 10.0),
+        amber_high=(35.0, 50.0),
+        display_optimal="10–35°",
+    ),
+    "batting_top_elbow_angle": MetricRange(
+        label="Top-Elbow Angle At Contact",
+        unit="°",
+        kind="band",
+        green=(100.0, 160.0),
+        amber=(85.0, 100.0),
+        amber_high=(160.0, 175.0),
+        display_optimal="100–160°",
+    ),
 }
+
+# Explicit, hardcoded lists (not "everything in RANGES") so adding either
+# sport's metrics can never silently change what the OTHER sport's
+# coaching report/PDF iterates over — see all_metric_keys()/
+# all_batting_metric_keys() below.
+_BOWLING_METRIC_KEYS = [
+    "front_knee_bracing", "hip_shoulder_separation", "trunk_lean",
+    "release_height", "head_stability",
+]
+_BATTING_METRIC_KEYS = [
+    "batting_head_movement", "batting_front_foot_alignment",
+    "batting_weight_transfer", "batting_downswing_plane", "batting_top_elbow_angle",
+]
 
 
 def classify(metric_key: str, value) -> str:
@@ -174,7 +240,15 @@ def classify(metric_key: str, value) -> str:
 
 
 def all_metric_keys():
-    return list(RANGES.keys())
+    """Bowling's 5 metric keys ONLY — explicitly hardcoded (not
+    list(RANGES.keys())) so adding batting_* entries to RANGES can never
+    silently pull batting metrics into the bowling coaching report/PDF.
+    See all_batting_metric_keys() for the batting equivalent."""
+    return list(_BOWLING_METRIC_KEYS)
+
+
+def all_batting_metric_keys():
+    return list(_BATTING_METRIC_KEYS)
 
 
 def describe_range(metric_key: str) -> str:
@@ -272,5 +346,19 @@ def extract_metric_value(metrics: dict, metric_key: str):
         "trunk_lean": metrics.get("trunk_lean", {}).get("degrees"),
         "release_height": metrics.get("release_height", {}).get("ratio"),
         "head_stability": head_value,
+    }
+    return lookup.get(metric_key)
+
+
+def extract_batting_metric_value(metrics: dict, metric_key: str):
+    """Batting equivalent of extract_metric_value — maps a batting_*
+    metric_ranges key to where batting_orchestrator.run_batting_analysis
+    actually stores the value in its biomechanical_metrics dict."""
+    lookup = {
+        "batting_head_movement": metrics.get("head_movement", {}).get("value"),
+        "batting_front_foot_alignment": metrics.get("front_foot_alignment", {}).get("degrees"),
+        "batting_weight_transfer": metrics.get("weight_transfer", {}).get("percent"),
+        "batting_downswing_plane": metrics.get("downswing_plane", {}).get("degrees"),
+        "batting_top_elbow_angle": metrics.get("top_elbow_angle", {}).get("degrees"),
     }
     return lookup.get(metric_key)

@@ -229,6 +229,202 @@ DRILL NAME: explaining what it corrects and how to perform it.
         return _error_state(f"Gemini API call failed: {str(e)}")
 
 
+def generate_batting_coaching_report(result_payload: Dict[str, Any]) -> dict:
+    """
+    Batting equivalent of generate_biomechanical_coaching_report — same
+    machinery (ZONE from metric_ranges.py as the single source of truth,
+    same missing-data gate, same two-section parse), new persona and new
+    metric set (head movement, front-foot alignment, weight transfer,
+    downswing plane, top-elbow angle) instead of bowling's 5.
+    """
+    events = result_payload.get("time_indices", {})
+    stance = events.get("stance_frame", "Unknown")
+    backlift = events.get("backlift_frame", "Unknown")
+    contact = events.get("contact_frame", "Unknown")
+
+    video_meta = result_payload.get("video_metadata", {})
+    fps = video_meta.get("fps", 30)
+    source_file = video_meta.get("source_file", "Unknown")
+    total_frames = video_meta.get("total_frames", 0)
+
+    metrics = result_payload.get("biomechanical_metrics", {})
+    batting_hand = metrics.get("batting_hand_detected", "Unknown")
+
+    head_data = metrics.get("head_movement", {})
+    head_val = head_data.get("value")
+    head_descriptor = head_data.get("tier", "Unknown")
+
+    foot_data = metrics.get("front_foot_alignment", {})
+    foot_val = foot_data.get("degrees")
+    foot_descriptor = foot_data.get("tier", "Unknown")
+
+    weight_data = metrics.get("weight_transfer", {})
+    weight_val = weight_data.get("percent")
+    weight_descriptor = weight_data.get("tier", "Unknown")
+
+    swing_data = metrics.get("downswing_plane", {})
+    swing_val = swing_data.get("degrees")
+    swing_descriptor = swing_data.get("tier", "Unknown")
+
+    elbow_data = metrics.get("top_elbow_angle", {})
+    elbow_val = elbow_data.get("degrees")
+    elbow_descriptor = elbow_data.get("tier", "Unknown")
+
+    head_zone = ZONE_LABELS[mr.classify("batting_head_movement", head_val)]
+    foot_zone = ZONE_LABELS[mr.classify("batting_front_foot_alignment", foot_val)]
+    weight_zone = ZONE_LABELS[mr.classify("batting_weight_transfer", weight_val)]
+    swing_zone = ZONE_LABELS[mr.classify("batting_downswing_plane", swing_val)]
+    elbow_zone = ZONE_LABELS[mr.classify("batting_top_elbow_angle", elbow_val)]
+
+    missing = []
+    if head_val is None: missing.append("head_movement")
+    if foot_val is None: missing.append("front_foot_alignment")
+    if weight_val is None: missing.append("weight_transfer")
+    if swing_val is None: missing.append("downswing_plane")
+    if elbow_val is None: missing.append("top_elbow_angle")
+
+    missing_note = ""
+    if missing:
+        missing_note = (
+            f"\nNOTE: The following metrics could not be calculated: {', '.join(missing)}. "
+            f"Acknowledge this in your narrative. Do not fabricate values for them.\n"
+        )
+        if len(missing) >= 4:
+            return _error_state(
+                f"Too many metrics missing: {', '.join(missing)}. "
+                f"Check landmark tracking quality and camera angle."
+            )
+
+    def fmt(val, unit="°"):
+        if val is None:
+            return "No Data (N/A)"
+        return f"{round(float(val), 2)}{unit}"
+
+    reference_ranges_block = "\n".join(mr.describe_range(k) for k in mr.all_batting_metric_keys())
+
+    prompt = f"""
+You are the lead batting technique analyst at a national cricket academy — a batting coach with
+decades of experience developing players from junior academy level through to elite performance,
+fluent in classical technique (MCC-style coaching principles: balance, head position, straight bat)
+as well as modern high-performance batting analysis.
+
+Analyze the following batting tracking data.
+
+VIDEO METADATA:
+- Source file: {source_file}
+- Frame rate: {fps} FPS
+- Total frames analyzed: {total_frames}
+- Batting hand detected (leading side): {batting_hand}
+- Stance: Frame {stance}
+- Backlift (top of swing): Frame {backlift}
+- Point of Contact: Frame {contact}
+
+BIOMECHANICAL MEASUREMENTS (ZONE is the authoritative classification for every
+decision below — base all urgency and drill choices on ZONE, not on the
+descriptor in parentheses, which is supplementary color commentary only):
+1. Head Movement (Stance to Contact): {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor})
+2. Front Foot Alignment: {fmt(foot_val)} — ZONE: {foot_zone} (descriptor: {foot_descriptor})
+3. Weight Transfer Onto Front Foot: {fmt(weight_val, "%")} — ZONE: {weight_zone} (descriptor: {weight_descriptor})
+4. Downswing Plane (Straight Bat): {fmt(swing_val)} — ZONE: {swing_zone} (descriptor: {swing_descriptor})
+5. Top-Elbow Angle At Contact: {fmt(elbow_val)} — ZONE: {elbow_zone} (descriptor: {elbow_descriptor})
+{missing_note}
+REFERENCE RANGES (authoritative, matches the UI and PDF report exactly):
+{reference_ranges_block}
+
+IMPORTANT CONTEXT: front_foot_alignment, downswing_plane, and top_elbow_angle are all derived from
+body-pose landmarks only (no bat-tracking sensor exists yet) — downswing_plane specifically uses
+the midpoint of both wrists as a proxy for the bat handle's path, not the bat's actual face angle.
+Do not overstate precision on these three; you may comment on them but frame borderline (ACCEPTABLE
+zone) readings with appropriate caution rather than absolute certainty.
+
+COACHING PHILOSOPHY:
+- Every batter has an individual technique built through years of practice — do not recommend
+  changing something that is merely unorthodox if it is not in a CRITICAL zone.
+- Only prescribe drills for metrics whose ZONE is CRITICAL, or a technically severe/obvious fault.
+- Prioritize the fundamentals in this order when multiple metrics are CRITICAL: head position first
+  (a stable head over the ball is the foundation everything else is built on), then weight transfer,
+  then front foot alignment, then downswing plane, then top-elbow control — a fix higher in this
+  order often naturally improves the ones below it, so lead with the most foundational fault.
+- Drills must be REAL, standard batting coaching drills a club or academy coach would recognize
+  (e.g. shadow batting in front of a mirror, throwdowns/side-arm feeds at a specific line and length,
+  a target cone drill for front-foot direction, a resistance-band or towel drill for downswing path,
+  a "top-hand only" shadow shot drill for elbow control) — not vague, generic advice like "practice more."
+
+Your task is to produce a two-section technical coaching report.
+Separate the two sections with exactly one line containing only: ---
+
+SECTION 1 — BATTING TECHNIQUE NARRATIVE ASSESSMENT:
+Write 4-5 sentences analyzing the full movement from stance through contact.
+Reference each metric by name and its ZONE (OPTIMAL/ACCEPTABLE/CRITICAL) only — do NOT restate the
+exact numeric value yourself. The precise figures are already shown in the table directly above this
+narrative in the final report; a value you restate from memory risks not matching the table exactly,
+which undermines trust in the whole report. Explicitly call out any missing data (N/A) without
+fabricating values. Clearly distinguish between what requires immediate correction (CRITICAL zone)
+versus what requires monitoring (ACCEPTABLE zone).
+
+SECTION 2 — PRESCRIBED DRILLS:
+Provide exactly 3 specific, real batting drills targeting the weakest CRITICAL zone(s), as an expert
+batting coach would prescribe them — name the drill, then explain exactly what it corrects and how to
+perform it (reps/sets or a concrete setup where useful).
+Format each drill exactly as a single line without extra line breaks:
+DRILL NAME: explaining what it corrects and how to perform it.
+"""
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return _error_state("GEMINI_API_KEY not found in environment. Check your .env file.")
+
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=8000
+            )
+        )
+
+        if not response or not response.text:
+            return _error_state("Gemini returned an empty response.")
+
+        raw_text = response.text.strip()
+
+        if "---" in raw_text:
+            parts = raw_text.split("---", maxsplit=1)
+            narrative = _strip_section_header(parts[0].strip())
+            drills_block = _strip_section_header(parts[1].strip())
+
+            drills = []
+            for line in drills_block.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if re.match(r'^(section\s*2\s*[-—:]*\s*)?prescribed\s+drills:?$',
+                            line, re.IGNORECASE):
+                    continue
+                line = line.lstrip("-•*0123456789. ").strip()
+                if len(line) > 10:
+                    drills.append(line)
+            drills = drills[:3]
+        else:
+            narrative = _strip_section_header(raw_text)
+            drills = []
+
+        return {
+            "narrative_analysis": narrative,
+            "prescribed_drills": drills
+        }
+
+    except Exception as e:
+        monitoring.capture(e)
+        return _error_state(f"Gemini API call failed: {str(e)}")
+
+
 def _error_state(message: str) -> dict:
     """Returns a clean structured error dict. Never silently fails."""
     return {
