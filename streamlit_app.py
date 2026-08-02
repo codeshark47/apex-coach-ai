@@ -870,6 +870,27 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
         "image below."
     )
 
+    # LOAD A SAVED CALIBRATION — the "once per setup" promise above only
+    # held within a single browser session before this: st.session_state
+    # is wiped the moment the tab closes or the server sleeps, so a coach
+    # was redoing the same upload-and-click flow far more often than the
+    # design intended. See add_camera_calibrations.sql for the real fix —
+    # this lets a coach reload a named setup instantly instead.
+    if not st.session_state.calibration:
+        _saved_calibrations = store.list_calibrations(st.session_state.auth_user["id"])
+        if _saved_calibrations:
+            _saved_labels = [c["setup_label"] for c in _saved_calibrations]
+            _load_choice = st.selectbox(
+                "Or load a saved camera setup", _saved_labels, key="load_calib_choice",
+            )
+            if st.button("📥 Load this calibration"):
+                _match = next(c for c in _saved_calibrations if c["setup_label"] == _load_choice)
+                st.session_state.calibration = cal.Calibration.from_dict(_match["calibration"])
+                st.session_state.calibration_frame_width = _match["frame_width_px"]
+                st.success(f"Loaded calibration: {_load_choice}")
+                st.rerun()
+            st.divider()
+
     # PRESET REFERENCE DISTANCES — guided, foolproof calibration instead of a
     # generic "click two points" prompt. Modeled on a competitor's calibration
     # screen (two labeled stump-alignment guides), adapted for this app's
@@ -988,6 +1009,7 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
                             real_dist, ref_label or "custom"
                         )
                         st.session_state.calibration = calibration
+                        st.session_state.calibration_frame_width = pil_img.width
                         st.session_state.calib_points = []
                         st.success(f"Calibrated: {calibration.meters_per_pixel:.6f} m/px")
                         warning = cal.implausibility_warning(calibration, pil_img.width)
@@ -1002,6 +1024,22 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
         c = st.session_state.calibration
         st.info(f"Active calibration: {c.reference_label} ({c.reference_distance_m}m) — "
                 f"{c.meters_per_pixel:.6f} m/px")
+
+        save_col1, save_col2 = st.columns([2, 1])
+        with save_col1:
+            setup_name = st.text_input(
+                "Save this camera setup as", key="save_calib_label",
+                placeholder="e.g. Home nets — evening spot",
+            )
+        with save_col2:
+            st.write("")
+            if st.button("💾 Save for future sessions", use_container_width=True, disabled=not setup_name.strip()):
+                store.save_calibration(
+                    st.session_state.auth_user["id"], setup_name,
+                    c.to_dict(), st.session_state.get("calibration_frame_width", 0),
+                )
+                st.success(f"Saved — reload it anytime as \"{setup_name.strip()}\".")
+
         if st.button("Clear calibration"):
             st.session_state.calibration = None
 

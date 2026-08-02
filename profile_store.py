@@ -362,3 +362,50 @@ def list_unassigned_athletes(coach_user_id: str) -> list:
         .execute()
     )
     return result.data or []
+
+
+def save_calibration(coach_user_id: str, setup_label: str, calibration_dict: dict,
+                      frame_width_px: int) -> dict:
+    """
+    Persists a camera calibration under a coach-chosen label (e.g. "Home
+    nets — evening spot"), so it survives past this browser session — see
+    add_camera_calibrations.sql for why this needed to exist at all
+    (calibration.py's own docstring says "once per fixed camera position",
+    but until now it only ever lived in st.session_state).
+
+    Upserts on (coach_user_id, setup_label): saving again under a label
+    that already exists updates it in place — re-calibrating a setup that
+    moved, not accumulating duplicates.
+    """
+    _require_coach_user_id(coach_user_id)
+    if not setup_label or not setup_label.strip():
+        raise ValueError("setup_label must be a non-empty name for this camera setup.")
+    client = get_client()
+    row = {
+        "coach_user_id": coach_user_id,
+        "setup_label": setup_label.strip(),
+        "calibration": _sanitize_for_json(calibration_dict),
+        "frame_width_px": frame_width_px,
+    }
+    result = (
+        client.table("camera_calibrations")
+        .upsert(row, on_conflict="coach_user_id,setup_label")
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError("Failed to save calibration.")
+    return result.data[0]
+
+
+def list_calibrations(coach_user_id: str) -> list:
+    """This coach's saved calibrations, most recently saved first."""
+    _require_coach_user_id(coach_user_id)
+    client = get_client()
+    result = (
+        client.table("camera_calibrations")
+        .select("setup_label, calibration, frame_width_px, created_at")
+        .eq("coach_user_id", coach_user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data or []
