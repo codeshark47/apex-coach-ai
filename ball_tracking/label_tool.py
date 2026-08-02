@@ -338,7 +338,7 @@ def main():
             st.rerun()
         return  # don't allow advancing until size is confirmed
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         confirm_disabled = pending_point is None
         if st.button("➡️ Confirm & next frame", disabled=confirm_disabled, use_container_width=True):
@@ -353,29 +353,48 @@ def main():
                          "no drawn marker ever existed on this video's pixels.",
             }, on_conflict="source_video_filename,frame_index").execute()
             _upsert_run(client, video_name, fps, orig_w, frame_rgb.shape[0], total_frames, frame_idx, x, y, radius)
-            st.session_state.label_tool_history.append((frame_idx, True))
+            st.session_state.label_tool_history.append(("confirm", frame_idx))
             st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             del st.session_state[pending_point_key]
             st.session_state.label_tool_frame_ptr += 1
             st.rerun()
     with col2:
-        if st.button("⏭️ No ball visible — skip", use_container_width=True):
-            st.session_state.label_tool_history.append((frame_idx, False))
-            if pending_point_key in st.session_state:
-                del st.session_state[pending_point_key]
-            st.session_state.label_tool_frame_ptr += 1
-            st.rerun()
-    with col3:
         if st.button("↩️ Undo last", use_container_width=True, disabled=not st.session_state.label_tool_history):
-            last_idx, had_ball = st.session_state.label_tool_history.pop()
-            if had_ball:
+            action, data = st.session_state.label_tool_history.pop()
+            if action == "confirm":
                 client.table("ball_tracking_labels").delete().eq(
                     "source_video_filename", video_name
-                ).eq("frame_index", last_idx).execute()
+                ).eq("frame_index", data).execute()
                 st.session_state.label_tool_counts[video_name] = max(
                     0, st.session_state.label_tool_counts.get(video_name, 1) - 1
                 )
-            st.session_state.label_tool_frame_ptr -= 1
+                st.session_state.label_tool_frame_ptr -= 1
+            else:  # "skip" — data is how many steps that skip advanced by
+                st.session_state.label_tool_frame_ptr -= data
+            st.rerun()
+
+    # SKIP, with a coach-chosen count — coach-requested feature: often
+    # already knows from experience the ball won't be visible for a whole
+    # stretch (bowler's run-up, follow-through) and doesn't want to click
+    # "skip" one frame at a time through it. Defaults to 1 so the existing
+    # single-skip behavior is unchanged unless the coach raises it. Stored
+    # in history as ("skip", n) — not n separate entries — so "Undo last"
+    # reverses the whole bulk skip as one action, not one frame at a time.
+    skip_col1, skip_col2 = st.columns([2, 1])
+    with skip_col1:
+        skip_n = st.number_input(
+            "Skip how many frames", min_value=1, max_value=100, value=1, key="label_tool_skip_n",
+            help="E.g. skip 10 to jump past a stretch you already know the ball won't be visible in. "
+                 "Clamped automatically if it would go past the end of this clip.",
+        )
+    with skip_col2:
+        st.write("")  # vertical alignment spacer so the button lines up with the number input
+        if st.button("⏭️ No ball visible — skip", use_container_width=True):
+            actual_skip = min(skip_n, len(sampled_indices) - ptr)
+            st.session_state.label_tool_history.append(("skip", actual_skip))
+            if pending_point_key in st.session_state:
+                del st.session_state[pending_point_key]
+            st.session_state.label_tool_frame_ptr += actual_skip
             st.rerun()
 
 
