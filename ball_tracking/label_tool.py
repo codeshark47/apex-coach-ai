@@ -528,6 +528,19 @@ def main():
 
     # FIRST clip's radius calibration — one-time per video, right after the
     # first click, so the coach sets it by eye once instead of every frame.
+    #
+    # BUG FOUND (2026-08-02, real coach test): before AI pre-fill existed,
+    # reaching this screen always meant a coach had genuinely clicked the
+    # ball, so basing the whole clip's radius on that point was safe. Now
+    # the AI can land here too — a coach reported it landing on the
+    # BATSMAN'S HELMET on a run-up frame where the ball wasn't even in
+    # play yet, and got stuck: this screen only ever offered "confirm
+    # size," no way to say "there's no real ball here, skip it," and the
+    # early `return` below meant the actual skip button (further down)
+    # never even rendered. Re-clicking on the frame WOULD correct a wrong
+    # AI guess if the true ball were visible somewhere else — but on a
+    # frame where there genuinely is no ball yet, there's nothing to
+    # click. Added the same skip escape hatch this screen was missing.
     if st.session_state.label_tool_radius is None and pending_point is not None:
         st.info("First click on this clip — set the ball's approximate size, then confirm.")
         radius = st.slider(
@@ -536,10 +549,20 @@ def main():
         )
         display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
         st.image(display_img)
-        if st.button("✅ Confirm size for this whole clip"):
-            st.session_state.label_tool_radius = radius
-            st.rerun()
-        return  # don't allow advancing until size is confirmed
+        calib_col1, calib_col2 = st.columns(2)
+        with calib_col1:
+            if st.button("✅ Confirm size for this whole clip", use_container_width=True):
+                st.session_state.label_tool_radius = radius
+                st.rerun()
+        with calib_col2:
+            if st.button("🚫 Not the ball — no ball visible here, skip", use_container_width=True):
+                st.session_state.label_tool_history.append(("skip", 1))
+                del st.session_state[pending_point_key]
+                st.session_state.pop(pending_source_key, None)
+                st.session_state.pop(ai_radius_key, None)
+                st.session_state.label_tool_frame_ptr += 1
+                st.rerun()
+        return  # don't allow advancing until size is confirmed OR this frame is skipped
 
     col1, col2 = st.columns(2)
     with col1:
