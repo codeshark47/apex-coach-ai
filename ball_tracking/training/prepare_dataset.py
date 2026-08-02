@@ -30,10 +30,16 @@ same background/lighting, so a random-frame split would let the model
 "see" near-duplicate scenes in both train and val and look like it
 generalizes when it's really just memorizing.
 
-VAL_CLIPS is intentionally empty right now — the old validation clip
-belonged to the abandoned workflow. Set this once a genuinely different
-clip (ideally a different scene/location) has been labeled with the new
-tool; main() warns loudly if no val images get written.
+VAL_CLIPS: was "night time.mp4" (2026-08-02), changed same day after the
+first training run scored near-zero on it — the coach confirmed the
+ball wasn't clearly visible in that footage even to a human, so a low
+score there reflects an ambiguous/noisy clip, not a real generalization
+gap. Not a fair validation set. night_time.mp4 moved into training
+instead (still useful as extra variety); PXL_20260801_040327130.mp4 is
+now VAL_CLIPS — filename suggests a different phone/camera than the
+rest, the best proxy for "different conditions" available in this
+batch. Revisit once a clip from a different physical location or a
+clearly-visible different lighting condition gets labeled.
 
 Usage:
     python ball_tracking/training/prepare_dataset.py
@@ -52,7 +58,7 @@ VALID_LABELED_BY = "direct_click_v1"
 
 # Set once a clip (ideally a different scene) has been labeled with the
 # new tool — see module docstring.
-VAL_CLIPS = set()
+VAL_CLIPS = {"PXL_20260801_040327130.mp4"}
 
 SEARCH_DIRS = [
     "C:/Users/Shoaib/Downloads",
