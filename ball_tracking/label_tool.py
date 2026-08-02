@@ -197,11 +197,31 @@ def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
         }).execute()
 
 
-def _load_frame(video_path: str, frame_idx: int):
+def _get_capture(video_path: str) -> cv2.VideoCapture:
+    """Reuses one VideoCapture handle per video across Streamlit reruns
+    instead of reopening the file from scratch on every single frame read.
+    Measured directly against a real clip (IMG_3082.MOV, 1080x1920 HEVC):
+    opening fresh every call cost ~275ms/frame; reusing one handle cut that
+    to ~153ms. Every click in this tool triggers a full script rerun, so
+    that per-call overhead was adding up on every interaction — worth
+    trimming regardless of the exact cause of the video-switching bug,
+    since it shrinks whatever race window that turns out to involve."""
+    cached_path = st.session_state.get("label_tool_cap_path")
+    cached_cap = st.session_state.get("label_tool_cap")
+    if cached_path == video_path and cached_cap is not None:
+        return cached_cap
+    if cached_cap is not None:
+        cached_cap.release()
     cap = cv2.VideoCapture(video_path)
+    st.session_state.label_tool_cap_path = video_path
+    st.session_state.label_tool_cap = cap
+    return cap
+
+
+def _load_frame(video_path: str, frame_idx: int):
+    cap = _get_capture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, frame = cap.read()
-    cap.release()
     if not ok:
         return None
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -278,10 +298,12 @@ def main():
     # renamed, deleted, or a stale selection from before a manual refresh),
     # Streamlit's selectbox raises outright rather than falling back —
     # clear the stale value first so it just defaults to the first option.
-    if st.session_state.get("label_tool_video_choice") not in video_names:
-        _log(f"STALE SELECTION — '{st.session_state.get('label_tool_video_choice')}' not found "
-             f"in the current {len(video_names)}-video list, clearing it so the picker falls "
-             f"back to its default option.")
+    _stale_choice = st.session_state.get("label_tool_video_choice")
+    if _stale_choice not in video_names:
+        if _stale_choice is not None:  # None here is just normal first-ever load, not an anomaly
+            _log(f"STALE SELECTION — '{_stale_choice}' not found in the current "
+                 f"{len(video_names)}-video list, clearing it so the picker falls back "
+                 f"to its default option.")
         st.session_state.pop("label_tool_video_choice", None)
     video_name = st.sidebar.selectbox(
         "Pick a video", video_names,
@@ -290,10 +312,9 @@ def main():
     )
     video_path = name_to_path[video_name]
 
-    cap = cv2.VideoCapture(video_path)
+    cap = _get_capture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    cap.release()
 
     # Reset per-clip session state whenever the chosen video changes.
     #
