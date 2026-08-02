@@ -424,6 +424,19 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
             min_value=0, max_value=max(total_frames - 1, 0),
             value=0, key=seed_slider_key,
         )
+        # BUG FOUND (2026-08-03, comparing against render_bowler_seed_ui's
+        # proven version): that function clears its stored point whenever
+        # the scrub slider moves to a different frame — this one didn't,
+        # so a point clicked on frame 40 could still be reused as the
+        # "existing point" while previewing frame 200, silently mismatched
+        # against a frame it was never actually clicked on. Not the cause
+        # of the zero-detection framing issue found the same day (that's
+        # camera positioning, confirmed by direct visual inspection of two
+        # different clips), but a real correctness gap regardless.
+        if st.session_state.get("_batting_seed_last_frame_idx") != seed_frame_idx:
+            st.session_state["_batting_seed_point"] = None
+            st.session_state["_batting_seed_last_frame_idx"] = seed_frame_idx
+
         seed_frame_img = cal.extract_reference_frame(ref_path, frame_index=seed_frame_idx)
         if seed_frame_img is not None:
             from PIL import Image
@@ -456,6 +469,30 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
     if stage12.get("status") != "success":
         st.error(f"⚠️ Tracking failed: {stage12.get('message', 'unknown error')}")
         return
+
+    # DIAGNOSTIC (2026-08-03, added after two real tests both came back
+    # with zero usable metrics): report tracking coverage immediately
+    # after stage 1+2, instead of only surfacing this after the coach has
+    # already confirmed all three events and run the full analysis. Both
+    # real failures were traced to camera framing (the batter too small/
+    # distant in frame for MediaPipe to place joints at all, confirmed by
+    # directly inspecting the actual video frames) — this makes that
+    # visible in seconds instead of requiring a database/CSV inspection.
+    _stage12_df = stage12["df"]
+    _tracked_frac = _stage12_df["NOSE_x"].notna().mean() if len(_stage12_df) else 0.0
+    if _tracked_frac < 0.10:
+        st.error(
+            f"⚠️ Only {_tracked_frac:.0%} of frames had a detectable pose for the person you clicked. "
+            "This almost always means the batter is too small/distant in this camera framing — "
+            "film with the camera closer to the batter (not from the bowler's end down the full "
+            "pitch length), the same way a bowling clip is filmed close to the bowler. Metrics below "
+            "are very unlikely to compute from this clip."
+        )
+    elif _tracked_frac < 0.50:
+        st.warning(
+            f"⚠️ Only {_tracked_frac:.0%} of frames had a detectable pose — tracking is partial. "
+            "Results may be incomplete; a camera position closer to the batter will help."
+        )
 
     confirmed_events = render_batting_event_confirmation(stage12, ref_path, file_identity)
     if confirmed_events is None:
