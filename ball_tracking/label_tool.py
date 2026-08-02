@@ -197,31 +197,22 @@ def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
         }).execute()
 
 
-def _get_capture(video_path: str) -> cv2.VideoCapture:
-    """Reuses one VideoCapture handle per video across Streamlit reruns
-    instead of reopening the file from scratch on every single frame read.
-    Measured directly against a real clip (IMG_3082.MOV, 1080x1920 HEVC):
-    opening fresh every call cost ~275ms/frame; reusing one handle cut that
-    to ~153ms. Every click in this tool triggers a full script rerun, so
-    that per-call overhead was adding up on every interaction — worth
-    trimming regardless of the exact cause of the video-switching bug,
-    since it shrinks whatever race window that turns out to involve."""
-    cached_path = st.session_state.get("label_tool_cap_path")
-    cached_cap = st.session_state.get("label_tool_cap")
-    if cached_path == video_path and cached_cap is not None:
-        return cached_cap
-    if cached_cap is not None:
-        cached_cap.release()
-    cap = cv2.VideoCapture(video_path)
-    st.session_state.label_tool_cap_path = video_path
-    st.session_state.label_tool_cap = cap
-    return cap
-
-
 def _load_frame(video_path: str, frame_idx: int):
-    cap = _get_capture(video_path)
+    # REVERTED (2026-08-02): briefly cached one VideoCapture handle per
+    # video to cut per-frame latency (~275ms -> ~153ms). That crashed the
+    # whole Streamlit process ("Assertion fctx->async_lock failed" from
+    # libavcodec's frame-threaded decoder) after ~30 minutes of real use —
+    # Streamlit can run two script executions for the same session back to
+    # back closely enough that a shared, cached VideoCapture's blocking
+    # native .read() call from one run can still be in flight when the next
+    # run's .set()/.read() touches the same object, and OpenCV's decoder
+    # isn't safe under that kind of concurrent access. A fresh capture per
+    # call has no shared native state to race on, so it can't hit this —
+    # worth the latency to not crash the coach's whole labeling session.
+    cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, frame = cap.read()
+    cap.release()
     if not ok:
         return None
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -321,9 +312,10 @@ def main():
     video_path = name_to_path[video_name]
     st.sidebar.caption(f"{counts.get(video_name, 0)} frames already labeled for this clip.")
 
-    cap = _get_capture(video_path)
+    cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    cap.release()
 
     # Reset per-clip session state whenever the chosen video changes.
     #
