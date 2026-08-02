@@ -32,6 +32,7 @@ Run locally (not deployed to Streamlit Cloud):
 """
 
 import bisect
+import datetime
 import os
 import sys
 
@@ -39,6 +40,15 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
+
+
+def _log(msg: str):
+    """Prints to the terminal running `streamlit run` (not the browser) —
+    diagnostic trail for the recurring 'switches back to a different video'
+    report (2026-08-02), which leaves no trace in the browser itself since
+    the coach sees no page reload when it happens. Timestamped so it can be
+    correlated against Supabase's created_at on the labels that did save."""
+    print(f"[label_tool {datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import profile_store as store
@@ -241,8 +251,11 @@ def main():
     # button, so a transient filesystem hiccup elsewhere can't cascade into
     # resetting an in-progress video's state anymore.
     if "label_tool_videos" not in st.session_state:
+        _log("SESSION INIT — label_tool_videos not in session_state, scanning fresh "
+             "(either this session's first run, or the session was reset).")
         st.session_state.label_tool_videos = _discover_videos()
     if st.sidebar.button("🔄 Refresh video list", help="Pick up new files added to the folders since this session started."):
+        _log("Manual refresh button clicked — rescanning video folders.")
         st.session_state.label_tool_videos = _discover_videos()
         st.rerun()
     videos = st.session_state.label_tool_videos
@@ -266,6 +279,9 @@ def main():
     # Streamlit's selectbox raises outright rather than falling back —
     # clear the stale value first so it just defaults to the first option.
     if st.session_state.get("label_tool_video_choice") not in video_names:
+        _log(f"STALE SELECTION — '{st.session_state.get('label_tool_video_choice')}' not found "
+             f"in the current {len(video_names)}-video list, clearing it so the picker falls "
+             f"back to its default option.")
         st.session_state.pop("label_tool_video_choice", None)
     video_name = st.sidebar.selectbox(
         "Pick a video", video_names,
@@ -297,7 +313,13 @@ def main():
     # labeling resumes right after the last saved frame instead of frame 0.
     # Worst case after any future reset is one redundant rerender, not lost
     # progress or re-skipping past an entire run-up again.
-    if st.session_state.get("label_tool_current_video") != video_name:
+    previous_video = st.session_state.get("label_tool_current_video")
+    if previous_video != video_name:
+        if previous_video is None:
+            _log(f"FIRST VIDEO THIS SESSION — '{video_name}' selected.")
+        else:
+            _log(f"VIDEO CHANGED — '{previous_video}' -> '{video_name}' "
+                 f"(picker key is currently '{st.session_state.get('label_tool_video_choice')}').")
         st.session_state.label_tool_current_video = video_name
         st.session_state.label_tool_radius = None
         st.session_state.label_tool_history = []  # for undo: list of (frame_idx, had_ball)
@@ -309,6 +331,8 @@ def main():
             if last_idx is not None:
                 default_sampled = list(range(0, total_frames, SAMPLE_EVERY_N_FRAMES))
                 st.session_state.label_tool_frame_ptr = bisect.bisect_right(default_sampled, last_idx)
+        _log(f"  -> confirmed={st.session_state.label_tool_video_confirmed} "
+             f"frame_ptr={st.session_state.label_tool_frame_ptr}")
 
     # ONE-TIME SAFETY CHECK per video, before any labeling starts: found
     # directly (2026-08-02) that some files in this folder are the main
@@ -409,6 +433,8 @@ def main():
             st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             del st.session_state[pending_point_key]
             st.session_state.label_tool_frame_ptr += 1
+            _log(f"CONFIRMED '{video_name}' frame {frame_idx} (saved) — advancing to ptr "
+                 f"{st.session_state.label_tool_frame_ptr}.")
             st.rerun()
     with col2:
         if st.button("↩️ Undo last", use_container_width=True, disabled=not st.session_state.label_tool_history):
