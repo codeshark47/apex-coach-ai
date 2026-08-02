@@ -463,39 +463,49 @@ def main():
     st.progress(ptr / max(1, len(sampled_indices) - 1))
     st.caption(f"**{video_name}** — frame {ptr + 1} of {len(sampled_indices)} (video frame #{frame_idx})")
 
-    frame_rgb = _load_frame(video_path, frame_idx)
-    if frame_rgb is None:
-        st.warning("Could not read this frame — skipping.")
-        st.session_state.label_tool_frame_ptr += 1
-        st.rerun()
-        return
+    # BUG REPORTED (2026-08-02, real coach test, "fairly often"): the frame
+    # image sometimes doesn't visually load at all, but the confirm/skip
+    # buttons are still there and clickable — the coach described clicking
+    # confirm on an AI suggestion without being able to see whether it was
+    # right (this time it happened to be correct, verified directly, but
+    # that was luck, not something to rely on). Wrapping the load+inference
+    # step in a spinner at least makes "still working" visually distinct
+    # from "silently stuck" — a manual reload button (below) is the actual
+    # escape hatch if the image still doesn't show up after that.
+    with st.spinner("Loading frame..."):
+        frame_rgb = _load_frame(video_path, frame_idx)
+        if frame_rgb is None:
+            st.warning("Could not read this frame — skipping.")
+            st.session_state.label_tool_frame_ptr += 1
+            st.rerun()
+            return
 
-    orig_w = frame_rgb.shape[1]
+        orig_w = frame_rgb.shape[1]
 
-    pending_point_key = f"label_tool_pending_{video_name}_{frame_idx}"
-    pending_source_key = f"label_tool_pending_source_{video_name}_{frame_idx}"
-    ai_radius_key = f"label_tool_ai_radius_{video_name}_{frame_idx}"
+        pending_point_key = f"label_tool_pending_{video_name}_{frame_idx}"
+        pending_source_key = f"label_tool_pending_source_{video_name}_{frame_idx}"
+        ai_radius_key = f"label_tool_ai_radius_{video_name}_{frame_idx}"
 
-    # AI PRE-FILL: only runs the FIRST time this frame is shown this
-    # session (pending_point_key not set yet) — never overwrites a
-    # coach's own click or a prior visit to this same frame (e.g. after
-    # "Undo last" stepping back to it). A confident detection pre-fills
-    # both the position and a starting radius guess (from the box size);
-    # the coach still reviews and confirms every single frame, same as
-    # before — this only removes the "click from nothing" step when the
-    # model already found it.
-    if pending_point_key not in st.session_state:
-        yolo_model = _load_yolo_model()
-        if yolo_model is not None:
-            results = yolo_model.predict(frame_rgb, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
-            boxes = results[0].boxes
-            if len(boxes) > 0:
-                confs = boxes.conf.tolist()
-                best_i = confs.index(max(confs))
-                x1, y1, x2, y2 = boxes.xyxy[best_i].tolist()
-                st.session_state[pending_point_key] = ((x1 + x2) / 2, (y1 + y2) / 2)
-                st.session_state[pending_source_key] = "ai"
-                st.session_state[ai_radius_key] = max(x2 - x1, y2 - y1) / 2
+        # AI PRE-FILL: only runs the FIRST time this frame is shown this
+        # session (pending_point_key not set yet) — never overwrites a
+        # coach's own click or a prior visit to this same frame (e.g. after
+        # "Undo last" stepping back to it). A confident detection pre-fills
+        # both the position and a starting radius guess (from the box size);
+        # the coach still reviews and confirms every single frame, same as
+        # before — this only removes the "click from nothing" step when the
+        # model already found it.
+        if pending_point_key not in st.session_state:
+            yolo_model = _load_yolo_model()
+            if yolo_model is not None:
+                results = yolo_model.predict(frame_rgb, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
+                boxes = results[0].boxes
+                if len(boxes) > 0:
+                    confs = boxes.conf.tolist()
+                    best_i = confs.index(max(confs))
+                    x1, y1, x2, y2 = boxes.xyxy[best_i].tolist()
+                    st.session_state[pending_point_key] = ((x1 + x2) / 2, (y1 + y2) / 2)
+                    st.session_state[pending_source_key] = "ai"
+                    st.session_state[ai_radius_key] = max(x2 - x1, y2 - y1) / 2
 
     pending_point = st.session_state.get(pending_point_key)
     pending_source = st.session_state.get(pending_source_key)
@@ -515,6 +525,14 @@ def main():
                    "or click elsewhere to fix it before confirming.")
     else:
         st.caption("📍 Your click (red).")
+
+    # ESCAPE HATCH (2026-08-02, real coach report of the image sometimes
+    # not visually loading "fairly often," with the confirm/skip buttons
+    # still clickable regardless): if the frame below looks blank, this
+    # forces a fresh rerun instead of guessing whether to confirm or skip
+    # on something you can't actually see.
+    if st.button("🔄 If the frame below looks blank, click here to reload it"):
+        st.rerun()
 
     display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
     click = streamlit_image_coordinates(display_img, key=f"label_tool_click_{video_name}_{frame_idx}")
