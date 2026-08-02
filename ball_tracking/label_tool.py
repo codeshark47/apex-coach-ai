@@ -31,6 +31,7 @@ Run locally (not deployed to Streamlit Cloud):
     streamlit run ball_tracking/label_tool.py
 """
 
+import bisect
 import os
 import sys
 
@@ -122,6 +123,21 @@ def _already_labeled_counts(client) -> dict:
     for r in rows:
         counts[r["source_video_filename"]] = counts.get(r["source_video_filename"], 0) + 1
     return counts
+
+
+def _last_labeled_frame_index(client, video_name: str):
+    """Highest frame_index already saved for this clip, or None. Used to
+    resume past work instead of restarting at frame 0 — see the resume
+    logic in main() for why this matters."""
+    result = (
+        client.table("ball_tracking_labels")
+        .select("frame_index")
+        .eq("source_video_filename", video_name)
+        .order("frame_index", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0]["frame_index"] if result.data else None
 
 
 def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
@@ -258,18 +274,41 @@ def main():
     )
     video_path = name_to_path[video_name]
 
-    # Reset per-clip session state whenever the chosen video changes.
-    if st.session_state.get("label_tool_current_video") != video_name:
-        st.session_state.label_tool_current_video = video_name
-        st.session_state.label_tool_frame_ptr = 0
-        st.session_state.label_tool_radius = None
-        st.session_state.label_tool_history = []  # for undo: list of (frame_idx, had_ball)
-        st.session_state.label_tool_video_confirmed = False
-
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     cap.release()
+
+    # Reset per-clip session state whenever the chosen video changes.
+    #
+    # BUG FOUND (2026-08-02, reported again after the earlier _discover_videos
+    # caching fix): coach got sent back to the "does this look like raw
+    # footage?" screen and lost their frame position mid-labeling, with no
+    # visible page reload — ruled out via a direct Supabase query that no
+    # labeled data was actually lost (a clip being worked on that session
+    # still had exactly the frames the coach had confirmed, nothing more,
+    # nothing less). That means the in-memory session state was silently
+    # reset by something below the app's control (e.g. a dropped/reconnected
+    # Streamlit connection) rather than by a code bug in the save path.
+    # Instead of chasing that trigger further, resume state is now derived
+    # from Supabase — the durable source of truth — rather than trusted
+    # session_state: a clip with any saved labels is treated as already
+    # confirmed as raw footage (the only way those rows could exist), and
+    # labeling resumes right after the last saved frame instead of frame 0.
+    # Worst case after any future reset is one redundant rerender, not lost
+    # progress or re-skipping past an entire run-up again.
+    if st.session_state.get("label_tool_current_video") != video_name:
+        st.session_state.label_tool_current_video = video_name
+        st.session_state.label_tool_radius = None
+        st.session_state.label_tool_history = []  # for undo: list of (frame_idx, had_ball)
+        already_labeled = counts.get(video_name, 0) > 0
+        st.session_state.label_tool_video_confirmed = already_labeled
+        st.session_state.label_tool_frame_ptr = 0
+        if already_labeled:
+            last_idx = _last_labeled_frame_index(client, video_name)
+            if last_idx is not None:
+                default_sampled = list(range(0, total_frames, SAMPLE_EVERY_N_FRAMES))
+                st.session_state.label_tool_frame_ptr = bisect.bisect_right(default_sampled, last_idx)
 
     # ONE-TIME SAFETY CHECK per video, before any labeling starts: found
     # directly (2026-08-02) that some files in this folder are the main
