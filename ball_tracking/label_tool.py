@@ -27,12 +27,24 @@ Deliberately ISOLATED from the production app, same as every other file
 in this package (see ball_tracking/__init__.py) — not imported by, and
 does not import from, streamlit_app.py or any file it depends on.
 
+AI PRE-FILL (2026-08-02): once a trained checkpoint exists under
+training/runs/*/weights/best.pt, each new frame is run through it before
+the coach ever sees it. A confident detection pre-fills the marker
+(shown in ORANGE, distinct from a coach's own RED click) so the coach
+reviews/confirms instead of clicking from a blank frame every time —
+this is the "use V1 to help label V2" bootstrap the project's own
+ball-tracking strategy always planned for, not a shortcut around
+verification: the coach still has to look at every frame and either
+confirm or correct it, same as before. No model found yet (e.g. a fresh
+checkout) just falls back to the original click-from-scratch flow.
+
 Run locally (not deployed to Streamlit Cloud):
     streamlit run ball_tracking/label_tool.py
 """
 
 import bisect
 import datetime
+import glob
 import os
 import sys
 
@@ -90,6 +102,50 @@ EXCLUDED_PREFIXES = ("Annotated_",)
 SAMPLE_EVERY_N_FRAMES = 3
 MAX_DISPLAY_WIDTH = 960
 DEFAULT_RADIUS_FRACTION = 0.02  # of frame width — first-frame starting guess only
+
+# Chosen from today's real evidence: genuine ball detections from this
+# model landed at 0.5-0.8 confidence; the false-positive noise it also
+# produces (a tree branch, a patch of grass) sat at 0.03-0.19. 0.35 sits
+# clearly above the noise band without being so strict it discards real
+# but less-certain detections — a starting point, not a tuned constant;
+# revisit once more of these pre-fills have been accepted/corrected.
+AI_PREFILL_CONF_THRESHOLD = 0.35
+
+
+@st.cache_resource(show_spinner="Loading AI ball detector (one-time)...")
+def _load_yolo_model():
+    """
+    Loads the most recently trained YOLO checkpoint to pre-fill the ball
+    position guess on each frame — the coach reviews/confirms instead of
+    clicking from a blank frame every time. Auto-picks the newest
+    training/runs/*/weights/best.pt by modification time so this never
+    needs updating by hand after a retrain (see training/train_yolo.py).
+
+    Returns None if no trained checkpoint exists yet (e.g. a fresh
+    checkout before the first training run) — the rest of this file
+    treats that as "no pre-fill available," falling back to the
+    original click-from-scratch flow with no error. A pre-fill is a
+    nice-to-have speedup, never a requirement for the tool to work.
+    """
+    candidates = glob.glob(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "training", "runs", "*", "weights", "best.pt")
+    )
+    if not candidates:
+        _log("No trained checkpoint found under training/runs/*/weights/best.pt — "
+             "AI pre-fill disabled, falling back to click-from-scratch.")
+        return None
+    latest = max(candidates, key=os.path.getmtime)
+
+    from ultralytics import YOLO
+    model = YOLO(latest)
+    # Ultralytics' first .predict() call pays a one-time warmup cost
+    # (~2.5s measured directly) that has nothing to do with per-frame
+    # inference speed (~40ms measured, after warmup) — pay that cost once
+    # here at load time (cached for the whole session by st.cache_resource),
+    # not on whatever frame the coach happens to land on first.
+    model.predict(np.zeros((640, 640, 3), dtype=np.uint8), conf=0.99, verbose=False)
+    _log(f"AI pre-fill model loaded: {latest}")
+    return model
 
 
 def _discover_videos() -> list:
@@ -218,11 +274,19 @@ def _load_frame(video_path: str, frame_idx: int):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
-def _display_image_with_marker(frame_rgb: np.ndarray, point, radius: float):
+def _display_image_with_marker(frame_rgb: np.ndarray, point, radius: float,
+                                marker_color=(255, 60, 60)):
     """Downscaled preview for display, with a marker circle drawn at
     `point` (original-image pixel coords) if one exists yet. Returns the
     PIL image to show and the scale factor to convert a click on the
-    DISPLAYED image back to original pixel coordinates."""
+    DISPLAYED image back to original pixel coordinates.
+
+    marker_color distinguishes an unreviewed AI suggestion (orange, see
+    main()) from a coach's own click (red, the original/default) — the
+    coach needs to be able to tell at a glance whether a marker is
+    something they confirmed or something still waiting on their
+    judgment, not just "a marker is present."
+    """
     img = Image.fromarray(frame_rgb)
     orig_w, orig_h = img.size
     scale = min(1.0, MAX_DISPLAY_WIDTH / orig_w)
@@ -233,7 +297,7 @@ def _display_image_with_marker(frame_rgb: np.ndarray, point, radius: float):
         draw = ImageDraw.Draw(img)
         dx, dy = point[0] * scale, point[1] * scale
         dr = max(3, radius * scale)
-        draw.ellipse([dx - dr, dy - dr, dx + dr, dy + dr], outline=(255, 60, 60), width=3)
+        draw.ellipse([dx - dr, dy - dr, dx + dr, dy + dr], outline=marker_color, width=3)
 
     return img, scale
 
@@ -407,18 +471,59 @@ def main():
         return
 
     orig_w = frame_rgb.shape[1]
-    radius = st.session_state.label_tool_radius or (orig_w * DEFAULT_RADIUS_FRACTION)
 
     pending_point_key = f"label_tool_pending_{video_name}_{frame_idx}"
-    pending_point = st.session_state.get(pending_point_key)
+    pending_source_key = f"label_tool_pending_source_{video_name}_{frame_idx}"
+    ai_radius_key = f"label_tool_ai_radius_{video_name}_{frame_idx}"
 
-    display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius)
+    # AI PRE-FILL: only runs the FIRST time this frame is shown this
+    # session (pending_point_key not set yet) — never overwrites a
+    # coach's own click or a prior visit to this same frame (e.g. after
+    # "Undo last" stepping back to it). A confident detection pre-fills
+    # both the position and a starting radius guess (from the box size);
+    # the coach still reviews and confirms every single frame, same as
+    # before — this only removes the "click from nothing" step when the
+    # model already found it.
+    if pending_point_key not in st.session_state:
+        yolo_model = _load_yolo_model()
+        if yolo_model is not None:
+            results = yolo_model.predict(frame_rgb, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
+            boxes = results[0].boxes
+            if len(boxes) > 0:
+                confs = boxes.conf.tolist()
+                best_i = confs.index(max(confs))
+                x1, y1, x2, y2 = boxes.xyxy[best_i].tolist()
+                st.session_state[pending_point_key] = ((x1 + x2) / 2, (y1 + y2) / 2)
+                st.session_state[pending_source_key] = "ai"
+                st.session_state[ai_radius_key] = max(x2 - x1, y2 - y1) / 2
+
+    pending_point = st.session_state.get(pending_point_key)
+    pending_source = st.session_state.get(pending_source_key)
+
+    if st.session_state.label_tool_radius is not None:
+        radius = st.session_state.label_tool_radius
+    elif pending_source == "ai" and ai_radius_key in st.session_state:
+        radius = st.session_state[ai_radius_key]
+    else:
+        radius = orig_w * DEFAULT_RADIUS_FRACTION
+
+    marker_color = (255, 165, 0) if pending_source == "ai" else (255, 60, 60)
+    if pending_point is None:
+        st.caption("Click the ball's center.")
+    elif pending_source == "ai":
+        st.caption("🤖 AI-suggested position (orange) — correct if it looks right, "
+                   "or click elsewhere to fix it before confirming.")
+    else:
+        st.caption("📍 Your click (red).")
+
+    display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
     click = streamlit_image_coordinates(display_img, key=f"label_tool_click_{video_name}_{frame_idx}")
 
     if click is not None:
         new_point = (click["x"] / scale, click["y"] / scale)
         if pending_point != new_point:
             st.session_state[pending_point_key] = new_point
+            st.session_state[pending_source_key] = "coach"
             st.rerun()
 
     # FIRST clip's radius calibration — one-time per video, right after the
@@ -429,7 +534,7 @@ def main():
             "Ball radius (pixels, original resolution)", min_value=2.0,
             max_value=orig_w * 0.1, value=float(radius), key="label_tool_radius_slider",
         )
-        display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius)
+        display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
         st.image(display_img)
         if st.button("✅ Confirm size for this whole clip"):
             st.session_state.label_tool_radius = radius
@@ -441,19 +546,32 @@ def main():
         confirm_disabled = pending_point is None
         if st.button("➡️ Confirm & next frame", disabled=confirm_disabled, use_container_width=True):
             x, y = pending_point
+            # Notes distinguish "AI suggested this, coach accepted it as-is" from a
+            # fully manual click — real signal for how often the pre-fill is
+            # actually trustworthy, same reasoning as the auto-vs-confirmed
+            # logging already built for release-point/foot-contact in the main
+            # app. labeled_by stays "direct_click_v1" either way — downstream
+            # (prepare_dataset.py) filters on that, not on this distinction.
+            if pending_source == "ai":
+                notes = ("AI-suggested position (V1 model pre-fill) accepted by the coach "
+                         "without adjustment — no drawn marker ever existed on this video's pixels.")
+            else:
+                notes = ("Directly clicked by the coach on the original, unmarked frame — "
+                         "no drawn marker ever existed on this video's pixels.")
             client.table("ball_tracking_labels").upsert({
                 "source_video_filename": video_name,
                 "frame_index": frame_idx,
                 "ball_x_px": x,
                 "ball_y_px": y,
                 "labeled_by": "direct_click_v1",
-                "notes": "Directly clicked by the coach on the original, unmarked frame — "
-                         "no drawn marker ever existed on this video's pixels.",
+                "notes": notes,
             }, on_conflict="source_video_filename,frame_index").execute()
             _upsert_run(client, video_name, fps, orig_w, frame_rgb.shape[0], total_frames, frame_idx, x, y, radius)
             st.session_state.label_tool_history.append(("confirm", frame_idx))
             st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             del st.session_state[pending_point_key]
+            st.session_state.pop(pending_source_key, None)
+            st.session_state.pop(ai_radius_key, None)
             st.session_state.label_tool_frame_ptr += 1
             _log(f"CONFIRMED '{video_name}' frame {frame_idx} (saved) — advancing to ptr "
                  f"{st.session_state.label_tool_frame_ptr}.")
@@ -494,6 +612,8 @@ def main():
             st.session_state.label_tool_history.append(("skip", actual_skip))
             if pending_point_key in st.session_state:
                 del st.session_state[pending_point_key]
+            st.session_state.pop(pending_source_key, None)
+            st.session_state.pop(ai_radius_key, None)
             st.session_state.label_tool_frame_ptr += actual_skip
             st.rerun()
 
