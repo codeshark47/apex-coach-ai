@@ -861,9 +861,12 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     once, upfront, fixes every downstream step at once instead of
     patching each one individually.
 
-    Falls back to writing the original file untouched if ffmpeg isn't
-    available or the transcode fails, rather than failing outright —
-    same reasoning as transcode_to_h264.
+    Falls back to writing the original file untouched only if ffmpeg isn't
+    installed at all (a deployment issue, not a per-video one). If ffmpeg
+    IS installed but fails or times out on this specific file, that means
+    the file itself is too demanding to safely hand to the rest of the
+    pipeline — raises RuntimeError instead of silently proceeding with an
+    even-more-demanding original (see the 2026-08-02 note below).
     """
     import shutil
     import tempfile
@@ -895,28 +898,59 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
         "-an", dest_path,
     ]
 
-    try:
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    # BUG FOUND (2026-08-02): an iPhone 17 Pro native recording crashed the
+    # whole shared Streamlit Cloud process (server died outright — "Oh no",
+    # no Python traceback in the logs, just silence — not something caught
+    # here). The fallback below used to treat ANY downscale failure the
+    # same as "ffmpeg isn't installed" and proceed with the untouched
+    # original file. That's backwards when ffmpeg fails or times out WHILE
+    # actively trying to decode this specific file: it means the source is
+    # too demanding for this decode step (resolution, bitrate, HDR/10-bit,
+    # framerate — newer phones keep raising this bar), and handing the
+    # even-more-demanding original to the rest of the pipeline (MediaPipe,
+    # OpenCV) just delays the same crash by a few steps, for every other
+    # coach sharing this same free-tier process. Only "ffmpeg missing from
+    # PATH entirely" (a deployment issue, not a per-video one) still falls
+    # back to the original — an actual failure/timeout on this file now
+    # raises a clear, catchable error instead, so Streamlit shows a normal
+    # red error box and the server survives instead of dying outright.
+    startupinfo = None
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
+    try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             startupinfo=startupinfo, timeout=180,
         )
-        if result.returncode != 0 or not os.path.exists(dest_path):
-            print(
-                f"WARNING: video downscale failed (exit code {result.returncode}): "
-                f"{result.stderr.decode(errors='ignore')[:300]} — using original resolution."
-            )
-            os.replace(raw_path, dest_path)
-        else:
-            os.remove(raw_path)
+    except subprocess.TimeoutExpired:
+        os.remove(raw_path)
+        raise RuntimeError(
+            "This video took too long to process (over 3 minutes) — it's likely "
+            "too high-resolution or high-bitrate for this server. Try trimming the "
+            "clip or recording at a standard (non-Pro/non-HDR) quality setting, "
+            "then re-upload."
+        )
     except Exception as e:
         monitoring.capture(e)
-        print(f"WARNING: video downscale raised an exception: {e} — using original resolution.")
-        os.replace(raw_path, dest_path)
+        os.remove(raw_path)
+        raise RuntimeError(
+            f"This video couldn't be processed due to an unexpected error ({e}). "
+            "Try trimming the clip or recording at a standard (non-Pro/non-HDR) "
+            "quality setting, then re-upload."
+        )
+
+    if result.returncode != 0 or not os.path.exists(dest_path):
+        stderr_tail = result.stderr.decode(errors='ignore')[:300]
+        os.remove(raw_path)
+        raise RuntimeError(
+            "This video couldn't be processed — it may be too high-resolution, "
+            "high-bitrate, or long for this server. Try trimming the clip or "
+            "recording at a standard (non-Pro/non-HDR) quality setting, then "
+            f"re-upload. (ffmpeg exit {result.returncode}: {stderr_tail})"
+        )
+    os.remove(raw_path)
 
 
 def transcode_to_h264(input_path: str) -> str:

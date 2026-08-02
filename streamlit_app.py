@@ -1168,7 +1168,11 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
         # same stream, so we can pull reference frames from it.
         os.makedirs("input", exist_ok=True)
         ref_path = os.path.abspath(os.path.join("input", f"_seed_ref_{save_key}_{uploaded_file.name}"))
-        o.save_uploaded_video_capped(uploaded_file, ref_path)
+        try:
+            o.save_uploaded_video_capped(uploaded_file, ref_path)
+        except RuntimeError as e:
+            st.error(f"⚠️ {e}")
+            st.stop()
         st.session_state[shared_ref_identity_key] = file_identity
         st.session_state[shared_ref_path_key] = ref_path
 
@@ -1861,16 +1865,20 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
     if st.sidebar.button("🚀 Execute Biomechanical Analysis Run", use_container_width=True):
         os.makedirs("input", exist_ok=True)
 
-        if camera_mode == "Single Camera":
-            video_path = os.path.abspath(os.path.join("input", uploaded_single.name))
-            o.save_uploaded_video_capped(uploaded_single, video_path)
-            st.sidebar.success(f"Cached: {uploaded_single.name}")
-        else:
-            video_path = os.path.abspath(os.path.join("input", uploaded_side.name))
-            rear_path = os.path.abspath(os.path.join("input", uploaded_rear.name))
-            o.save_uploaded_video_capped(uploaded_side, video_path)
-            o.save_uploaded_video_capped(uploaded_rear, rear_path)
-            st.sidebar.success(f"Cached: {uploaded_side.name} + {uploaded_rear.name}")
+        try:
+            if camera_mode == "Single Camera":
+                video_path = os.path.abspath(os.path.join("input", uploaded_single.name))
+                o.save_uploaded_video_capped(uploaded_single, video_path)
+                st.sidebar.success(f"Cached: {uploaded_single.name}")
+            else:
+                video_path = os.path.abspath(os.path.join("input", uploaded_side.name))
+                rear_path = os.path.abspath(os.path.join("input", uploaded_rear.name))
+                o.save_uploaded_video_capped(uploaded_side, video_path)
+                o.save_uploaded_video_capped(uploaded_rear, rear_path)
+                st.sidebar.success(f"Cached: {uploaded_side.name} + {uploaded_rear.name}")
+        except RuntimeError as e:
+            st.error(f"⚠️ {e}")
+            st.stop()
 
         with st.spinner("Executing kinematic extraction and landmark mapping..."):
             if camera_mode == "Dual Camera — Recommended":

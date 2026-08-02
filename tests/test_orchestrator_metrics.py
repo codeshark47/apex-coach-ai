@@ -23,9 +23,11 @@ confirmed bugs found on real footage this session:
 """
 
 import os
+import subprocess
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import orchestrator as o
 
@@ -263,3 +265,46 @@ class TestSaveUploadedVideoCapped:
         o.save_uploaded_video_capped(fake_file, dest)
 
         assert os.path.exists(dest)
+
+    def test_raises_instead_of_falling_back_when_ffmpeg_fails_on_this_file(self, tmp_path, monkeypatch):
+        """BUG FOUND (2026-08-02): an iPhone 17 Pro native recording crashed
+        the whole shared Streamlit Cloud process outright. The old fallback
+        treated a failed downscale attempt the same as "ffmpeg not
+        installed" and silently handed the untouched (often even more
+        demanding) original to the rest of the pipeline — which just moves
+        the same crash a few steps later instead of preventing it. A real
+        per-file failure must now surface as a catchable error, not a
+        silent, dangerous fallback."""
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+        class _FailedResult:
+            returncode = 1
+            stderr = b"some ffmpeg failure output"
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FailedResult())
+
+        fake_file = _FakeUploadedFile("clip.mp4", b"pretend this is a huge native 4K HDR file")
+        dest = str(tmp_path / "saved.mp4")
+
+        with pytest.raises(RuntimeError):
+            o.save_uploaded_video_capped(fake_file, dest)
+
+        assert not os.path.exists(dest)
+
+    def test_raises_instead_of_falling_back_when_ffmpeg_times_out(self, tmp_path, monkeypatch):
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+        def _raise_timeout(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=180)
+
+        monkeypatch.setattr(subprocess, "run", _raise_timeout)
+
+        fake_file = _FakeUploadedFile("clip.mp4", b"pretend this is a huge native 4K HDR file")
+        dest = str(tmp_path / "saved.mp4")
+
+        with pytest.raises(RuntimeError):
+            o.save_uploaded_video_capped(fake_file, dest)
+
+        assert not os.path.exists(dest)
