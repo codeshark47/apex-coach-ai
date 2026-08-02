@@ -210,7 +210,26 @@ def main():
         "just click and it moves on."
     )
 
-    videos = _discover_videos()
+    # BUG FOUND directly from a coach report (2026-08-02): re-scanning the
+    # actual folders on every single rerun (every click) meant ANY transient
+    # inconsistency in that scan — a file mid-download, a cloud-sync
+    # hiccup, antivirus briefly touching a file — could make the CURRENTLY
+    # selected video look "missing" for one render, which triggered the
+    # safety fallback below to reset the selection outright. That reset
+    # also wiped label_tool_video_confirmed, forcing the "does this look
+    # like raw footage?" screen to reappear — reported as "keeps pushing me
+    # back to frame one" and confirmed to happen without ever restarting
+    # the app, ruling out a simpler explanation. Fix: scan the folders ONCE
+    # per session (cached in session_state), not on every rerun — the list
+    # only changes when the coach explicitly asks it to via the refresh
+    # button, so a transient filesystem hiccup elsewhere can't cascade into
+    # resetting an in-progress video's state anymore.
+    if "label_tool_videos" not in st.session_state:
+        st.session_state.label_tool_videos = _discover_videos()
+    if st.sidebar.button("🔄 Refresh video list", help="Pick up new files added to the folders since this session started."):
+        st.session_state.label_tool_videos = _discover_videos()
+        st.rerun()
+    videos = st.session_state.label_tool_videos
     if not videos:
         st.error(f"No video files found in {SEARCH_DIRS}.")
         return
@@ -220,22 +239,16 @@ def main():
         st.session_state.label_tool_counts = _already_labeled_counts(client)
     counts = st.session_state.label_tool_counts
 
-    # BUG FOUND directly from a coach report: the selection was stored as
-    # a raw POSITION in the video list, not the filename itself. _discover_
-    # videos() re-scans the actual folders on every single rerun (every
-    # click), so if a new file appeared mid-session (e.g. still downloading
-    # more clips while labeling — confirmed this is what was happening),
-    # the list's order shifts and the same stored position number silently
-    # points at a DIFFERENT video — no re-selection, no warning, just a
-    # different clip on screen. Keying the widget by filename instead means
-    # Streamlit keeps the same clip selected even if the list around it
-    # changes, since it matches by identity, not position.
+    # Keyed by filename, not list position, so the selection survives even
+    # if the (now session-cached, only-refreshed-on-request) list ever
+    # does change — see BUG note above for why position-based indexing
+    # was fragile.
     video_names = [name for name, _ in videos]
     name_to_path = dict(videos)
-    # If the previously-selected file disappeared from the list (moved,
-    # renamed, deleted) between reruns, Streamlit's selectbox raises
-    # outright rather than falling back — clear the stale value first so
-    # it just defaults to the first option instead of crashing.
+    # If the previously-selected file genuinely disappeared (moved,
+    # renamed, deleted, or a stale selection from before a manual refresh),
+    # Streamlit's selectbox raises outright rather than falling back —
+    # clear the stale value first so it just defaults to the first option.
     if st.session_state.get("label_tool_video_choice") not in video_names:
         st.session_state.pop("label_tool_video_choice", None)
     video_name = st.sidebar.selectbox(
