@@ -871,6 +871,26 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     import shutil
     import tempfile
 
+    # BUG FOUND (2026-08-02, same iPhone 17 Pro Max incident as above): the
+    # server log for that crash showed the app going silent with NO warning
+    # printed — but every failure path below prints one before giving up.
+    # That means the crash most likely happened even earlier than any of
+    # this: reading the raw upload fully into memory (the next few lines)
+    # runs BEFORE ffmpeg is ever invoked. Newer Pro-line phones can produce
+    # native files large enough (very high bitrate, or stereoscopic
+    # "spatial video" on 15/16/17 Pro) to exhaust the server's memory just
+    # buffering the raw bytes, before the compressor gets a chance to help
+    # at all. Reject grossly oversized uploads outright, using the size
+    # Streamlit already reports without needing to read the file first.
+    MAX_UPLOAD_BYTES = 300 * 1024 * 1024  # 300MB
+    upload_size = getattr(uploaded_file, "size", None)
+    if upload_size is not None and upload_size > MAX_UPLOAD_BYTES:
+        raise RuntimeError(
+            f"This video file is {upload_size / (1024 * 1024):.0f}MB, too large for this "
+            "server to safely handle. Try recording at a standard (non-Pro/non-HDR/"
+            "non-spatial) quality setting, or trim/compress the clip, then re-upload."
+        )
+
     dest_dir = os.path.dirname(dest_path) or "."
     os.makedirs(dest_dir, exist_ok=True)
     raw_fd, raw_path = tempfile.mkstemp(

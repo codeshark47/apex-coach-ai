@@ -215,11 +215,15 @@ class TestLandmarksCsvPath:
 
 class _FakeUploadedFile:
     """Minimal stand-in for Streamlit's UploadedFile — just enough for
-    save_uploaded_video_capped, which only touches .name and .getbuffer()."""
+    save_uploaded_video_capped, which only touches .name, .size, and
+    .getbuffer(). size defaults to len(content) (real Streamlit behavior)
+    but can be overridden to simulate a huge upload without actually
+    allocating huge fake bytes."""
 
-    def __init__(self, name: str, content: bytes):
+    def __init__(self, name: str, content: bytes, size: int = None):
         self.name = name
         self._content = content
+        self.size = len(content) if size is None else size
 
     def getbuffer(self):
         return self._content
@@ -265,6 +269,30 @@ class TestSaveUploadedVideoCapped:
         o.save_uploaded_video_capped(fake_file, dest)
 
         assert os.path.exists(dest)
+
+    def test_rejects_grossly_oversized_upload_before_reading_it_into_memory(self, tmp_path, monkeypatch):
+        """BUG FOUND (2026-08-02, same iPhone 17 Pro Max incident): the
+        server log showed the app going silent with NO warning printed —
+        but every ffmpeg failure path prints one before giving up. That
+        means the crash likely happened even earlier: reading the raw
+        upload into memory, which runs before ffmpeg is ever invoked.
+        A grossly oversized upload must be rejected on its reported .size
+        alone, without ever calling .getbuffer()."""
+        import shutil as _shutil
+        # If getbuffer() were called, this would prove the size check was
+        # skipped -- fail loudly rather than actually allocating 400MB.
+        def _explode():
+            raise AssertionError("getbuffer() should never be called for an oversized upload")
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+        fake_file = _FakeUploadedFile("clip.mp4", b"tiny placeholder", size=400 * 1024 * 1024)
+        fake_file.getbuffer = _explode
+        dest = str(tmp_path / "saved.mp4")
+
+        with pytest.raises(RuntimeError, match="too large"):
+            o.save_uploaded_video_capped(fake_file, dest)
+
+        assert not os.path.exists(dest)
 
     def test_raises_instead_of_falling_back_when_ffmpeg_fails_on_this_file(self, tmp_path, monkeypatch):
         """BUG FOUND (2026-08-02): an iPhone 17 Pro native recording crashed
