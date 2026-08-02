@@ -305,12 +305,21 @@ def main():
                  f"{len(video_names)}-video list, clearing it so the picker falls back "
                  f"to its default option.")
         st.session_state.pop("label_tool_video_choice", None)
-    video_name = st.sidebar.selectbox(
-        "Pick a video", video_names,
-        format_func=lambda name: f"{name}  ({counts.get(name, 0)} frames already labeled)",
-        key="label_tool_video_choice",
-    )
+    # ROOT CAUSE FOUND (2026-08-02, via the coach's terminal log): format_func
+    # used to bake the live "N frames already labeled" count into each
+    # option's displayed text. Confirming a frame updates that count for the
+    # CURRENTLY selected video in the very same rerun that also (re)submits
+    # the selectbox's own value — the log showed session_state literally
+    # holding the formatted display string ("IMG_3082.MOV  (3 frames already
+    # labeled)") instead of the filename right after a count changed, which
+    # then failed the video_names membership check above and fell back to
+    # the first video alphabetically (Abu Bakar.MOV) — matching every
+    # reported incident exactly. Fix: the option label must never change
+    # while it's selected. Show the raw filename only in the dropdown, and
+    # put the live count in a separate caption underneath instead.
+    video_name = st.sidebar.selectbox("Pick a video", video_names, key="label_tool_video_choice")
     video_path = name_to_path[video_name]
+    st.sidebar.caption(f"{counts.get(video_name, 0)} frames already labeled for this clip.")
 
     cap = _get_capture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
