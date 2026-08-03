@@ -28,6 +28,27 @@ class TestHeadMovement:
         assert result["status"] == "success"
         assert result["tier"] == "Excess Head Drift"
 
+    def test_tier_threshold_matches_metric_ranges_green_band(self):
+        """BUG FOUND (2026-08-03, real coach test): this function used to
+        cut its own "tier" text off at 0.015, while metric_ranges.py's
+        actual green/OPTIMAL band goes up to 0.02 -- a real result of
+        0.0162 landed inside the authoritative green band but showed the
+        contradictory "Excess Head Drift" descriptor. A value in the
+        0.015-0.02 gap must now report the tier consistent with
+        metric_ranges, not a second, independent boundary."""
+        import metric_ranges as mr
+        # Alternating +-a around a fixed mean gives std_dev == a exactly
+        # (population std, ddof=0) -- 0.0162 matches the real value from
+        # the coach test that exposed this bug.
+        rows = [{"frame": i, "NOSE_x": 0.50 + (0.0162 if i % 2 == 0 else -0.0162)} for i in range(10)]
+        df = pd.DataFrame(rows)
+        result = bk.calculate_head_movement(df, stance_frame=0, contact_frame=9)
+        assert result["status"] == "success"
+        value = float(result["deviation_index"])
+        assert 0.015 < value <= 0.02, "test value must fall in the gap this bug lived in"
+        assert result["tier"] == "Head Still Over The Ball"
+        assert mr.classify("batting_head_movement", value) == "green"
+
     def test_empty_window_is_error_not_fabricated(self):
         df = pd.DataFrame([{"frame": 0, "NOSE_x": 0.5}])
         result = bk.calculate_head_movement(df, stance_frame=100, contact_frame=200)
@@ -104,6 +125,23 @@ class TestWeightTransfer:
                              "LEFT_HIP_x": 0.5, "RIGHT_HIP_x": 0.5}])
         result = bk.calculate_weight_transfer(df, stance_frame=0, contact_frame=999, front_side="left")
         assert result["status"] == "error"
+
+    def test_implausible_percent_is_error_not_a_fabricated_number(self):
+        """BUG FOUND (2026-08-03, real coach test): a genuine session
+        produced 497% -- physically impossible (hips can't move ~5x the
+        stance width). Caused by a small-but-nonzero stance_width (not
+        caught by the earlier "< 1e-6" literal-zero check) amplifying an
+        ordinary hip displacement. Must now report this as an honest
+        tracking failure, not a fabricated-looking extreme number."""
+        stance = {"frame": 0, "LEFT_ANKLE_x": 0.490, "RIGHT_ANKLE_x": 0.510,
+                   "LEFT_HIP_x": 0.500, "RIGHT_HIP_x": 0.500}
+        contact = {"frame": 10, "LEFT_ANKLE_x": 0.490, "RIGHT_ANKLE_x": 0.510,
+                    "LEFT_HIP_x": 0.400, "RIGHT_HIP_x": 0.400}
+        df = pd.DataFrame([stance, contact])
+        result = bk.calculate_weight_transfer(df, stance_frame=0, contact_frame=10, front_side="left")
+        assert result["status"] == "error"
+        assert result["percent"] is None
+        assert result["tier"] == "Tracking Drop"
 
     def test_zero_stance_width_is_error_not_divide_crash(self):
         stance = {"frame": 0, "LEFT_ANKLE_x": 0.50, "RIGHT_ANKLE_x": 0.50,

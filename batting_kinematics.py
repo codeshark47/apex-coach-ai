@@ -46,9 +46,21 @@ def calculate_head_movement(df: pd.DataFrame, stance_frame: int, contact_frame: 
     result = calculate_head_stability(df, stance_frame, contact_frame)
     # Relabel to batting-relevant tier language without changing the
     # underlying (proven, reused) computation at all.
+    #
+    # BUG FOUND (2026-08-03, real coach test): this used 0.015 as its own
+    # cutoff for the tier TEXT, while metric_ranges.py's actual green band
+    # for batting_head_movement is (0.0, 0.02) — a value like 0.0162 (a
+    # real result from that test) landed inside the green/OPTIMAL band by
+    # the authoritative classify() call, but showed "Excess Head Drift" as
+    # its descriptor, a self-contradictory pair that reached the Gemini
+    # prompt as "ZONE: OPTIMAL (descriptor: Excess Head Drift)". Same class
+    # of bug already fixed for bowling metrics (ZONE from metric_ranges is
+    # the only authoritative source; the tier/descriptor text must never
+    # imply a different verdict) — matching the boundary here instead of
+    # inventing a second, independent one.
     if result.get("status") == "success":
         std_dev = float(result["deviation_index"])
-        tier = "Head Still Over The Ball" if std_dev <= 0.015 else "Excess Head Drift"
+        tier = "Head Still Over The Ball" if std_dev <= 0.02 else "Excess Head Drift"
         return {"deviation_index": result["deviation_index"], "tier": tier, "status": "success"}
     return {"deviation_index": None, "tier": result.get("tier", "Data Deficit"), "status": "error"}
 
@@ -127,6 +139,24 @@ def calculate_weight_transfer(df: pd.DataFrame, stance_frame: int, contact_frame
         displacement = (contact_hip_x - stance_hip_x) * direction
         percent = round(float(displacement / stance_width) * 100, 1)
         if np.isnan(percent):
+            return {"percent": None, "tier": "Tracking Drop", "status": "error"}
+
+        # IMPLAUSIBILITY GUARD (2026-08-03, found on a real coach test: a
+        # genuine session produced 497%, which would mean the hips moved
+        # nearly 5x the entire stance width — not physically possible for
+        # a real batting shot). The 1e-6 check above only catches a
+        # LITERALLY zero-width stance; it doesn't catch a small-but-nonzero
+        # stance_width (e.g. from an imprecisely chosen stance frame or
+        # noisy ankle tracking), which still blows up an ordinary hip
+        # displacement into an absurd percentage when divided. Same
+        # reasoning as the knee-bracing near-zero-angle guard elsewhere in
+        # this codebase: an engineering ceiling based on what's physically
+        # plausible, not a cited biomechanics constant. Beyond this, the
+        # result is far more likely a degenerate denominator than a real
+        # measurement — honest "couldn't measure this" beats a fabricated-
+        # looking extreme number.
+        WEIGHT_TRANSFER_IMPLAUSIBLE_CEILING = 150.0
+        if abs(percent) > WEIGHT_TRANSFER_IMPLAUSIBLE_CEILING:
             return {"percent": None, "tier": "Tracking Drop", "status": "error"}
 
         if percent >= 40.0:
