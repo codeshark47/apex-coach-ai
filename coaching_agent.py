@@ -249,13 +249,20 @@ def generate_batting_coaching_report(result_payload: Dict[str, Any]) -> dict:
 
     metrics = result_payload.get("biomechanical_metrics", {})
     batting_hand = metrics.get("batting_hand_detected", "Unknown")
+    camera_angle = result_payload.get("camera_angle", "uncertain")
+    view_caveats = result_payload.get("view_confidence_caveats", [])
+    shot_played = result_payload.get("shot_played")
+    ball_line = result_payload.get("ball_line")
+    falling_over = result_payload.get("falling_over_risk", {})
 
     head_data = metrics.get("head_movement", {})
     head_val = head_data.get("value")
     head_descriptor = head_data.get("tier", "Unknown")
 
     foot_data = metrics.get("front_foot_alignment", {})
-    foot_val = foot_data.get("degrees")
+    foot_val = foot_data.get("deviation_degrees")
+    foot_signed = foot_data.get("signed_degrees")
+    foot_side = foot_data.get("side")
     foot_descriptor = foot_data.get("tier", "Unknown")
 
     weight_data = metrics.get("weight_transfer", {})
@@ -270,18 +277,37 @@ def generate_batting_coaching_report(result_payload: Dict[str, Any]) -> dict:
     elbow_val = elbow_data.get("degrees")
     elbow_descriptor = elbow_data.get("tier", "Unknown")
 
+    knee_data = metrics.get("front_knee_flexion", {})
+    knee_val = knee_data.get("degrees")
+    knee_descriptor = knee_data.get("tier", "Unknown")
+
+    xfactor_data = metrics.get("xfactor_separation", {})
+    xfactor_val = xfactor_data.get("degrees")
+    xfactor_descriptor = xfactor_data.get("tier", "Unknown")
+
     head_zone = ZONE_LABELS[mr.classify("batting_head_movement", head_val)]
     foot_zone = ZONE_LABELS[mr.classify("batting_front_foot_alignment", foot_val)]
     weight_zone = ZONE_LABELS[mr.classify("batting_weight_transfer", weight_val)]
     swing_zone = ZONE_LABELS[mr.classify("batting_downswing_plane", swing_val)]
     elbow_zone = ZONE_LABELS[mr.classify("batting_top_elbow_angle", elbow_val)]
+    knee_zone = ZONE_LABELS[mr.classify("batting_front_knee_flexion", knee_val)]
+    xfactor_zone = ZONE_LABELS[mr.classify("batting_xfactor_separation", xfactor_val)]
+
+    # front_foot_alignment's deviation is intentionally None for shots in
+    # batting_kinematics.NOT_APPLICABLE_SHOTS (back-foot/horizontal-bat/
+    # unorthodox shots, e.g. a hook or reverse sweep) — that's a real,
+    # deliberate "this metric doesn't apply", not a tracking failure, and
+    # must not count toward "missing data" or the too-many-missing gate.
+    foot_not_applicable = foot_descriptor == "Not Applicable For This Shot"
 
     missing = []
     if head_val is None: missing.append("head_movement")
-    if foot_val is None: missing.append("front_foot_alignment")
+    if foot_val is None and not foot_not_applicable: missing.append("front_foot_alignment")
     if weight_val is None: missing.append("weight_transfer")
     if swing_val is None: missing.append("downswing_plane")
     if elbow_val is None: missing.append("top_elbow_angle")
+    if knee_val is None: missing.append("front_knee_flexion")
+    if xfactor_val is None: missing.append("xfactor_separation")
 
     missing_note = ""
     if missing:
@@ -289,7 +315,14 @@ def generate_batting_coaching_report(result_payload: Dict[str, Any]) -> dict:
             f"\nNOTE: The following metrics could not be calculated: {', '.join(missing)}. "
             f"Acknowledge this in your narrative. Do not fabricate values for them.\n"
         )
-        if len(missing) >= 4:
+        # Threshold scaled up from the original 5-metric set's ">= 4" (80%
+        # missing) to keep roughly the same bar now that there are 7
+        # metrics — front_knee_flexion and xfactor_separation are most
+        # reliable from opposite camera angles (see
+        # batting_orchestrator.py's docstring), so it's expected and fine
+        # for ONE of them to occasionally read as weaker than the other,
+        # not grounds alone to fail the whole report.
+        if len(missing) >= 5:
             return _error_state(
                 f"Too many metrics missing: {', '.join(missing)}. "
                 f"Check landmark tracking quality and camera angle."
@@ -301,6 +334,40 @@ def generate_batting_coaching_report(result_payload: Dict[str, Any]) -> dict:
         return f"{round(float(val), 2)}{unit}"
 
     reference_ranges_block = "\n".join(mr.describe_range(k) for k in mr.all_batting_metric_keys())
+
+    camera_angle_note = {
+        "side_on": "Filmed side-on.",
+        "front_or_rear": (
+            "Filmed front-on/rear-on (camera roughly behind the stumps or bowler's end). "
+            + (f"Treat {', '.join(view_caveats)} with extra caution — these two are most reliable "
+               "from side-on footage and can be less precise from this angle." if view_caveats else "")
+        ),
+        "uncertain": "Filming angle could not be confidently determined.",
+        "unavailable": "Filming angle could not be determined (insufficient landmark data).",
+    }.get(camera_angle, "Filming angle unknown.")
+
+    foot_direction_note = ""
+    if foot_signed is not None:
+        shot_label = shot_played.replace("_", " ").title() if shot_played else "no specific shot selected"
+        foot_direction_note = (
+            f" Front foot pointed {abs(foot_signed)}° toward the {foot_side.lower()} "
+            f"of straight down the pitch (shot the coach identified: {shot_label})."
+        )
+
+    falling_over_block = ""
+    if falling_over.get("status") == "success":
+        if falling_over.get("flagged"):
+            falling_over_block = (
+                f"\nCOMPOUND TECHNICAL FAULT DETECTED — FALLING OVER / PLAYING AROUND THE FRONT PAD:\n"
+                f"{falling_over.get('reason')} (head drift {falling_over.get('head_shift_pct')}% of stance "
+                f"width, front-foot cross {falling_over.get('foot_cross_pct')}% of stance width, both toward "
+                f"the {ball_line} side on a {ball_line}-stump line delivery). This MUST be called out as a "
+                f"critical finding in your narrative and should be the top-priority drill if it's the most "
+                f"severe fault present — this is a specific, named coaching fault, not a generic head-position "
+                f"or foot-alignment comment.\n"
+            )
+        else:
+            falling_over_block = "\nCompound falling-over/scissor-foot check: not triggered on this delivery.\n"
 
     prompt = f"""
 You are the lead batting technique analyst at a national cricket academy — a batting coach with
@@ -315,6 +382,8 @@ VIDEO METADATA:
 - Frame rate: {fps} FPS
 - Total frames analyzed: {total_frames}
 - Batting hand detected (leading side): {batting_hand}
+- Camera angle: {camera_angle_note}
+- Ball line reported by coach: {ball_line or "not specified"}
 - Stance: Frame {stance}
 - Backlift (top of swing): Frame {backlift}
 - Point of Contact: Frame {contact}
@@ -323,11 +392,13 @@ BIOMECHANICAL MEASUREMENTS (ZONE is the authoritative classification for every
 decision below — base all urgency and drill choices on ZONE, not on the
 descriptor in parentheses, which is supplementary color commentary only):
 1. Head Movement (Stance to Contact): {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor})
-2. Front Foot Alignment: {fmt(foot_val)} — ZONE: {foot_zone} (descriptor: {foot_descriptor})
+2. Front Foot Alignment (deviation from shot-relative target): {fmt(foot_val)} — ZONE: {foot_zone} (descriptor: {foot_descriptor}).{foot_direction_note}
 3. Weight Transfer Onto Front Foot: {fmt(weight_val, "%")} — ZONE: {weight_zone} (descriptor: {weight_descriptor})
 4. Downswing Plane (Straight Bat): {fmt(swing_val)} — ZONE: {swing_zone} (descriptor: {swing_descriptor})
 5. Top-Elbow Angle At Contact: {fmt(elbow_val)} — ZONE: {elbow_zone} (descriptor: {elbow_descriptor})
-{missing_note}
+6. Front Knee Flexion At Contact: {fmt(knee_val)} — ZONE: {knee_zone} (descriptor: {knee_descriptor})
+7. Hip-Shoulder Separation (X-Factor): {fmt(xfactor_val)} — ZONE: {xfactor_zone} (descriptor: {xfactor_descriptor})
+{missing_note}{falling_over_block}
 REFERENCE RANGES (authoritative, matches the UI and PDF report exactly):
 {reference_ranges_block}
 
@@ -335,20 +406,29 @@ IMPORTANT CONTEXT: front_foot_alignment, downswing_plane, and top_elbow_angle ar
 body-pose landmarks only (no bat-tracking sensor exists yet) — downswing_plane specifically uses
 the midpoint of both wrists as a proxy for the bat handle's path, not the bat's actual face angle.
 Do not overstate precision on these three; you may comment on them but frame borderline (ACCEPTABLE
-zone) readings with appropriate caution rather than absolute certainty.
+zone) readings with appropriate caution rather than absolute certainty. Front Knee Flexion is most
+reliable from side-on footage; Hip-Shoulder Separation (X-Factor) is most reliable from front-on/
+rear-on footage — one of the two reading as N/A or borderline is expected depending on camera angle,
+not necessarily a tracking failure.
 
 COACHING PHILOSOPHY:
 - Every batter has an individual technique built through years of practice — do not recommend
   changing something that is merely unorthodox if it is not in a CRITICAL zone.
+- A CONFIRMED compound fault (the falling-over/scissor-foot check above, if triggered) always takes
+  priority over any single metric being CRITICAL — it describes a specific, named technical fault a
+  real coach would call out by name, not a number in isolation.
 - Only prescribe drills for metrics whose ZONE is CRITICAL, or a technically severe/obvious fault.
-- Prioritize the fundamentals in this order when multiple metrics are CRITICAL: head position first
-  (a stable head over the ball is the foundation everything else is built on), then weight transfer,
-  then front foot alignment, then downswing plane, then top-elbow control — a fix higher in this
-  order often naturally improves the ones below it, so lead with the most foundational fault.
+- Prioritize the fundamentals in this order when multiple metrics are CRITICAL: the falling-over
+  compound fault first (if triggered), then head position (a stable head over the ball is the
+  foundation everything else is built on), then weight transfer, then front foot alignment, then
+  downswing plane, then front-knee flexion / hip-shoulder separation, then top-elbow control — a fix
+  higher in this order often naturally improves the ones below it, so lead with the most foundational
+  fault.
 - Drills must be REAL, standard batting coaching drills a club or academy coach would recognize
   (e.g. shadow batting in front of a mirror, throwdowns/side-arm feeds at a specific line and length,
   a target cone drill for front-foot direction, a resistance-band or towel drill for downswing path,
-  a "top-hand only" shadow shot drill for elbow control) — not vague, generic advice like "practice more."
+  a "top-hand only" shadow shot drill for elbow control, an off-stump guard drill for the falling-over
+  fault) — not vague, generic advice like "practice more."
 
 Your task is to produce a two-section technical coaching report.
 Separate the two sections with exactly one line containing only: ---

@@ -49,6 +49,14 @@ class MetricRange:
     amber: tuple         # (low, high) — lower amber band for all kinds
     display_optimal: str  # human string for the "optimal range" column
     amber_high: tuple = None  # (low, high) upper amber band — only used by "band" kind
+    # BUG FIX (2026-08-03, found while restyling the batting UI): format_value/
+    # describe_range used to multiply EVERY unit="%" metric's raw value by 100,
+    # which is only correct for a metric stored as a 0-1 fraction (release_height,
+    # e.g. 0.85 -> "85%"). batting_weight_transfer's calculate_weight_transfer
+    # already returns a 0-100+ number (e.g. 52.0 meaning 52%) — blindly
+    # multiplying that turned it into "5200%". already_percent=True opts a
+    # metric out of that extra *100, for metrics already stored in percent units.
+    already_percent: bool = False
 
 
 RANGES = {
@@ -137,12 +145,21 @@ RANGES = {
         display_optimal="0.00–0.02",
     ),
     "batting_front_foot_alignment": MetricRange(
-        label="Front Foot Alignment",
+        # REDESIGNED (2026-08-03, coach requirement: front-foot alignment
+        # should be judged relative to the SHOT BEING PLAYED, e.g. a cover
+        # drive's toe should point between mid-off and extra-cover, not
+        # dead straight down the pitch) — this metric is no longer a raw
+        # angle-from-vertical; it's the DEVIATION (in degrees) between the
+        # front foot's actual direction and the target direction for the
+        # coach-selected shot (or dead-straight, if no shot is selected).
+        # See batting_kinematics.calculate_front_foot_alignment and its
+        # SHOT_TARGET_CENTERS_DEGREES table.
+        label="Front Foot Alignment (vs. Shot Target)",
         unit="°",
         kind="lower_better",
-        green=(0.0, 20.0),
-        amber=(20.0, 35.0),
-        display_optimal="0–20°",
+        green=(0.0, 15.0),
+        amber=(15.0, 30.0),
+        display_optimal="0–15° off target",
     ),
     "batting_weight_transfer": MetricRange(
         label="Weight Transfer Onto Front Foot",
@@ -151,6 +168,7 @@ RANGES = {
         green=(40.0, 200.0),
         amber=(20.0, 40.0),
         display_optimal="40%+",
+        already_percent=True,  # calculate_weight_transfer already returns e.g. 52.0 meaning 52%
     ),
     "batting_downswing_plane": MetricRange(
         label="Downswing Plane (Straight Bat)",
@@ -170,6 +188,38 @@ RANGES = {
         amber_high=(160.0, 175.0),
         display_optimal="100–160°",
     ),
+    "batting_front_knee_flexion": MetricRange(
+        # NEW (2026-08-03), added alongside dual camera-angle support:
+        # most reliable from side-on footage (see
+        # batting_kinematics.calculate_front_knee_flexion) — same
+        # Law-of-Cosines formula and reasoning as bowling's proven
+        # front_knee_bracing metric above, applied to the batter's lead
+        # leg at contact.
+        label="Front Knee Flexion At Contact",
+        unit="°",
+        kind="band",
+        green=(100.0, 170.0),
+        amber=(85.0, 100.0),
+        amber_high=(170.0, 178.0),
+        display_optimal="100–170°",
+    ),
+    "batting_xfactor_separation": MetricRange(
+        # NEW (2026-08-03): reuses orchestrator.calculate_hip_shoulder_separation
+        # wholesale (same computation bowling already relies on) — most
+        # reliable from front-on/rear-on footage, per that function's own
+        # documented geometry (front/rear preserves hip-shoulder rotation
+        # signal that side-on foreshortens). Same green/amber bands as
+        # bowling's hip_shoulder_separation since it's the identical
+        # underlying measurement, just applied at batting's contact frame
+        # instead of bowling's front-foot-contact frame.
+        label="Hip-Shoulder Separation (X-Factor)",
+        unit="°",
+        kind="band",
+        green=(25.0, 50.0),
+        amber=(15.0, 25.0),
+        amber_high=(50.0, 65.0),
+        display_optimal="25–50°",
+    ),
 }
 
 # Explicit, hardcoded lists (not "everything in RANGES") so adding either
@@ -183,6 +233,7 @@ _BOWLING_METRIC_KEYS = [
 _BATTING_METRIC_KEYS = [
     "batting_head_movement", "batting_front_foot_alignment",
     "batting_weight_transfer", "batting_downswing_plane", "batting_top_elbow_angle",
+    "batting_front_knee_flexion", "batting_xfactor_separation",
 ]
 
 
@@ -260,7 +311,9 @@ def describe_range(metric_key: str) -> str:
     r = RANGES[metric_key]
 
     def fv(v):
-        return f"{v * 100:.0f}%" if r.unit == "%" else f"{v}{r.unit}"
+        if r.unit != "%":
+            return f"{v}{r.unit}"
+        return f"{v:.0f}%" if r.already_percent else f"{v * 100:.0f}%"
 
     if r.kind == "higher_better":
         # BUG FIX: this used to render the green band as CLOSED
@@ -292,7 +345,8 @@ def format_value(metric_key: str, value) -> str:
     """Human-readable value + unit, matching describe_range's convention."""
     r = RANGES[metric_key]
     if r.unit == "%":
-        return f"{float(value) * 100:.0f}%"
+        v = float(value)
+        return f"{v:.0f}%" if r.already_percent else f"{v * 100:.0f}%"
     return f"{value}{r.unit}"
 
 
@@ -356,9 +410,15 @@ def extract_batting_metric_value(metrics: dict, metric_key: str):
     actually stores the value in its biomechanical_metrics dict."""
     lookup = {
         "batting_head_movement": metrics.get("head_movement", {}).get("value"),
-        "batting_front_foot_alignment": metrics.get("front_foot_alignment", {}).get("degrees"),
+        # REDESIGNED (2026-08-03): front_foot_alignment now stores its
+        # classifiable number under "deviation_degrees" (degrees off the
+        # shot-relative target), not the old "degrees" (raw angle from
+        # vertical) — see batting_kinematics.calculate_front_foot_alignment.
+        "batting_front_foot_alignment": metrics.get("front_foot_alignment", {}).get("deviation_degrees"),
         "batting_weight_transfer": metrics.get("weight_transfer", {}).get("percent"),
         "batting_downswing_plane": metrics.get("downswing_plane", {}).get("degrees"),
         "batting_top_elbow_angle": metrics.get("top_elbow_angle", {}).get("degrees"),
+        "batting_front_knee_flexion": metrics.get("front_knee_flexion", {}).get("degrees"),
+        "batting_xfactor_separation": metrics.get("xfactor_separation", {}).get("degrees"),
     }
     return lookup.get(metric_key)

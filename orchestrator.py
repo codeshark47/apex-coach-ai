@@ -973,6 +973,50 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     os.remove(raw_path)
 
 
+def _find_ffmpeg() -> str:
+    """
+    Locates ffmpeg without relying solely on the current process's PATH.
+
+    FIX (2026-08-03, real coach test): shutil.which("ffmpeg") only sees
+    PATH entries that existed when THIS process started. Windows never
+    propagates a PATH change (e.g. from `winget install`) into an
+    already-running process — a coach who installs ffmpeg and then just
+    restarts the `streamlit run` command in the SAME terminal window (not
+    a brand new one) keeps hitting "not found" indefinitely, no matter
+    how many times they restart the app itself, because the terminal
+    process holding the stale PATH never changes. Verified on a real
+    machine: shutil.which() failed here even though ffmpeg was genuinely,
+    correctly installed and on the persisted user PATH.
+
+    Falls back to globbing the well-known install locations on Windows
+    (the winget package directory — versioned, so a fixed path would
+    break on an ffmpeg update — and the classic C:\\ffmpeg\\bin manual-
+    install convention) before giving up, so this stops depending on the
+    coach's terminal-restart hygiene entirely.
+    """
+    import shutil
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    if os.name == "nt":
+        import glob
+        candidates = [
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+        ]
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            candidates += glob.glob(
+                os.path.join(local_app_data, "Microsoft", "WinGet", "Packages",
+                             "*ffmpeg*", "**", "ffmpeg.exe"),
+                recursive=True,
+            )
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
 def transcode_to_h264(input_path: str) -> str:
     """
     Transcodes mp4v video to H264 for browser playback using ffmpeg.
@@ -985,12 +1029,11 @@ def transcode_to_h264(input_path: str) -> str:
     the function returned the original untranscoded mp4v video with NO
     warning anywhere — which may not play back correctly in a browser.
 
-    Fix: use shutil.which() to actually locate ffmpeg on PATH, on any OS.
-    If it's genuinely not installed/found, that's surfaced with a clear
+    Fix: use _find_ffmpeg() to actually locate the binary (PATH first,
+    then well-known Windows install locations) on any OS. If it's
+    genuinely not installed/found anywhere, that's surfaced with a clear
     log line instead of failing silently.
     """
-    import shutil
-
     base, ext = os.path.splitext(input_path)
     web_safe_path = f"{base}_h264{ext}"
 
@@ -1000,12 +1043,12 @@ def transcode_to_h264(input_path: str) -> str:
         except OSError:
             pass
 
-    ffmpeg_bin = shutil.which("ffmpeg")
+    ffmpeg_bin = _find_ffmpeg()
     if ffmpeg_bin is None:
         print(
-            "WARNING: ffmpeg not found on PATH. Video will be served in its "
-            "original codec, which may not play back correctly in all browsers. "
-            "Install ffmpeg and ensure it's on PATH to fix this."
+            "WARNING: ffmpeg not found on PATH or in well-known install locations. "
+            "Video will be served in its original codec, which may not play back "
+            "correctly in all browsers. Install ffmpeg to fix this."
         )
         return input_path
 

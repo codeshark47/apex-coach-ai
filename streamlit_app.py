@@ -1,5 +1,7 @@
 import os
 import base64
+import html
+import math
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -22,6 +24,7 @@ from datetime import datetime
 
 # Phase 2 modules — single source of truth for ranges, real timing/speed, history
 import metric_ranges as mr
+import batting_kinematics as bk
 import pdf_color_ranges as pcr
 import speed_estimation as se
 import calibration as cal
@@ -263,6 +266,519 @@ def render_zoomable_click_image(pil_img, key_prefix: str, marker_point=None, mar
     return (round(crop_x0 + click_x_in_crop), round(crop_y0 + click_y_in_crop))
 
 
+# ====================================================================
+# BATTING ANALYSIS — VISUAL THEME  ("floodlit night match")
+# ====================================================================
+# Purely presentational: a dark, willow-gold-accented skin for the
+# Batting Analysis output (approved by the coach from a standalone HTML
+# mockup). Every selector is prefixed with .apex-batting-theme so this
+# can never bleed onto the Bowling Analysis page — this <style> block is
+# only ever injected from inside render_batting_analysis_ui, which is a
+# dead-end branch (it ends in st.stop()), and every themed HTML block
+# below is additionally wrapped in its own .apex-batting-theme div as a
+# second, belt-and-braces layer of scoping. No data/orchestration logic
+# lives here — only markup for values already computed elsewhere.
+_BATTING_THEME_CSS = """
+<style>
+.apex-batting-theme {
+  --bg: #0d1310; --surface: #172019; --surface-2: #1d2721;
+  --border: #2a352d; --border-soft: #212b24;
+  --ink: #ece8db; --ink-muted: #93a79b; --ink-faint: #647266;
+  --accent: #d3a54d;
+  --good: #34c77b; --good-soft: rgba(52,199,123,0.14);
+  --warn: #e8a33d; --warn-soft: rgba(232,163,61,0.14);
+  --crit: #e5484d; --crit-soft: rgba(229,72,77,0.16);
+  --font-display: "Barlow Condensed","Bahnschrift","Oswald","Arial Narrow",sans-serif;
+  --font-body: Charter,"Iowan Old Style","Georgia Pro",Georgia,serif;
+  --font-mono: "Cascadia Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;
+  color: var(--ink);
+}
+.apex-batting-theme, .apex-batting-theme * { box-sizing: border-box; }
+
+.apex-batting-theme .topbar {
+  display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;
+  padding:14px 18px; margin-bottom:14px;
+  background: radial-gradient(ellipse 700px 300px at 30% -40%, rgba(211,165,77,0.10), transparent 60%), var(--bg);
+  border:1px solid var(--border); border-radius:12px;
+}
+.apex-batting-theme .brand { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.apex-batting-theme .brand .logo-mark { height:26px; width:auto; display:block; filter:drop-shadow(0 1px 5px rgba(211,165,77,0.18)); }
+.apex-batting-theme .brand .mark { font-family:var(--font-display); font-weight:700; font-size:19px; letter-spacing:0.02em; color:var(--ink); line-height:1.2; }
+.apex-batting-theme .brand .mark em { color:var(--accent); font-style:normal; }
+.apex-batting-theme .brand .tagline {
+  font-family:var(--font-body); font-size:11.5px; font-style:italic; color:var(--ink-muted); line-height:1.3;
+}
+.apex-batting-theme .brand .module {
+  font-family:var(--font-display); font-size:11px; letter-spacing:0.16em; text-transform:uppercase;
+  color:var(--ink-muted); padding:3px 9px; border:1px solid var(--border); border-radius:3px; margin-left:6px;
+}
+.apex-batting-theme .identity { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.apex-batting-theme .intro-note {
+  font-size:13px; color:var(--ink-muted); line-height:1.55; padding:2px 4px 10px;
+}
+.apex-batting-theme .intro-note b { color:var(--ink); font-weight:600; }
+.apex-batting-theme .pill {
+  font-family:var(--font-mono); font-size:12px; padding:4px 10px; border-radius:999px;
+  border:1px solid var(--border); background:var(--surface); color:var(--ink-muted); white-space:nowrap;
+}
+.apex-batting-theme .pill b { color:var(--ink); font-weight:600; }
+.apex-batting-theme .pill.pill-warn { border-color:rgba(232,163,61,0.4); background:var(--warn-soft); color:var(--warn); }
+
+.apex-batting-theme .flag {
+  display:flex; gap:14px; align-items:flex-start; background:var(--crit-soft);
+  border:1px solid rgba(229,72,77,0.4); border-radius:10px; padding:14px 18px; margin:14px 0;
+}
+.apex-batting-theme .flag.is-clear { background:var(--good-soft); border-color:rgba(52,199,123,0.35); }
+.apex-batting-theme .flag.is-neutral { background:var(--surface); border-color:var(--border); }
+.apex-batting-theme .flag .stripe { width:4px; align-self:stretch; border-radius:3px; background:var(--crit); flex:none; }
+.apex-batting-theme .flag.is-clear .stripe { background:var(--good); }
+.apex-batting-theme .flag.is-neutral .stripe { background:var(--ink-faint); }
+.apex-batting-theme .flag-body { flex:1; min-width:0; }
+.apex-batting-theme .flag-title {
+  font-family:var(--font-display); font-weight:700; letter-spacing:0.03em; font-size:15px;
+  color:var(--crit); text-transform:uppercase; margin-bottom:3px;
+}
+.apex-batting-theme .flag.is-clear .flag-title { color:var(--good); }
+.apex-batting-theme .flag.is-neutral .flag-title { color:var(--ink-muted); }
+.apex-batting-theme .flag-desc { font-size:14px; color:var(--ink); max-width:70ch; }
+.apex-batting-theme .flag-meters { display:flex; gap:22px; margin-top:10px; flex-wrap:wrap; }
+.apex-batting-theme .flag-meter { font-family:var(--font-mono); font-size:12px; color:var(--ink-muted); }
+.apex-batting-theme .flag-meter b { color:var(--ink); font-size:13px; }
+.apex-batting-theme .flag-bar { width:110px; height:5px; border-radius:3px; background:var(--border); margin-top:4px; overflow:hidden; }
+.apex-batting-theme .flag-bar > span { display:block; height:100%; background:var(--crit); }
+.apex-batting-theme .flag.is-clear .flag-bar > span { background:var(--good); }
+
+.apex-batting-theme .section-label {
+  font-family:var(--font-display); font-size:13px; letter-spacing:0.12em; text-transform:uppercase;
+  color:var(--ink-faint); margin:18px 2px 10px;
+}
+
+/* RESTRUCTURE (2026-08-04): grid narrowed from minmax(230px,...) — the
+   metrics grid now sits in a Streamlit column beside the video (real
+   st.columns, not a CSS trick) instead of spanning the full page width,
+   so it needs to comfortably fit 2 cards per row in a narrower space. */
+.apex-batting-theme .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(155px, 1fr)); gap:9px; margin-bottom:8px; }
+.apex-batting-theme .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px 16px 16px; position:relative; }
+.apex-batting-theme .card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; margin-bottom:10px; }
+.apex-batting-theme .card-title { font-family:var(--font-display); font-size:13px; letter-spacing:0.04em; color:var(--ink-muted); text-transform:uppercase; line-height:1.25; }
+.apex-batting-theme .chip { font-family:var(--font-mono); font-size:10.5px; letter-spacing:0.04em; padding:2px 7px; border-radius:4px; font-weight:700; white-space:nowrap; flex:none; }
+.apex-batting-theme .chip.good { background:var(--good-soft); color:var(--good); }
+.apex-batting-theme .chip.warn { background:var(--warn-soft); color:var(--warn); }
+.apex-batting-theme .chip.crit { background:var(--crit-soft); color:var(--crit); }
+.apex-batting-theme .chip.unknown { background:var(--border-soft); color:var(--ink-faint); }
+.apex-batting-theme .value-row { display:flex; align-items:baseline; gap:5px; margin-bottom:2px; }
+.apex-batting-theme .value { font-family:var(--font-mono); font-variant-numeric:tabular-nums; font-size:28px; font-weight:600; letter-spacing:-0.01em; }
+.apex-batting-theme .value.good { color:var(--good); }
+.apex-batting-theme .value.warn { color:var(--warn); }
+.apex-batting-theme .value.crit { color:var(--crit); }
+.apex-batting-theme .value.unknown { color:var(--ink-faint); }
+.apex-batting-theme .unit { font-family:var(--font-mono); font-size:13px; color:var(--ink-faint); }
+.apex-batting-theme .card-note { font-size:12.5px; color:var(--ink-muted); margin-bottom:6px; min-height:1.2em; }
+.apex-batting-theme .card-range { font-size:11px; color:var(--ink-faint); font-family:var(--font-mono); }
+.apex-batting-theme .view-tag {
+  position:absolute; top:14px; right:16px; font-family:var(--font-mono); font-size:9px; letter-spacing:0.05em;
+  color:var(--warn); border:1px solid rgba(232,163,61,0.4); border-radius:3px; padding:1px 5px;
+}
+
+/* Per-metric visualizations (2026-08-03) — ported from the approved
+   mockup, computed server-side as static SVG/HTML per card (the mockup
+   drew these with client-side JS; Streamlit's markdown sandbox doesn't
+   reliably execute injected <script> tags, and these values are already
+   final by the time the card renders, so there's nothing to compute live
+   here anyway). */
+.apex-batting-theme .gauge-wrap { display:flex; justify-content:center; margin-top:8px; }
+.apex-batting-theme svg.gauge { width:100%; height:auto; max-width:170px; }
+.apex-batting-theme .gauge .band { fill:none; stroke-width:8; }
+.apex-batting-theme .gauge .needle { stroke:var(--ink); stroke-width:2.5; stroke-linecap:round; }
+.apex-batting-theme .gauge .hub { fill:var(--ink); }
+.apex-batting-theme .gauge .tick-label { font-family:var(--font-mono); font-size:8px; fill:var(--ink-faint); }
+
+.apex-batting-theme .foot-gauge { margin-top:8px; }
+.apex-batting-theme .foot-track {
+  position:relative; height:10px; border-radius:6px; margin:10px 2px 4px;
+  background:linear-gradient(90deg, rgba(79,138,201,0.28), rgba(79,138,201,0.06) 46%, var(--border) 50%, rgba(201,122,79,0.06) 54%, rgba(201,122,79,0.28));
+  border:1px solid var(--border);
+}
+.apex-batting-theme .foot-target {
+  position:absolute; top:-3px; bottom:-3px; background:rgba(211,165,77,0.32);
+  border-left:1px solid var(--accent); border-right:1px solid var(--accent); border-radius:3px;
+}
+.apex-batting-theme .foot-marker { position:absolute; top:-6px; width:2px; height:22px; background:var(--ink); }
+.apex-batting-theme .foot-marker::after {
+  content:""; position:absolute; top:-5px; left:50%; transform:translateX(-50%);
+  border:5px solid transparent; border-top-color:var(--ink);
+}
+.apex-batting-theme .foot-labels { display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:9.5px; color:var(--ink-faint); padding:0 2px; }
+
+.apex-batting-theme .bar-gauge { margin-top:10px; }
+.apex-batting-theme .bar-track { position:relative; height:10px; border-radius:6px; background:var(--border); overflow:hidden; }
+.apex-batting-theme .bar-fill { position:absolute; inset:0; border-radius:6px; }
+.apex-batting-theme .bar-ticks { position:relative; height:14px; margin-top:2px; }
+.apex-batting-theme .bar-ticks span { position:absolute; top:0; font-family:var(--font-mono); font-size:8.5px; color:var(--ink-faint); transform:translateX(-50%); }
+
+.apex-batting-theme .report-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-top:8px; }
+.apex-batting-theme .report-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+.apex-batting-theme .report-head .dot { width:7px; height:7px; border-radius:50%; background:var(--accent); }
+.apex-batting-theme .report-title { font-family:var(--font-display); font-size:15px; letter-spacing:0.03em; text-transform:uppercase; color:var(--ink); }
+.apex-batting-theme .narrative { font-family:var(--font-body); font-size:15px; color:var(--ink); max-width:75ch; line-height:1.6; margin:0; }
+.apex-batting-theme .narrative b { color:var(--accent); font-weight:700; }
+.apex-batting-theme .drills { list-style:none; margin:14px 0 0; padding:0; display:flex; flex-direction:column; gap:10px; }
+.apex-batting-theme .drills li { padding:10px 0 0; border-top:1px solid var(--border-soft); font-size:14px; font-family:var(--font-body); color:var(--ink); }
+.apex-batting-theme .drills .dname { font-family:var(--font-display); letter-spacing:0.02em; color:var(--accent); font-weight:700; font-size:13.5px; text-transform:uppercase; display:block; margin-bottom:2px; }
+
+/* NATIVE STREAMLIT WIDGETS (2026-08-03, coach feedback: expanders/video
+   still looked like the old plain UI) — this whole <style> block is only
+   ever injected while the Batting Analysis branch is actually running
+   (see render_batting_analysis_ui), so scoping these to the raw
+   data-testid selectors (rather than nesting under .apex-batting-theme,
+   which native Streamlit widgets aren't rendered inside of) still can't
+   leak onto the Bowling Analysis page — that's a completely separate
+   script run where this CSS is never injected at all. !important matches
+   the specificity of the app's own pre-existing global expander/video
+   rules further down this file (the "PAGE CONFIG & ELITE DARK UI" block)
+   — source order (this one renders later) settles the tie in its favor. */
+/* NOTE: Streamlit 1.60.0's expander header label has no stable, dedicated
+   testid of its own to target directly (verified by reading the actual
+   JS bundle — it's an internal, minified styled-component, not something
+   safe to hard-code a class name for). Setting color on the outer
+   container and relying on CSS inheritance is the robust way to reach it
+   without depending on an implementation detail that could rename itself
+   on a Streamlit update. */
+div[data-testid="stExpander"] {
+  background: var(--surface) !important; border: 1px solid var(--border) !important;
+  border-radius: 10px !important; margin-bottom: 10px !important; color: var(--ink) !important;
+}
+div[data-testid="stExpander"] svg { fill: var(--ink-muted) !important; }
+
+/* BUG FIX (2026-08-03, real coach test): "huge expanders" — the frame-
+   preview images inside the seed-click/stance/backlift/contact
+   confirmation expanders are portrait phone-video frames rendered at
+   use_column_width=True, i.e. stretched to the FULL width of the main
+   content column. For a portrait image that means the height scales up
+   proportionally to something far taller than the column is wide — the
+   exact same "unconstrained portrait media" bug as the video fix above,
+   just for st.image instead of st.video. Same fix: cap the max-width so
+   the image (and the expander containing it) settles to a sane size
+   regardless of the source photo's native resolution.
+   [data-testid="stImage"] is confirmed correct from the JS bundle (the
+   image *container*, not the raw <img> — the actual <img> tag is nested
+   inside it, hence the descendant selector rather than assuming stImage
+   itself is the <img>, unlike the stVideo mistake above). */
+div[data-testid="stImage"] { display: flex !important; justify-content: center !important; }
+div[data-testid="stImage"] img {
+  max-width: 420px !important; width: 100% !important; height: auto !important;
+  max-height: 70vh !important; object-fit: contain !important;
+  border-radius: 8px !important; border: 1px solid var(--border) !important;
+}
+
+/* BUG FIX (2026-08-03, real coach test, second attempt): the first fix
+   used "div[data-testid='stVideo']" and did nothing at all — verified by
+   reading Streamlit 1.60.0's own JS bundle directly: data-testid="stVideo"
+   is set on the <video> element ITSELF, not a wrapping div (there is no
+   such div). !important is needed because Streamlit's React component
+   sets inline width/height styles on the element directly, which beat a
+   plain CSS rule of equal-or-lower specificity. Without a size cap, a
+   tall portrait phone clip stretched to "width:100%" of the full main
+   content column scales its height proportionally, easily overflowing
+   well past the viewport — confirmed directly in the coach's screenshot
+   (one video frame taller than the whole page). */
+video[data-testid="stVideo"] {
+  max-width: 380px !important; width: 100% !important; height: auto !important;
+  max-height: 70vh !important; object-fit: contain !important; display: block !important;
+  margin: 0 auto !important; border: 1px solid var(--border) !important;
+  border-radius: 10px !important; background: var(--bg) !important;
+}
+</style>
+"""
+
+
+def _batting_html(raw: str) -> None:
+    """
+    BUG FIX (2026-08-03, found on a real coach test): st.markdown(...,
+    unsafe_allow_html=True) still runs its input through Streamlit's
+    Markdown/CommonMark renderer before allowing raw HTML through it —
+    and CommonMark treats a line indented 4+ spaces as a literal indented
+    code block, rendering it as visible plain text instead of parsing the
+    HTML inside it. The themed HTML blocks below were written nicely
+    indented for source readability (nested <div>s), which tripped
+    exactly this: the coach saw raw HTML/text where the styled cards
+    should have been. Stripping each line's leading whitespace here means
+    the source can stay readable while the string handed to st.markdown
+    is always a single unindented block, immune to this.
+    """
+    st.markdown(_dedent_html(raw), unsafe_allow_html=True)
+
+
+def _dedent_html(raw: str) -> str:
+    """Strips every line's leading whitespace — see _batting_html's
+    docstring above. Used both there AND by any helper (like
+    _batting_metric_card_html below) that builds a multi-line indented
+    HTML fragment which will eventually be joined into a larger string
+    and handed to st.markdown — the CommonMark code-block trap applies
+    just the same whether the indented string reaches st.markdown
+    directly or via a join() of several such fragments. FOUND ON A REAL
+    COACH TEST (2026-08-03): the first fix only covered direct
+    st.markdown(f\"\"\"...\"\"\") call sites and missed this function
+    returning its own indented fragment, which still broke the metric
+    cards grid the exact same way."""
+    return "\n".join(line.strip() for line in raw.strip("\n").split("\n"))
+
+
+# Full named-shot vocabulary for the "Shot Played" dropdown (2026-08-03,
+# coach-provided real cricket shot taxonomy — vertical-bat drives/defense
+# plus horizontal-bat/unorthodox shots) mapped to
+# batting_kinematics.SHOT_TARGET_CENTERS_DEGREES / NOT_APPLICABLE_SHOTS
+# keys. Ordered so the shots that DO get a real front-foot-alignment
+# target come first, then the ones that don't (grouped to match the
+# coach's own categorization: defense, cuts, pull/hook, sweeps,
+# unorthodox) — see NOT_APPLICABLE_SHOTS in batting_kinematics.py for why
+# that second group isn't scored on this particular metric.
+_SHOT_PLAYED_OPTIONS = {
+    "Not sure / skip this check": None,
+    "Straight Drive": "straight_drive",
+    "On Drive": "on_drive",
+    "Off Drive": "off_drive",
+    "Cover Drive": "cover_drive",
+    "Flick / Leg Glance": "flick_leg_glance",
+    "Forward Defense": "forward_defense",
+    "Backward Defense": "backward_defense",
+    "Square Cut": "square_cut",
+    "Late Cut": "late_cut",
+    "Pull Shot": "pull_shot",
+    "Hook Shot": "hook_shot",
+    "Sweep": "standard_sweep",
+    "Reverse Sweep": "reverse_sweep",
+    "Slog Sweep": "slog_sweep",
+    "Scoop / Ramp Shot": "scoop_ramp",
+    "Switch Hit": "switch_hit",
+}
+
+
+# Maps each metric_ranges.py batting_* key to the sub-dict key
+# batting_orchestrator.run_batting_analysis actually stores it under in
+# biomechanical_metrics — same mapping mr.extract_batting_metric_value
+# already uses internally, duplicated here only to also reach each
+# metric's "tier" descriptor text (extract_batting_metric_value only
+# returns the numeric value, not the tier), which the metric cards below
+# display as their one-line descriptor.
+_BATTING_SUBKEY_BY_MKEY = {
+    "batting_head_movement": "head_movement",
+    "batting_front_foot_alignment": "front_foot_alignment",
+    "batting_weight_transfer": "weight_transfer",
+    "batting_downswing_plane": "downswing_plane",
+    "batting_top_elbow_angle": "top_elbow_angle",
+    "batting_front_knee_flexion": "front_knee_flexion",
+    "batting_xfactor_separation": "xfactor_separation",
+}
+_ZONE_CSS_CLASS = {"green": "good", "amber": "warn", "red": "crit", "unknown": "unknown"}
+_ZONE_CSS_VAR = {"good": "--good", "warn": "--warn", "crit": "--crit", "unknown": "--ink-faint"}
+
+# Display axis extents for the semicircle gauges below — a PRESENTATION
+# choice (how much of the dial to draw), not a duplicated threshold: the
+# actual green/amber/red boundaries always come from mr.RANGES directly
+# (see _bands_for_metric), never repeated here.
+_GAUGE_DISPLAY_RANGE = {
+    "batting_downswing_plane": (0.0, 55.0),
+    "batting_top_elbow_angle": (60.0, 180.0),
+    "batting_front_knee_flexion": (60.0, 185.0),
+    "batting_xfactor_separation": (0.0, 70.0),
+}
+_BAR_DISPLAY_MAX = {
+    "batting_head_movement": 0.06,
+    "batting_weight_transfer": 100.0,
+}
+
+
+def _svg_polar(cx: float, cy: float, r: float, angle_deg: float):
+    rad = math.radians(angle_deg)
+    return cx + r * math.cos(rad), cy + r * math.sin(rad)
+
+
+def _svg_arc_path(cx: float, cy: float, r: float, a0: float, a1: float) -> str:
+    x0, y0 = _svg_polar(cx, cy, r, a0)
+    x1, y1 = _svg_polar(cx, cy, r, a1)
+    large = 1 if abs(a1 - a0) > 180 else 0
+    return f"M {x0:.2f} {y0:.2f} A {r} {r} 0 {large} 1 {x1:.2f} {y1:.2f}"
+
+
+def _bands_for_metric(mkey: str, display_min: float, display_max: float):
+    """Derives the gauge's colored zone segments straight from mr.RANGES
+    (never a second, hand-copied set of thresholds) — only supports
+    kind="band", the only kind used by the metrics routed to a semicircle
+    gauge below."""
+    r = mr.RANGES[mkey]
+    if r.kind != "band":
+        return []
+    g_lo, g_hi = r.green
+    a_lo, a_hi = r.amber
+    ah_lo, ah_hi = r.amber_high
+    bands = []
+    if display_min < a_lo:
+        bands.append((display_min, a_lo, "--crit"))
+    bands.append((a_lo, g_lo, "--warn"))
+    bands.append((g_lo, g_hi, "--good"))
+    bands.append((g_hi, ah_hi, "--warn"))
+    if display_max > ah_hi:
+        bands.append((ah_hi, display_max, "--crit"))
+    return bands
+
+
+def _svg_band_gauge(value: float, display_min: float, display_max: float, bands) -> str:
+    """Static semicircle band gauge (needle + colored zone arcs), computed
+    server-side — same math as the approved mockup's client-side JS
+    version, ported to Python since these values are already final by the
+    time the card renders (nothing here needs to be interactive)."""
+    cx, cy, r = 60.0, 58.0, 46.0
+    span = display_max - display_min
+    parts = ['<svg class="gauge" viewBox="0 0 120 68">']
+    for lo, hi, css_var in bands:
+        a0 = 180 + ((lo - display_min) / span) * 180
+        a1 = 180 + ((hi - display_min) / span) * 180
+        parts.append(f'<path class="band" style="stroke:var({css_var})" d="{_svg_arc_path(cx, cy, r, a0, a1)}"></path>')
+    clamped = max(display_min, min(display_max, value))
+    a = 180 + ((clamped - display_min) / span) * 180
+    tip_x, tip_y = _svg_polar(cx, cy, r - 12, a)
+    parts.append(f'<line class="needle" x1="{cx}" y1="{cy}" x2="{tip_x:.2f}" y2="{tip_y:.2f}"></line>')
+    parts.append(f'<circle class="hub" cx="{cx}" cy="{cy}" r="3.5"></circle>')
+    for t in (display_min, (display_min + display_max) / 2, display_max):
+        ta = 180 + ((t - display_min) / span) * 180
+        lx, ly = _svg_polar(cx, cy, r + 9, ta)
+        parts.append(f'<text class="tick-label" x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle">{round(t)}</text>')
+    parts.append("</svg>")
+    return f'<div class="gauge-wrap">{"".join(parts)}</div>'
+
+
+def _linear_bar_gauge_html(value: float, display_max: float, ticks, css_zone: str) -> str:
+    """Horizontal fill bar for the two metrics that read as a single
+    linear number (higher_better/lower_better), not a band — weight
+    transfer and head movement. Fill color follows the metric's own
+    already-computed zone; ticks mark the real green/amber boundaries
+    from mr.RANGES (passed in by the caller, not re-derived here)."""
+    pct = max(0.0, min(1.0, value / display_max)) * 100 if display_max else 0.0
+    tick_html = "".join(
+        f'<span style="left:{(t / display_max) * 100:.0f}%">{t:g}</span>' for t in ticks
+    )
+    css_var = _ZONE_CSS_VAR.get(css_zone, "--ink-faint")
+    return (
+        '<div class="bar-gauge">'
+        f'<div class="bar-track"><div class="bar-fill" style="width:{pct:.0f}%;background:var({css_var})"></div></div>'
+        f'<div class="bar-ticks">{tick_html}</div>'
+        "</div>"
+    )
+
+
+def _foot_strip_gauge_html(signed_degrees, target_shot) -> str:
+    """Off/leg strip gauge for front_foot_alignment: -45 (leg) to +45
+    (off), a highlighted wedge for the shot's real target window (only
+    when the shot actually has one — see batting_kinematics.
+    SHOT_TARGET_CENTERS_DEGREES/NOT_APPLICABLE_SHOTS), and a marker at
+    the real measured foot direction."""
+    gmin, gmax = -45.0, 45.0
+
+    def pct(a):
+        return max(0.0, min(1.0, (a - gmin) / (gmax - gmin))) * 100
+
+    target_html = ""
+    if target_shot in bk.SHOT_TARGET_CENTERS_DEGREES:
+        center = bk.SHOT_TARGET_CENTERS_DEGREES[target_shot]
+        lo = max(gmin, center - bk.FRONT_FOOT_DEVIATION_TOLERANCE)
+        hi = min(gmax, center + bk.FRONT_FOOT_DEVIATION_TOLERANCE)
+        target_html = f'<div class="foot-target" style="left:{pct(lo):.1f}%;width:{max(0.0, pct(hi) - pct(lo)):.1f}%"></div>'
+
+    marker_html = ""
+    if signed_degrees is not None:
+        clamped = max(gmin, min(gmax, signed_degrees))
+        marker_html = f'<div class="foot-marker" style="left:{pct(clamped):.1f}%"></div>'
+
+    return (
+        '<div class="foot-gauge"><div class="foot-track">'
+        f"{target_html}{marker_html}"
+        '</div><div class="foot-labels"><span>LEG</span><span>STRAIGHT</span><span>OFF</span></div></div>'
+    )
+
+
+def _batting_metric_visual_html(mkey: str, value, css_zone: str, metrics: dict) -> str:
+    """Dispatches to the right visualization for this metric key. Returns
+    "" (no visual) when the underlying value is None — a missing/
+    inapplicable reading has nothing real to plot, and a gauge sitting at
+    a fixed "0" position would misleadingly look like a genuine reading
+    of zero."""
+    if mkey == "batting_front_foot_alignment":
+        foot_data = metrics.get("front_foot_alignment", {})
+        return _foot_strip_gauge_html(foot_data.get("signed_degrees"), foot_data.get("target_shot"))
+    if value is None:
+        return ""
+    if mkey in _GAUGE_DISPLAY_RANGE:
+        display_min, display_max = _GAUGE_DISPLAY_RANGE[mkey]
+        return _svg_band_gauge(float(value), display_min, display_max, _bands_for_metric(mkey, display_min, display_max))
+    if mkey in _BAR_DISPLAY_MAX:
+        r = mr.RANGES[mkey]
+        ticks = sorted(set(r.amber) | set(r.green)) if r.kind != "band" else []
+        # Only the boundary that actually separates zones is worth marking
+        # (e.g. weight_transfer: 20 and 40); drop any tick beyond the
+        # gauge's own display ceiling.
+        ticks = [t for t in ticks if 0 < t < _BAR_DISPLAY_MAX[mkey]]
+        return _linear_bar_gauge_html(float(value), _BAR_DISPLAY_MAX[mkey], ticks, css_zone)
+    return ""
+
+
+def _batting_metric_card_html(mkey: str, metrics: dict, view_caveats: list) -> str:
+    """
+    Renders ONE metric as a themed card. Reads the zone straight from
+    mr.classify()/mr.RANGES (never invents its own thresholds) — this
+    function only decides how that already-computed classification looks
+    on screen, not what it is.
+    """
+    value = mr.extract_batting_metric_value(metrics, mkey)
+    zone = mr.classify(mkey, value)
+    r = mr.RANGES[mkey]
+    css_zone = _ZONE_CSS_CLASS.get(zone, "unknown")
+    chip_label = zone.upper()
+    subkey = _BATTING_SUBKEY_BY_MKEY.get(mkey, "")
+    tier_text = metrics.get(subkey, {}).get("tier", "") if subkey else ""
+
+    if value is not None:
+        formatted = mr.format_value(mkey, value)
+        if r.unit and formatted.endswith(r.unit):
+            numeric_part, unit_part = formatted[: -len(r.unit)], r.unit
+        else:
+            numeric_part, unit_part = formatted, ""
+    else:
+        numeric_part, unit_part = "N/A", ""
+
+    view_tag_html = '<span class="view-tag">view-sensitive</span>' if mkey in (view_caveats or []) else ""
+    visual_html = _batting_metric_visual_html(mkey, value, css_zone, metrics)
+
+    return _dedent_html(f"""<div class="card">
+      {view_tag_html}
+      <div class="card-head">
+        <div class="card-title">{html.escape(r.label)}</div>
+        <div class="chip {css_zone}">{html.escape(chip_label)}</div>
+      </div>
+      <div class="value-row">
+        <span class="value {css_zone}">{html.escape(numeric_part)}</span>
+        <span class="unit">{html.escape(unit_part)}</span>
+      </div>
+      <div class="card-note">{html.escape(tier_text)}</div>
+      <div class="card-range">Target: {html.escape(r.display_optimal)}</div>
+      {visual_html}
+    </div>""")
+
+
+def _batting_narrative_to_html(text: str) -> str:
+    """
+    Pure display conversion for the AI coach narrative paragraph: HTML-
+    escapes the raw LLM text (never trusted as HTML) then re-applies the
+    same **bold** emphasis markdown already rendered via st.write() in
+    the previous plain version of this UI — same words, same emphasis,
+    only the surrounding typography changes.
+    """
+    escaped = html.escape(text or "")
+    parts = escaped.split("**")
+    rebuilt = "".join(f"<b>{p}</b>" if i % 2 == 1 else p for i, p in enumerate(parts))
+    return rebuilt.replace("\n", "<br>")
+
+
 def render_batting_event_confirmation(stage12_result, ref_path: str, file_identity: str):
     """
     Batting equivalent of render_stream_event_confirmation — mandatory
@@ -361,10 +877,10 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
     Self-contained Batting Analysis flow — deliberately isolated from
     every bowling code path below in this file (per the explicit decision
     to add batting as a separate module, not touch the working, already-
-    verified bowling pipeline). Single camera only: a coach films the
-    batter from behind the stumps, same physical setup already used for
-    several ball-tracking clips — no 3D/dual-camera complexity needed for
-    stance/head/foot/weight-transfer/downswing analysis.
+    verified bowling pipeline). Single video upload; the camera can be
+    EITHER side-on or front-on/rear-on (auto-detected, same as bowling) —
+    a coach filming in the nets often can't get a side-on shot at all
+    because the net physically obstructs it, so both must work.
 
     Called from the top-level "Analysis Type" branch, followed by
     st.stop() — nothing below that call site in the file executes when
@@ -374,18 +890,40 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
     import usage_limits
     from coaching_agent import generate_batting_coaching_report
 
-    st.title("🏏 Batting Analysis")
-    st.caption(
-        "Stance, head position, weight transfer, downswing plane, and top-elbow control — "
-        "from a single phone behind the stumps. First version: see the note below on what's "
-        "measured directly from body pose vs. approximated (no bat-tracking sensor exists yet)."
-    )
-    st.info(
-        "ℹ️ front_foot_alignment, downswing_plane, and top_elbow_angle are derived from body-pose "
-        "landmarks only — downswing_plane specifically uses the midpoint of both wrists as a proxy "
-        "for the bat handle's path, not the bat's actual face angle. Treat borderline readings on "
-        "these three with appropriate caution, same as any first-version metric in this app."
-    )
+    st.markdown(_BATTING_THEME_CSS, unsafe_allow_html=True)
+
+    # THEMED INTRO HEADER — the coach's own feedback (2026-08-03): the report
+    # section got the "floodlit night match" redesign, but the page still
+    # opened with a bare st.title()/st.caption() indistinguishable from the
+    # old plain UI, so it "looked the same" until Execute was clicked.
+    #
+    # BUG FIX (2026-08-03, "double header" spotted on a real coach test):
+    # this used to re-render the logo + "APEX COACH AI" wordmark + tagline
+    # a SECOND time — but that exact branding (logo + "AUTONOMOUS
+    # BIOMECHANICAL PERFORMANCE HUB") already renders once, globally, at
+    # the very top of the whole app (see the "LOGO (unchanged)" section
+    # further down this file, which runs before the sidebar/auth gate for
+    # every analysis type). Repeating it here stacked two near-identical
+    # headers on the same page. Kept only the "Batting Analysis" section
+    # marker here — that's the one piece of information this page adds
+    # that the global header doesn't already show.
+    _batting_html("""
+<div class="apex-batting-theme">
+  <div class="topbar">
+    <div class="brand">
+      <span class="module">🏏 Batting Analysis</span>
+    </div>
+  </div>
+  <div class="intro-note">
+    Stance, head position, weight transfer, downswing plane, and top-elbow control — from a
+    single phone, filmed either side-on or front-on/rear-on. <b>front_foot_alignment,
+    downswing_plane, and top_elbow_angle</b> are derived from body-pose landmarks only —
+    downswing_plane specifically uses the midpoint of both wrists as a proxy for the bat
+    handle's path, not the bat's actual face angle. Treat borderline readings on these three
+    with appropriate caution, same as any first-version metric in this app.
+  </div>
+</div>
+""")
 
     uploaded_batting_video = st.sidebar.file_uploader(
         "Batting Video (.mp4 or .mov)", type=["mp4", "mov", "m4v"], key="batting_video_upload",
@@ -393,6 +931,30 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
     if uploaded_batting_video is None:
         st.warning("👆 Upload a batting video in the sidebar to begin.")
         return
+
+    st.sidebar.divider()
+    batting_hand_choice = st.sidebar.selectbox(
+        "🏏 Batting Hand", ["Auto-detect", "Right-handed", "Left-handed"],
+        help="Auto-detected from which wrist sits higher at stance. Override here if you know it.",
+        key="batting_hand_choice",
+    )
+    batting_hand_override = {"Auto-detect": None, "Right-handed": "left", "Left-handed": "right"}[batting_hand_choice]
+
+    # CAMERA ANGLE — auto-detected the same way bowling already does
+    # (camera_angle_detection.py's shoulder-width/height ratio), because
+    # nets sessions often can't get a side-on shot (the net obstructs it).
+    # front_foot_alignment and the falling-over check are unaffected by
+    # this either way (see batting_kinematics._derive_batting_axes); only
+    # weight_transfer and downswing_plane get a reduced-confidence caveat
+    # under front-on/rear-on filming.
+    camera_angle_choice = st.sidebar.selectbox(
+        "📐 Filming Angle", ["Auto-detect", "Side-on", "Front-on / Rear-on"],
+        help="Auto-detect can misjudge this — set it manually if you know how this clip was filmed.",
+        key="batting_camera_angle_choice",
+    )
+    camera_angle_override = {
+        "Auto-detect": None, "Side-on": "side_on", "Front-on / Rear-on": "front_or_rear",
+    }[camera_angle_choice]
 
     file_identity = f"{uploaded_batting_video.name}_{uploaded_batting_video.size}"
     if st.session_state.get("_batting_ref_identity") != file_identity:
@@ -456,12 +1018,22 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
         st.warning("👆 Click the batter above to continue.")
         return
 
+    # Re-run stage 1+2 if the coach changes the handedness/camera-angle
+    # override after it already ran once — same reasoning as the seed-
+    # point invalidation above.
+    _batting_overrides_key = (batting_hand_override, camera_angle_override)
+    if st.session_state.get("_batting_overrides_key") != _batting_overrides_key:
+        st.session_state["_batting_stage12"] = None
+        st.session_state["_batting_overrides_key"] = _batting_overrides_key
+
     if st.session_state.get("_batting_stage12") is None:
         with st.spinner("Tracking the batter and detecting phase events..."):
             stage12 = bto.extract_and_detect_batting_events(
                 ref_path, output_dir="output",
                 seed_point=seed_point,
                 seed_frame_index=st.session_state.get("_batting_seed_frame_idx", 0),
+                batting_hand_override=batting_hand_override,
+                camera_angle_override=camera_angle_override,
             )
         st.session_state["_batting_stage12"] = stage12
 
@@ -469,6 +1041,18 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
     if stage12.get("status") != "success":
         st.error(f"⚠️ Tracking failed: {stage12.get('message', 'unknown error')}")
         return
+
+    if stage12.get("angle_estimate") is not None:
+        _ae = stage12["angle_estimate"]
+        _angle_label = {"side_on": "Side-on", "front_or_rear": "Front-on / Rear-on",
+                         "uncertain": "Uncertain"}.get(_ae.angle, _ae.angle)
+        _angle_source = "manually set" if camera_angle_override else "auto-detected"
+        st.markdown(
+            f'<div class="apex-batting-theme"><span class="pill">📐 Filming angle '
+            f'({html.escape(_angle_source)}): <b>{html.escape(str(_angle_label))}</b> '
+            f'— {html.escape(_ae.confidence_note)}</span></div>',
+            unsafe_allow_html=True,
+        )
 
     # DIAGNOSTIC (2026-08-03, added after two real tests both came back
     # with zero usable metrics): report tracking coverage immediately
@@ -499,120 +1083,279 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
         st.warning("👆 Confirm Stance, Backlift, and Point of Contact above to enable analysis.")
         return
 
-    _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
-    _usage = {"remaining": 1, "used": 0, "limit": 1}
-    if not _is_admin_user:
-        _usage = usage_limits.get_usage(st.session_state.auth_user["id"])
-        if _usage["remaining"] <= 0:
-            st.sidebar.error(
-                f"🚫 Free analysis limit reached ({_usage['used']}/{_usage['limit']} today). "
-                "Contact us to unlock unlimited access."
+    # STRUCTURAL SPLIT (2026-08-04, coach feedback: "the fundamental grid
+    # remains exactly the same" across several rounds of CSS-only
+    # redesign) — this is a real change in composition, not another
+    # repaint: Configure/Run and Report are now genuinely separate
+    # Streamlit tabs (a different interaction model, not just a
+    # different-looking single scroll), and the report's video sits
+    # beside its metrics in real st.columns rather than stacked full-
+    # width sections. Both use Streamlit's own native layout primitives
+    # instead of CSS-injection tricks, deliberately — repeated selector
+    # mismatches earlier this project (stVideo, stImage) were the direct
+    # cost of fighting the framework's DOM instead of using it.
+    tab_setup, tab_report = st.tabs(["⚙️ Configure & Run", "📊 Report"])
+
+    with tab_setup:
+        st.caption(
+            "There's no ball-tracking signal yet to know the shot/line automatically — tell the "
+            "app what happened on this delivery so it can judge front-foot direction against the "
+            "actual shot, and check for the head/foot 'falling over' fault against the actual "
+            "line bowled."
+        )
+        col_shot, col_line = st.columns(2)
+        with col_shot:
+            shot_choice = st.selectbox(
+                "🏏 Shot Played",
+                list(_SHOT_PLAYED_OPTIONS.keys()),
+                key="batting_shot_played_choice",
             )
-        else:
-            st.sidebar.caption(f"🎟️ {_usage['remaining']} of {_usage['limit']} free analyses remaining")
+            if _SHOT_PLAYED_OPTIONS[shot_choice] in bk.NOT_APPLICABLE_SHOTS:
+                st.caption(
+                    "ℹ️ Front-foot alignment isn't scored for this shot — \"foot points toward "
+                    "the shot\" is a front-foot-drive/defense concept, not a back-foot or "
+                    "horizontal-bat one. The foot's actual direction is still shown, just "
+                    "without a pass/fail target."
+                )
+        with col_line:
+            line_choice = st.selectbox(
+                "🎯 Line Bowled (for falling-over check)",
+                ["Not sure / skip this check", "Off Stump", "Middle Stump", "Leg Stump"],
+                key="batting_ball_line_choice",
+            )
+        shot_played = _SHOT_PLAYED_OPTIONS[shot_choice]
+        ball_line = {
+            "Not sure / skip this check": None, "Off Stump": "off", "Middle Stump": "middle", "Leg Stump": "leg",
+        }[line_choice]
 
-    if _usage["remaining"] <= 0:
-        return
+        _is_admin_user = usage_limits.is_admin(st.session_state.auth_user.get("email", ""))
+        _usage = {"remaining": 1, "used": 0, "limit": 1}
+        if not _is_admin_user:
+            _usage = usage_limits.get_usage(st.session_state.auth_user["id"])
+            if _usage["remaining"] <= 0:
+                st.error(
+                    f"🚫 Free analysis limit reached ({_usage['used']}/{_usage['limit']} today). "
+                    "Contact us to unlock unlimited access."
+                )
+            else:
+                st.caption(f"🎟️ {_usage['remaining']} of {_usage['limit']} free analyses remaining")
 
-    if st.button("🚀 Execute Batting Analysis", use_container_width=True):
-        with st.spinner("Calculating batting technique metrics..."):
-            stage12_with_overrides = dict(stage12)
-            stage12_with_overrides["events"] = {**stage12["events"], **{
-                "STANCE": confirmed_events["STANCE"],
-                "BACKLIFT": confirmed_events["BACKLIFT"],
-                "CONTACT": confirmed_events["CONTACT"],
-            }}
-            result_payload = bto.run_batting_analysis(ref_path, output_dir="output", precomputed=stage12_with_overrides)
+        # BUG FIX: this used to be a bare `return` when usage was exhausted
+        # — harmless in the old single-scroll layout (nothing further to
+        # show anyway), but here it would also skip rendering the Report
+        # tab entirely, hiding an already-completed earlier result. Gating
+        # just the button avoids that.
+        if _usage["remaining"] > 0:
+            if st.button("🚀 Execute Batting Analysis", use_container_width=True):
+                with st.spinner("Calculating batting technique metrics..."):
+                    stage12_with_overrides = dict(stage12)
+                    stage12_with_overrides["events"] = {**stage12["events"], **{
+                        "STANCE": confirmed_events["STANCE"],
+                        "BACKLIFT": confirmed_events["BACKLIFT"],
+                        "CONTACT": confirmed_events["CONTACT"],
+                    }}
+                    result_payload = bto.run_batting_analysis(
+                        ref_path, output_dir="output", precomputed=stage12_with_overrides,
+                        shot_played=shot_played, ball_line=ball_line,
+                    )
 
-        if result_payload.get("status") != "success":
-            st.error(f"⚠️ Analysis failed: {result_payload.get('message', 'unknown error')}")
+                if result_payload.get("status") != "success":
+                    st.error(f"⚠️ Analysis failed: {result_payload.get('message', 'unknown error')}")
+                else:
+                    # Fold the auto-vs-confirmed pairs into the result so they
+                    # get saved to history below — same (auto_detected,
+                    # coach_confirmed) training-signal pattern already used
+                    # for bowling's release point/foot contacts.
+                    result_payload["time_indices"]["stance_frame_auto_detected"] = confirmed_events["STANCE_auto_detected"]
+                    result_payload["time_indices"]["backlift_frame_auto_detected"] = confirmed_events["BACKLIFT_auto_detected"]
+                    result_payload["time_indices"]["contact_frame_auto_detected"] = confirmed_events["CONTACT_auto_detected"]
+                    result_payload["time_indices"]["contact_auto_confidence"] = confirmed_events["CONTACT_auto_confidence"]
+
+                    st.session_state["_batting_result_payload"] = result_payload
+                    if not _is_admin_user:
+                        usage_limits.record_usage(st.session_state.auth_user["id"])
+                    st.success("✅ Analysis complete — open the **📊 Report** tab above to view it.")
+
+    with tab_report:
+        result_payload = st.session_state.get("_batting_result_payload")
+        if result_payload is None:
+            st.info(
+                "👈 Pick the shot/line and click **Execute Batting Analysis** in the "
+                "**Configure & Run** tab to see the report here."
+            )
             return
 
-        # Fold the auto-vs-confirmed pairs into the result so they get
-        # saved to history below — same (auto_detected, coach_confirmed)
-        # training-signal pattern already used for bowling's release
-        # point/foot contacts.
-        result_payload["time_indices"]["stance_frame_auto_detected"] = confirmed_events["STANCE_auto_detected"]
-        result_payload["time_indices"]["backlift_frame_auto_detected"] = confirmed_events["BACKLIFT_auto_detected"]
-        result_payload["time_indices"]["contact_frame_auto_detected"] = confirmed_events["CONTACT_auto_detected"]
-        result_payload["time_indices"]["contact_auto_confidence"] = confirmed_events["CONTACT_auto_confidence"]
+        metrics = result_payload["biomechanical_metrics"]
+        hand_val = metrics.get("batting_hand_detected", "Unknown")
+        _angle_label = {"side_on": "Side-on", "front_or_rear": "Front-on / Rear-on",
+                         "uncertain": "Uncertain", "unavailable": "Unavailable"}.get(
+            result_payload.get("camera_angle"), "Unknown")
+        view_caveats = result_payload.get("view_confidence_caveats") or []
+        caveat_pill_html = ""
+        if view_caveats:
+            _caveat_labels = ", ".join(mr.RANGES[k].label for k in view_caveats)
+            caveat_pill_html = f'<span class="pill pill-warn">⚠ Extra caution: {html.escape(_caveat_labels)}</span>'
 
-        st.session_state["_batting_result_payload"] = result_payload
-        if not _is_admin_user:
-            usage_limits.record_usage(st.session_state.auth_user["id"])
-        st.rerun()
+        # BUG FIX (2026-08-03, "double header"): dropped the repeated logo +
+        # "APEX COACH AI" wordmark here too — same reasoning as the intro
+        # header fix above, that branding already renders once, globally, at
+        # the top of the whole app. This bar's actual job is the per-session
+        # info (leading side, filming angle, caveats), which it keeps.
+        _batting_html(f"""
+    <div class="apex-batting-theme">
+      <div class="topbar">
+        <div class="brand">
+          <span class="module">🏏 Batting Analysis — Report</span>
+        </div>
+        <div class="identity">
+          <span class="pill">Leading side: <b>{html.escape(str(hand_val))}</b></span>
+          <span class="pill">📐 Filming angle: <b>{html.escape(_angle_label)}</b></span>
+          {caveat_pill_html}
+        </div>
+      </div>
+    </div>
+    """)
 
-    result_payload = st.session_state.get("_batting_result_payload")
-    if result_payload is None:
-        return
-
-    st.divider()
-    st.header("📊 Batting Technique Report")
-
-    metrics = result_payload["biomechanical_metrics"]
-    st.caption(f"Batting hand detected (leading side): **{metrics.get('batting_hand_detected', 'Unknown')}**")
-
-    table_rows = []
-    for mkey, label_key in [
-        ("batting_head_movement", "head_movement"),
-        ("batting_front_foot_alignment", "front_foot_alignment"),
-        ("batting_weight_transfer", "weight_transfer"),
-        ("batting_downswing_plane", "downswing_plane"),
-        ("batting_top_elbow_angle", "top_elbow_angle"),
-    ]:
-        value = mr.extract_batting_metric_value(metrics, mkey)
-        zone = mr.classify(mkey, value)
-        r = mr.RANGES[mkey]
-        table_rows.append({
-            "Metric": r.label,
-            "Value": mr.format_value(mkey, value) if value is not None else "N/A",
-            "Zone": zone.upper(),
-            "Optimal": r.display_optimal,
-        })
-    st.table(pd.DataFrame(table_rows))
-
-    if result_payload.get("annotated_video_output"):
-        st.video(result_payload["annotated_video_output"])
-
-    with st.spinner("Generating expert batting coaching report..."):
-        insights = generate_batting_coaching_report(result_payload)
-    st.subheader("🧠 AI Batting Coach Analysis")
-    st.write(insights.get("narrative_analysis", ""))
-    if insights.get("prescribed_drills"):
-        st.subheader("🏋️ Prescribed Drills")
-        for i, drill in enumerate(insights["prescribed_drills"], 1):
-            st.markdown(f"**Drill {i}:** {drill}")
-
-    clean_slug = player_name.replace(" ", "_")
-    pdf_data = generate_batting_pdf_report(
-        metrics, result_payload["time_indices"], insights, batter_name=player_name,
-    )
-    st.download_button(
-        label="📄 Download Official PDF Report",
-        data=pdf_data,
-        file_name=f"Batting_Report_{clean_slug}.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-
-    if history_enabled and not st.session_state.get("batting_history_saved_for_run", False):
-        try:
-            athlete_id = store.get_or_create_athlete(player_name, st.session_state.auth_user["id"])
-            store.save_session(
-                athlete_id=athlete_id,
-                coach_user_id=st.session_state.auth_user["id"],
-                video_filename=os.path.basename(ref_path),
-                camera_mode="Batting - Single Camera",
-                fps=result_payload["video_metadata"]["fps"],
-                metrics=metrics,
-                phase_durations=None,
-                release_arm_speed_kmh=None,
-                speed_status="unavailable",
+        falling_over = result_payload.get("falling_over_risk", {})
+        _fo_status = falling_over.get("status")
+        if _fo_status == "success" and falling_over.get("flagged"):
+            _head_pct = falling_over.get("head_shift_pct")
+            _foot_pct = falling_over.get("foot_cross_pct")
+            _bar_scale = 40.0  # visual scale only, chosen so the 15% flag threshold reads clearly on the bar — the numbers shown as text are always the real, unscaled percentages
+            _head_bar = min(abs(_head_pct or 0) / _bar_scale * 100, 100)
+            _foot_bar = min(abs(_foot_pct or 0) / _bar_scale * 100, 100)
+            _batting_html(f"""
+    <div class="apex-batting-theme">
+      <div class="flag">
+        <div class="stripe"></div>
+        <div class="flag-body">
+          <div class="flag-title">🚩 Red Flag — Falling Over</div>
+          <div class="flag-desc">{html.escape(falling_over.get('reason') or '')}</div>
+          <div class="flag-meters">
+            <div class="flag-meter">Head drift toward danger side<br><b>{html.escape(str(_head_pct))}%</b> of stance width
+              <div class="flag-bar"><span style="width:{_head_bar:.0f}%"></span></div>
+            </div>
+            <div class="flag-meter">Front-foot cross toward danger side<br><b>{html.escape(str(_foot_pct))}%</b> of stance width
+              <div class="flag-bar"><span style="width:{_foot_bar:.0f}%"></span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    """)
+        elif _fo_status == "success":
+            _line = html.escape(str(result_payload.get("ball_line") or ""))
+            _batting_html(f"""
+    <div class="apex-batting-theme">
+      <div class="flag is-clear">
+        <div class="stripe"></div>
+        <div class="flag-body">
+          <div class="flag-title">Falling-Over Check — Clear</div>
+          <div class="flag-desc">Head/front-foot drift did not both point toward the danger side of this
+            {_line}-stump delivery. No compound fault detected on this ball.</div>
+        </div>
+      </div>
+    </div>
+    """)
+        elif _fo_status == "not_applicable":
+            st.markdown(
+                '<div class="apex-batting-theme"><div class="flag is-neutral"><div class="stripe"></div>'
+                '<div class="flag-body"><div class="flag-title">Falling-Over Check — Not Evaluated</div>'
+                '<div class="flag-desc">This check only runs for Off Stump or Leg Stump lines, where a '
+                '"wrong side" drift is well-defined.</div></div></div></div>',
+                unsafe_allow_html=True,
             )
-            st.session_state["batting_history_saved_for_run"] = True
-        except Exception as e:
-            monitoring.capture(e)
-            st.warning(f"Could not save this session to athlete history: {e}")
+        elif _fo_status == "error":
+            st.markdown(
+                '<div class="apex-batting-theme"><div class="flag is-neutral"><div class="stripe"></div>'
+                '<div class="flag-body"><div class="flag-title">Falling-Over Check — Unavailable</div>'
+                '<div class="flag-desc">Could not be evaluated for this clip (insufficient tracking data at '
+                'the stance/contact frames).</div></div></div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # RESTRUCTURE (2026-08-04): video and its metrics now sit side by
+        # side in real Streamlit columns, instead of the video appearing
+        # in its own full-width block below a separate full-width metrics
+        # grid. Same content, genuinely different composition.
+        col_video, col_metrics = st.columns([1, 1.5], gap="medium")
+        with col_video:
+            if result_payload.get("annotated_video_output"):
+                st.video(result_payload["annotated_video_output"])
+            else:
+                st.caption("Annotated video unavailable for this session.")
+        with col_metrics:
+            st.markdown(
+                '<div class="apex-batting-theme"><div class="section-label">'
+                'Batting Technique Telemetry — Stance → Backlift → Contact</div></div>',
+                unsafe_allow_html=True,
+            )
+            _cards_html = "".join(
+                _batting_metric_card_html(mkey, metrics, view_caveats) for mkey in mr.all_batting_metric_keys()
+            )
+            st.markdown(f'<div class="apex-batting-theme"><div class="grid">{_cards_html}</div></div>',
+                        unsafe_allow_html=True)
+
+        with st.spinner("Generating expert batting coaching report..."):
+            insights = generate_batting_coaching_report(result_payload)
+
+        narrative_html = _batting_narrative_to_html(insights.get("narrative_analysis", ""))
+        drills = insights.get("prescribed_drills") or []
+        drills_html = ""
+        if drills:
+            _drill_items = []
+            for drill in drills:
+                dname, _sep, ddesc = drill.partition(":")
+                if ddesc.strip():
+                    _drill_items.append(
+                        f'<li><span class="dname">{html.escape(dname.strip())}</span>'
+                        f'{html.escape(ddesc.strip())}</li>'
+                    )
+                else:
+                    _drill_items.append(f'<li>{html.escape(drill.strip())}</li>')
+            drills_html = f'<ul class="drills">{"".join(_drill_items)}</ul>'
+
+        _batting_html(f"""
+    <div class="apex-batting-theme">
+      <div class="report-card">
+        <div class="report-head"><span class="dot"></span><span class="report-title">AI Batting Coach — Assessment</span></div>
+        <p class="narrative">{narrative_html}</p>
+        {drills_html}
+      </div>
+    </div>
+    """)
+
+        clean_slug = player_name.replace(" ", "_")
+        pdf_data = generate_batting_pdf_report(
+            metrics, result_payload["time_indices"], insights, batter_name=player_name,
+            falling_over_risk=falling_over,
+        )
+        st.download_button(
+            label="📄 Download Official PDF Report",
+            data=pdf_data,
+            file_name=f"Batting_Report_{clean_slug}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+        if history_enabled and not st.session_state.get("batting_history_saved_for_run", False):
+            try:
+                athlete_id = store.get_or_create_athlete(player_name, st.session_state.auth_user["id"])
+                store.save_session(
+                    athlete_id=athlete_id,
+                    coach_user_id=st.session_state.auth_user["id"],
+                    video_filename=os.path.basename(ref_path),
+                    camera_mode="Batting - Single Camera",
+                    fps=result_payload["video_metadata"]["fps"],
+                    metrics=metrics,
+                    phase_durations=None,
+                    release_arm_speed_kmh=None,
+                    speed_status="unavailable",
+                )
+                st.session_state["batting_history_saved_for_run"] = True
+            except Exception as e:
+                monitoring.capture(e)
+                st.warning(f"Could not save this session to athlete history: {e}")
 
 
 def render_stream_event_confirmation(stage12_result, ref_path: str, file_identity: str,
@@ -1145,14 +1888,20 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
     return buffer.getvalue()
 
 
-def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite Athlete"):
+def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite Athlete",
+                                 falling_over_risk=None):
     """
     Batting equivalent of generate_pdf_report — same reportlab primitives,
-    same visual language, simplified for batting's 5 metrics (no speed/
+    same visual language, simplified for batting's metrics (no speed/
     phase-duration section, which doesn't apply to batting analysis).
     Deliberately builds its own color-coded table with mr.classify/
     mr.format_value directly rather than reusing pdf_color_ranges.py,
     which iterates the bowling-only metric set.
+
+    falling_over_risk: optional result dict from
+    batting_kinematics.detect_falling_over_risk (via
+    result_payload["falling_over_risk"]) — when flagged, called out as
+    its own red-flag paragraph, same as the Streamlit UI's alert box.
     """
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter,
@@ -1160,10 +1909,15 @@ def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite
     story = []
     styles = getSampleStyleSheet()
 
+    # Print-safe echo of the on-screen "floodlit night match" palette —
+    # the raw --ink/--accent hex values from the Streamlit theme are too
+    # light/washed-out as TEXT on white paper, so these are darkened,
+    # readable equivalents of the same two hues (dark pitch-green ink,
+    # dark willow-gold) rather than a copy-paste of the screen colors.
     title_style = ParagraphStyle('DocTitle', parent=styles['Heading1'],
-                                  fontSize=22, leading=26, textColor=colors.HexColor('#1A365D'))
+                                  fontSize=22, leading=26, textColor=colors.HexColor('#182019'))
     h2_style = ParagraphStyle('SectionHeader', parent=styles['Heading2'],
-                               fontSize=14, leading=18, textColor=colors.HexColor('#2B6CB0'),
+                               fontSize=14, leading=18, textColor=colors.HexColor('#8A6A24'),
                                spaceBefore=12, spaceAfter=6)
     body_style = ParagraphStyle('ReportBody', parent=styles['Normal'],
                                  fontSize=10, leading=14, textColor=colors.HexColor('#2D3748'))
@@ -1188,6 +1942,13 @@ def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite
     ))
     story.append(Spacer(1, 10))
 
+    if falling_over_risk and falling_over_risk.get("status") == "success" and falling_over_risk.get("flagged"):
+        story.append(Paragraph(
+            f"🚩 RED FLAG — FALLING OVER: {falling_over_risk.get('reason', '')}",
+            ParagraphStyle('RedFlag', parent=bold_body, fontSize=10, textColor=colors.HexColor('#C53030'))
+        ))
+        story.append(Spacer(1, 10))
+
     story.append(Paragraph("Phase Milestones", h2_style))
     time_rows = [
         [Paragraph("<b>Phase</b>", bold_body), Paragraph("<b>Frame</b>", bold_body)],
@@ -1197,7 +1958,7 @@ def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite
     ]
     t_time = Table(time_rows, colWidths=[250, 250])
     t_time.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#EDF2F7')),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F3ECD9')),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E0')),
         ('PADDING', (0, 0), (-1, -1), 6),
     ]))
@@ -1211,11 +1972,14 @@ def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite
     ))
     story.append(Spacer(1, 6))
 
-    zone_bg = {"green": colors.HexColor('#D9F7E4'), "amber": colors.HexColor('#FFF3D6'),
-               "red": colors.HexColor('#FDE0E0'), "unknown": colors.HexColor('#EDF2F7')}
+    # Reuses metric_ranges.py's own PDF tint table (mr.TIER_COLORS_PDF)
+    # instead of a second, separately-hardcoded copy of the same four
+    # colors — this table already matches the on-screen good/warn/crit
+    # zone colors' intent, just as soft print-safe fills.
+    zone_bg = {k: colors.HexColor(v) for k, v in mr.TIER_COLORS_PDF.items()}
     metric_rows = [[Paragraph("<b>Metric</b>", bold_body), Paragraph("<b>Value</b>", bold_body),
                     Paragraph("<b>Zone</b>", bold_body), Paragraph("<b>Optimal</b>", bold_body)]]
-    row_colors = [colors.HexColor('#EDF2F7')]
+    row_colors = [colors.HexColor('#F3ECD9')]
     for mkey in mr.all_batting_metric_keys():
         value = mr.extract_batting_metric_value(metrics, mkey)
         zone = mr.classify(mkey, value)

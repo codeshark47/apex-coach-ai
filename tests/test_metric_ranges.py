@@ -172,3 +172,26 @@ class TestDescribeRangeMatchesClassify:
         second, lower, contradictory one."""
         assert mr.measurement_warning("release_height", 1.45) is None
         assert mr.measurement_warning("release_height", 1.18) is None
+
+
+class TestFormatValuePercentUnits:
+    """BUG FOUND (2026-08-03, while restyling the batting UI): format_value
+    and describe_range's fv() helper used to multiply EVERY unit="%" metric
+    by 100 unconditionally, which is only correct for a metric stored as a
+    0-1 fraction (release_height, e.g. 0.85 -> "85%"). batting_weight_transfer's
+    calculate_weight_transfer already returns a 0-100+ number (e.g. 52.0
+    meaning 52%) -- the old code turned that into "5200%". Fixed with an
+    explicit already_percent flag on MetricRange rather than guessing from
+    the unit string alone."""
+
+    def test_fraction_based_metric_still_multiplies_by_100(self):
+        assert mr.format_value("release_height", 0.85) == "85%"
+
+    def test_already_percent_metric_is_not_multiplied_again(self):
+        assert mr.format_value("batting_weight_transfer", 52.0) == "52%"
+        assert mr.format_value("batting_weight_transfer", 100.0) == "100%"
+
+    def test_describe_range_does_not_inflate_an_already_percent_metric(self):
+        desc = mr.describe_range("batting_weight_transfer")
+        assert "40%+" in desc
+        assert "4000%" not in desc
