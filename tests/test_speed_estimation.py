@@ -44,6 +44,7 @@ the same clip can still be found and used.
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import speed_estimation as se
 
@@ -169,3 +170,46 @@ class TestComputeReleaseArmSpeedNeverFabricatesImpossibleNumbers:
             assert 0 < result["kmh"] <= 200
         else:
             assert result["status"] == "error"
+
+
+class TestComputeEstimatedStandingHeight:
+    """
+    compute_estimated_standing_height (2026-08-05): automatic bowler-height
+    estimate from the segment-sum body-height baseline
+    (orchestrator._compute_segment_sum_body_height) converted through
+    stump calibration — a coach explicitly said no coach will realistically
+    supply a bowler's real height manually, so this has to be fully
+    automatic or not exist at all. Same never-invent-a-scale and
+    never-return-an-implausible-value discipline as
+    compute_release_height_absolute right above it.
+    """
+
+    def test_not_calibrated_when_no_scale_available(self):
+        result = se.compute_estimated_standing_height(0.60, frame_height=1080, meters_per_pixel=None)
+        assert result["status"] == "not_calibrated"
+
+    def test_no_baseline_when_segment_sum_is_none(self):
+        """A clip too short/noisy to find enough plausible early run-up
+        frames must say so, not silently fall back to guessing."""
+        result = se.compute_estimated_standing_height(None, frame_height=1080, meters_per_pixel=0.0006)
+        assert result["status"] == "no_baseline"
+
+    def test_plausible_real_height_succeeds(self):
+        # segment_sum=0.60 (normalized), frame_height=1080px,
+        # meters_per_pixel=0.0006 (a plausible stump-height-calibrated
+        # scale for a bowler filling most of the frame) ->
+        # 0.60 * 1080 * 0.0006 = 0.3888m... use a scale that lands in a
+        # real human range instead, e.g. meters_per_pixel=0.0027:
+        # 0.60 * 1080 * 0.0027 = 1.7496m = 174.96cm
+        result = se.compute_estimated_standing_height(0.60, frame_height=1080, meters_per_pixel=0.0027)
+        assert result["status"] == "success"
+        assert 100 < result["cm"] < 230
+        assert result["cm"] == pytest.approx(175.0, abs=0.1)
+
+    def test_implausible_height_is_flagged_not_trusted(self):
+        """A wildly-off calibration or tracking failure would otherwise
+        produce a nonsense height (e.g. 50cm or 400cm) — must be flagged
+        as an error, never presented as a real reading."""
+        # Same segment_sum as above, but a scale an order of magnitude off.
+        result = se.compute_estimated_standing_height(0.60, frame_height=1080, meters_per_pixel=0.05)
+        assert result["status"] == "error"

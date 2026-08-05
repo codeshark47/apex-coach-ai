@@ -111,6 +111,18 @@ DEFAULT_RADIUS_FRACTION = 0.02  # of frame width — first-frame starting guess 
 # revisit once more of these pre-fills have been accepted/corrected.
 AI_PREFILL_CONF_THRESHOLD = 0.35
 
+# HARD-NEGATIVE MINING (2026-08-04): real evaluation of ball_v1-6/v1-7
+# found the model's false positives cluster on specific lookalike
+# objects (a glove was the clearest repeat offender), not random noise.
+# Skipping a frame with one of these on screen previously threw the
+# information away — the coach recognized exactly what confused a
+# detector but the tool never asked. These categories let that get
+# captured as a confirmed non-ball training example instead (see
+# _save_hard_negative below and prepare_dataset.py's background-image
+# handling). "No — just skip" must stay first (index 0) — code below
+# treats that as the disabled/default state.
+HARD_NEGATIVE_CATEGORIES = ["No — just skip", "Glove", "Pad/guard", "Helmet", "Other shiny/round object"]
+
 
 @st.cache_resource(show_spinner="Loading AI ball detector (one-time)...")
 def _load_yolo_model():
@@ -251,6 +263,30 @@ def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
             "frames_with_candidates": 1,
             "raw_candidates": {str(frame_idx): candidate},
         }).execute()
+
+
+def _save_hard_negative(client, video_name: str, frame_idx: int, category: str):
+    """
+    Confirmed hard-negative example: the coach has determined there is NO
+    ball in this frame, but a specific lookalike (glove/pad/helmet/other)
+    is visible — exactly the false-positive pattern found by direct
+    inspection of ball_v1-6/v1-7's predictions (the model latching onto a
+    glove). Stored as an ordinary ball_tracking_labels row with NULL
+    coordinates — the schema already documents this exact case ("null if
+    ball not visible/identifiable this frame"), so no migration is
+    needed. prepare_dataset.py reads these and writes a plain background
+    image (no matching .txt label) — valid YOLO for "zero objects here,"
+    which teaches the model this object is a confirmed non-ball rather
+    than simply unseen/unlabeled.
+    """
+    client.table("ball_tracking_labels").upsert({
+        "source_video_filename": video_name,
+        "frame_index": frame_idx,
+        "ball_x_px": None,
+        "ball_y_px": None,
+        "labeled_by": "direct_click_v1",
+        "notes": f"HARD NEGATIVE: {category} visible here, coach confirmed no ball in frame.",
+    }, on_conflict="source_video_filename,frame_index").execute()
 
 
 def _load_frame(video_path: str, frame_idx: int):
@@ -497,7 +533,23 @@ def main():
         if pending_point_key not in st.session_state:
             yolo_model = _load_yolo_model()
             if yolo_model is not None:
-                results = yolo_model.predict(frame_rgb, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
+                # BUG FOUND (2026-08-04, real coach report of near-total
+                # non-detection even on a clearly-visible ball): frame_rgb
+                # is RGB (converted for on-screen display). train_yolo.py
+                # trains on raw BGR frames (prepare_dataset.py writes
+                # cv2.imwrite(..., frame) with no color conversion), and
+                # ultralytics treats a raw numpy array the same way cv2
+                # itself does — BGR. Feeding it frame_rgb silently swapped
+                # red/blue for every prediction. Confirmed directly
+                # against 71 real labeled frames from a genuine training
+                # clip: BGR input hit the true ball position on 69/71
+                # frames (avg conf 0.467) vs only 59/71 for RGB (avg conf
+                # 0.476, but several frames lost enough confidence to fall
+                # below AI_PREFILL_CONF_THRESHOLD entirely, e.g. 0.41->0.14
+                # on one frame). Convert back to BGR for inference only —
+                # frame_rgb still drives the on-screen display, unchanged.
+                frame_bgr_for_model = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                results = yolo_model.predict(frame_bgr_for_model, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
                 boxes = results[0].boxes
                 if len(boxes) > 0:
                     confs = boxes.conf.tolist()
@@ -573,8 +625,21 @@ def main():
                 st.session_state.label_tool_radius = radius
                 st.rerun()
         with calib_col2:
+            hard_neg_choice = st.selectbox(
+                "Lookalike here? (optional)", HARD_NEGATIVE_CATEGORIES,
+                key=f"label_tool_hardneg_calib_{video_name}_{frame_idx}",
+                help="If the AI (or a click) landed on a glove, pad, or helmet instead of the "
+                     "real ball, flag which one — that gets saved as a confirmed non-ball "
+                     "example so the model learns to tell them apart, instead of just being "
+                     "skipped past unrecorded.",
+            )
             if st.button("🚫 Not the ball — no ball visible here, skip", use_container_width=True):
-                st.session_state.label_tool_history.append(("skip", 1))
+                if hard_neg_choice != HARD_NEGATIVE_CATEGORIES[0]:
+                    _save_hard_negative(client, video_name, frame_idx, hard_neg_choice)
+                    st.session_state.label_tool_history.append(("skip_hardneg", frame_idx))
+                    st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
+                else:
+                    st.session_state.label_tool_history.append(("skip", 1))
                 del st.session_state[pending_point_key]
                 st.session_state.pop(pending_source_key, None)
                 st.session_state.pop(ai_radius_key, None)
@@ -620,7 +685,10 @@ def main():
     with col2:
         if st.button("↩️ Undo last", use_container_width=True, disabled=not st.session_state.label_tool_history):
             action, data = st.session_state.label_tool_history.pop()
-            if action == "confirm":
+            if action in ("confirm", "skip_hardneg"):
+                # Both wrote a real ball_tracking_labels row (positive or
+                # hard-negative) for exactly one frame — same undo: delete
+                # that row, un-count it, step back one frame.
                 client.table("ball_tracking_labels").delete().eq(
                     "source_video_filename", video_name
                 ).eq("frame_index", data).execute()
@@ -646,11 +714,28 @@ def main():
             help="E.g. skip 10 to jump past a stretch you already know the ball won't be visible in. "
                  "Clamped automatically if it would go past the end of this clip.",
         )
+        # Hard-negative tagging only makes sense for a single, specific
+        # frame — a bulk skip of N frames has no one frame to attach a
+        # category to, so the picker is only offered when skip_n == 1.
+        hard_neg_choice = HARD_NEGATIVE_CATEGORIES[0]
+        if skip_n == 1:
+            hard_neg_choice = st.selectbox(
+                "Lookalike here? (optional)", HARD_NEGATIVE_CATEGORIES,
+                key=f"label_tool_hardneg_main_{video_name}_{frame_idx}",
+                help="Flags a glove/pad/helmet visible in THIS frame as a confirmed non-ball "
+                     "example, instead of just passing over it unrecorded — helps the model "
+                     "stop mistaking these for the ball.",
+            )
     with skip_col2:
         st.write("")  # vertical alignment spacer so the button lines up with the number input
         if st.button("⏭️ No ball visible — skip", use_container_width=True):
             actual_skip = min(skip_n, len(sampled_indices) - ptr)
-            st.session_state.label_tool_history.append(("skip", actual_skip))
+            if skip_n == 1 and hard_neg_choice != HARD_NEGATIVE_CATEGORIES[0]:
+                _save_hard_negative(client, video_name, frame_idx, hard_neg_choice)
+                st.session_state.label_tool_history.append(("skip_hardneg", frame_idx))
+                st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
+            else:
+                st.session_state.label_tool_history.append(("skip", actual_skip))
             if pending_point_key in st.session_state:
                 del st.session_state[pending_point_key]
             st.session_state.pop(pending_source_key, None)

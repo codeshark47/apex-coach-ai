@@ -28,7 +28,7 @@ def _format_value(metric_key: str, value) -> str:
     return str(round(float(value), 4))
 
 
-def build_color_coded_range_table(metrics: dict, bold_body: ParagraphStyle) -> Table:
+def build_color_coded_range_table(metrics: dict, bold_body: ParagraphStyle, bowler_type: str = None) -> Table:
     values = _metric_value_map(metrics)
 
     header = [
@@ -42,12 +42,27 @@ def build_color_coded_range_table(metrics: dict, bold_body: ParagraphStyle) -> T
     row_tiers = ["header"]  # tracks which color to paint each row
 
     for key in mr.all_metric_keys():
-        r = mr.RANGES[key]
         val = values.get(key)
-        tier = mr.classify(key, val)
-        zone_label = {"green": "Optimal", "amber": "Acceptable",
-                      "red": "Critical", "unknown": "No Data"}[tier]
-        rows.append([r.label, _format_value(key, val), zone_label, r.display_optimal])
+        tier = mr.classify(key, val, bowler_type)
+        zone_label = {"green": "Optimal", "amber": "Acceptable", "red": "Critical",
+                      "unknown": "No Data", "descriptive": "Descriptive (no benchmark yet)"}[tier]
+        if tier == "descriptive":
+            r = mr.RANGES[key]
+            rows.append([r.label, _format_value(key, val), zone_label, "N/A for this bowling style"])
+        else:
+            r = mr.SPIN_RANGE_OVERRIDES.get((key, bowler_type), mr.RANGES[key])
+            optimal_text = r.display_optimal
+            # See orchestrator.calculate_release_height_ratio_safe's and
+            # kinematics.calculate_head_stability's "recalibration_pending"
+            # comments (2026-08-05): both measurements were just corrected
+            # to fix real camera-distance bugs, but their bands were tuned
+            # against the OLD, uncorrected measurement and haven't been
+            # re-validated against the new one yet — say so in the report
+            # itself, not just on screen, so the PDF can't overstate
+            # confidence either.
+            if metrics.get(key, {}).get("recalibration_pending"):
+                optimal_text += " (bands under re-validation — see report)"
+            rows.append([r.label, _format_value(key, val), zone_label, optimal_text])
         row_tiers.append(tier)
 
     table = Table(rows, colWidths=[150, 90, 100, 110])

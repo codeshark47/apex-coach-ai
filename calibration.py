@@ -12,6 +12,10 @@ will report "not available" rather than guess.
 
 Typical reference distances a coach can use (any known distance works):
   - Stump width (leg to off stump):        22.86 cm  = 0.2286 m
+  - Stump height (top to ground, ANY one stump — same official
+    standard everywhere, so this works even when only one stump is
+    visible in frame, unlike width which needs two spaced apart):
+                                            28 in     = 0.7112 m
   - Popping crease to popping crease:      20.12 m
   - A placed marker of known length (tape measure, cone spacing, etc.)
 

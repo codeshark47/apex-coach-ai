@@ -116,6 +116,12 @@ class TestTrunkLean:
         assert "implausible" in result["tier"].lower()
 
 
+def _head_row(frame, nose_x, sh_left_x=0.6, sh_right_x=0.4):
+    """shoulder width defaults to 0.2 — a plausible, moderate camera
+    distance, used across the normalization tests below."""
+    return {"frame": frame, "NOSE_x": nose_x, "LEFT_SHOULDER_x": sh_left_x, "RIGHT_SHOULDER_x": sh_right_x}
+
+
 class TestHeadStability:
     def test_empty_window_returns_none_not_zero(self):
         """The exact bug found on real footage: an empty tracking
@@ -128,22 +134,63 @@ class TestHeadStability:
         assert result["status"] == "error"
 
     def test_fewer_than_two_valid_points_returns_none(self):
-        df = pd.DataFrame({"frame": [1, 2, 3], "NOSE_x": [np.nan, np.nan, 0.3]})
+        df = pd.DataFrame([
+            _head_row(1, np.nan), _head_row(2, np.nan), _head_row(3, 0.3),
+        ])
         result = k.calculate_head_stability(df, start_frame=1, end_frame=3)
         assert result["deviation_index"] is None
         assert result["status"] == "error"
 
     def test_genuine_stable_head_reports_elite_tier(self):
-        df = pd.DataFrame({"frame": [1, 2, 3, 4], "NOSE_x": [0.500, 0.501, 0.499, 0.500]})
+        df = pd.DataFrame([
+            _head_row(1, 0.500), _head_row(2, 0.501), _head_row(3, 0.499), _head_row(4, 0.500),
+        ])
         result = k.calculate_head_stability(df, start_frame=1, end_frame=4)
         assert result["status"] == "success"
         assert result["tier"] == "Elite Fixed Gaze Focus"
+        assert result["recalibration_pending"] is True
 
     def test_erratic_head_movement_reports_correct_tier(self):
-        df = pd.DataFrame({"frame": [1, 2, 3, 4], "NOSE_x": [0.3, 0.7, 0.2, 0.8]})
+        df = pd.DataFrame([
+            _head_row(1, 0.3), _head_row(2, 0.7), _head_row(3, 0.2), _head_row(4, 0.8),
+        ])
         result = k.calculate_head_stability(df, start_frame=1, end_frame=4)
         assert result["status"] == "success"
         assert result["tier"] == "Erratic Lateral Head Drift"
+
+    def test_camera_distance_no_longer_changes_the_reading(self):
+        """THE core bug this fix targets: the exact same real head
+        movement (as a fraction of body size) must read identically
+        whether the bowler is filmed close to the camera (wide shoulder
+        span) or further away (narrow shoulder span) — the old raw-
+        pixel version would have reported these as different amounts of
+        'drift' purely from framing, not real technique."""
+        close_up = pd.DataFrame([
+            _head_row(1, 0.48, sh_left_x=0.7, sh_right_x=0.3),   # width 0.4
+            _head_row(2, 0.52, sh_left_x=0.7, sh_right_x=0.3),
+        ])
+        far_away = pd.DataFrame([
+            _head_row(1, 0.49, sh_left_x=0.6, sh_right_x=0.4),   # width 0.2 (half as wide -> twice as far)
+            _head_row(2, 0.51, sh_left_x=0.6, sh_right_x=0.4),
+        ])
+        close_result = k.calculate_head_stability(close_up, start_frame=1, end_frame=2)
+        far_result = k.calculate_head_stability(far_away, start_frame=1, end_frame=2)
+        assert close_result["status"] == far_result["status"] == "success"
+        assert close_result["deviation_index"] == far_result["deviation_index"]
+
+    def test_degenerate_shoulder_width_does_not_blow_up_the_ratio(self):
+        """A near-zero shoulder width (mistracked/collapsed landmarks)
+        must not be divided into, which would produce a huge, meaningless
+        ratio — same 'None, not a fabricated number' guard as the rest of
+        this codebase."""
+        df = pd.DataFrame([
+            _head_row(1, 0.5, sh_left_x=0.501, sh_right_x=0.500),  # width 0.001, below MIN_SHOULDER_WIDTH
+            _head_row(2, 0.5, sh_left_x=0.501, sh_right_x=0.500),
+        ])
+        result = k.calculate_head_stability(df, start_frame=1, end_frame=2)
+        assert result["deviation_index"] is None
+        assert result["status"] == "error"
+        assert result["tier"] == "Tracking Drop"
 
 
 if __name__ == "__main__":

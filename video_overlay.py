@@ -249,7 +249,8 @@ def render_annotated_video(video_path: str, output_path: str,
                             df: pd.DataFrame, events: dict,
                             slow_motion_factor: float = 4.0,
                             bowling_arm: str = "right",
-                            camera_angle: str = "side_on"):
+                            camera_angle: str = "side_on",
+                            bowler_type: str = None):
     """
     Generates annotated skeleton overlay video using mp4v codec.
 
@@ -502,15 +503,19 @@ def render_annotated_video(video_path: str, output_path: str,
     # just a different color — "thickness according to the angle": draws
     # the eye to whichever joint actually needs coaching attention instead
     # of every joint looking equally important.
-    _TIER_EXTRA_PX = {"green": 0, "amber": 1, "red": 2, "unknown": 0}
+    _TIER_EXTRA_PX = {"green": 0, "amber": 1, "red": 2, "unknown": 0, "descriptive": 0}
 
     # COLOR/THICKNESS BY ANGLE: reuses metric_ranges.classify — the exact
     # same green/amber/red the dashboard and PDF report already use for
     # each of these metrics, not a new judgment invented for the video.
+    # bowler_type passes through so a spin bowler's metrics with no
+    # validated range (see SPIN_RANGE_OVERRIDES) draw in the neutral
+    # "descriptive" color instead of being silently judged against
+    # pace-calibrated bands.
     def _tier_and_color(metric_key, value):
         if value is None or (isinstance(value, float) and np.isnan(value)):
             return "unknown", TIER_COLORS_BGR["unknown"]
-        tier = mr.classify(metric_key, float(value))
+        tier = mr.classify(metric_key, float(value), bowler_type)
         return tier, TIER_COLORS_BGR[tier]
 
     # BUG FIX, found auditing the skeleton-collapse fix above: a fully
@@ -682,7 +687,13 @@ def render_annotated_video(video_path: str, output_path: str,
     else:
         CHART_MIN, CHART_MAX = 0.0, 180.0
         CHART_GRIDLINES = (0, 90, 180)
-    _hero_green_lo, _hero_green_hi = mr.RANGES[hero_key].green
+    # Same bowler_type-aware lookup _tier_and_color uses below — a spin
+    # bowler with no validated range for hero_key must not have this chart
+    # silently draw pace's green band as if it applied (see
+    # SPIN_RANGE_OVERRIDES / classify()'s "descriptive" tier).
+    _hero_range = mr.SPIN_RANGE_OVERRIDES.get((hero_key, bowler_type)) if bowler_type in ("finger_spin", "wrist_spin") else None
+    _hero_has_validated_range = _hero_range is not None or bowler_type not in ("finger_spin", "wrist_spin")
+    _hero_green_lo, _hero_green_hi = (_hero_range or mr.RANGES[hero_key]).green
     # SHRUNK from 38% of frame height to a slim ~16% strip — the old chart
     # dominated a third of the video, which read as a dashboard bolted onto
     # footage rather than a broadcast graphic. The data itself (live knee
@@ -719,14 +730,19 @@ def render_annotated_video(video_path: str, output_path: str,
     # look; for a "band" metric (green in the middle) it's a thinner
     # strip — either way it's the metric's REAL green band, not a
     # separately-hardcoded threshold that could drift from it.
-    green_top_y = y_to_px(_hero_green_hi)
-    green_bot_y = y_to_px(_hero_green_lo)
-    cv2.rectangle(chart_base, (MARGIN_L, green_top_y), (width - MARGIN_R, green_bot_y),
-                  (28, 55, 28), -1)
-    band_label = (f"OPTIMAL {_hero_green_lo:.0f}-{_hero_green_hi:.0f}"
-                  if hero_key == "hip_shoulder_separation" else f"ELITE {_hero_green_lo:.0f}+")
-    cv2.putText(chart_base, band_label, (MARGIN_L + 8, green_top_y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 205, 130), 1, cv2.LINE_AA)
+    if _hero_has_validated_range:
+        green_top_y = y_to_px(_hero_green_hi)
+        green_bot_y = y_to_px(_hero_green_lo)
+        cv2.rectangle(chart_base, (MARGIN_L, green_top_y), (width - MARGIN_R, green_bot_y),
+                      (28, 55, 28), -1)
+        band_label = (f"OPTIMAL {_hero_green_lo:.0f}-{_hero_green_hi:.0f}"
+                      if hero_key == "hip_shoulder_separation" else f"ELITE {_hero_green_lo:.0f}+")
+        cv2.putText(chart_base, band_label, (MARGIN_L + 8, green_top_y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 205, 130), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(chart_base, "NO VALIDATED BENCHMARK YET — DESCRIPTIVE ONLY",
+                    (MARGIN_L + 8, MARGIN_T + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1, cv2.LINE_AA)
     # Fewer gridlines (was every 45deg incl. labels at each) — a compact
     # panel doesn't have room for a dense axis without feeling cramped.
     for g in CHART_GRIDLINES:

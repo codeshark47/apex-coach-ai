@@ -10,6 +10,7 @@ from orchestrator import (
     detect_bowling_arm,
     _nearest_complete_row,
     _find_grounded_reference_near,
+    _compute_segment_sum_body_height,
 )
 from main import extract_video_landmarks
 from kinematics import calculate_knee_bracing, calculate_trunk_lean, calculate_head_stability
@@ -21,7 +22,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                               rear_seed_point: tuple = None, rear_seed_frame_index: int = 0,
                               side_extra_seeds: list = None, rear_extra_seeds: list = None,
                               side_precomputed: dict = None, rear_precomputed: dict = None,
-                              side_event_overrides: dict = None, rear_event_overrides: dict = None) -> dict:
+                              side_event_overrides: dict = None, rear_event_overrides: dict = None,
+                              bowler_type: str = None) -> dict:
     """
     SaaS Architecture Dual Camera Engine.
     Processes side-on and rear streams independently to bypass manual sync issues.
@@ -123,9 +125,15 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     side_wrist_x = side_events.get("wrist_override_x")
     side_wrist_y = side_events.get("wrist_override_y")
     side_wrist_override_norm = (side_wrist_x, side_wrist_y) if side_wrist_x is not None and side_wrist_y is not None else None
+    # Same real body-height fix as Single Camera mode — see
+    # _compute_segment_sum_body_height's docstring for the real 240%
+    # false reading a raw head-to-ankle span produced on a bent reference
+    # frame.
+    side_segment_sum_body_height = _compute_segment_sum_body_height(side_df, bowling_arm, side_events.get("BFC"))
     release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm,
                                                               reference_row=side_height_ref,
-                                                              wrist_override_norm=side_wrist_override_norm)
+                                                              wrist_override_norm=side_wrist_override_norm,
+                                                              segment_sum_body_height=side_segment_sum_body_height)
 
     # FFC-to-Release knee angle delta ("yielding knee" check from external
     # biomechanical audit) — same logic as Single Camera mode.
@@ -184,9 +192,11 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         rear_wrist_x = rear_events.get("wrist_override_x")
         rear_wrist_y = rear_events.get("wrist_override_y")
         rear_wrist_override_norm = (rear_wrist_x, rear_wrist_y) if rear_wrist_x is not None and rear_wrist_y is not None else None
+        rear_segment_sum_body_height = _compute_segment_sum_body_height(rear_df, bowling_arm, rear_events.get("BFC"))
         rear_release_height = calculate_release_height_ratio_safe(rear_br_rows.iloc[0], bowling_arm=bowling_arm,
                                                                     reference_row=rear_height_ref,
-                                                                    wrist_override_norm=rear_wrist_override_norm)
+                                                                    wrist_override_norm=rear_wrist_override_norm,
+                                                                    segment_sum_body_height=rear_segment_sum_body_height)
 
     release_height_source = "side"
     if release_height.get("status") != "success" and rear_release_height.get("status") == "success":
@@ -196,13 +206,13 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     # SIDE-ON ANNOTATED VIDEO
     raw_video = os.path.join(output_dir, "annotated_raw.mp4")
     generate_fail_safe_video(side_on_path, raw_video, side_df, side_events, bowling_arm=bowling_arm,
-                              camera_angle="side_on")
+                              camera_angle="side_on", bowler_type=bowler_type)
     web_safe_video = transcode_to_h264(raw_video)
 
     # REAR-VIEW ANNOTATED VIDEO
     rear_raw_video = os.path.join(output_dir, "annotated_rear_raw.mp4")
     generate_fail_safe_video(rear_view_path, rear_raw_video, rear_df, rear_events, bowling_arm=bowling_arm,
-                              camera_angle="front_or_rear")
+                              camera_angle="front_or_rear", bowler_type=bowler_type)
     rear_web_safe_video = transcode_to_h264(rear_raw_video)
 
     def clean_numeric(val):
@@ -235,6 +245,7 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     return {
         "status": "success",
         "camera_mode": "dual",
+        "bowler_type": bowler_type,
         "bowling_arm_detected": bowling_arm,
         "video_metadata": {
             "source_file": os.path.basename(side_on_path),
@@ -277,6 +288,7 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                 # the side stream's own reading failed and the rear
                 # stream's coach-corrected wrist point produced a real one)
                 "measured_from": release_height_source,
+                "recalibration_pending": release_height.get("recalibration_pending", False),
             },
             "hip_shoulder_separation": {
                 "degrees": clean_numeric(hip_separation.get("degrees")),
@@ -286,7 +298,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
             "head_stability": {
                 "value": clean_numeric(head_stability.get("deviation_index") or head_stability.get("value")),
                 "tier": head_stability.get("tier", "Unknown"),
-                "status": head_stability.get("status", "error")
+                "status": head_stability.get("status", "error"),
+                "recalibration_pending": head_stability.get("recalibration_pending", False),
             },
             # BUG FIX (found during a broader audit): this used to only
             # exist at the TOP level of this return dict. Single Camera's

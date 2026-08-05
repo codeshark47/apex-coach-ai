@@ -1762,7 +1762,7 @@ os.makedirs("input", exist_ok=True)
 # ====================================================================
 def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete",
                          camera_mode="Single Camera", phase_durations=None,
-                         speed_result=None, quality=None):
+                         speed_result=None, quality=None, bowler_type=None):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter,
                              rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
@@ -1856,7 +1856,7 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
         body_style
     ))
     story.append(Spacer(1, 6))
-    story.append(pcr.build_color_coded_range_table(metrics, bold_body))
+    story.append(pcr.build_color_coded_range_table(metrics, bold_body, bowler_type))
     story.append(Spacer(1, 15))
 
     # AI NARRATIVE
@@ -2160,6 +2160,18 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
             "point1_prompt": "one edge of the stumps",
             "point2_prompt": "the other edge of the stumps",
         },
+        # ADDED (2026-08-05, coach request): stump width needs at least two
+        # stumps clearly spaced apart in frame — unusable when only one
+        # stump is visible (partial framing, occlusion, a rear-view camera
+        # positioned close behind one stump). Stump HEIGHT (28 inches =
+        # 0.7112m, the same official standard for every stump on any
+        # ground) is a real, known vertical distance available from just
+        # ONE stump — click its top and where it meets the ground.
+        "Stump height (0.7112m) — works from just one visible stump": {
+            "distance_m": 0.7112, "label": "stump height",
+            "point1_prompt": "the top of one stump",
+            "point2_prompt": "the base of that SAME stump, where it meets the ground",
+        },
         "Popping crease to popping crease (20.12m) — full pitch in frame": {
             "distance_m": 20.12, "label": "popping crease to popping crease",
             "point1_prompt": "the STRIKER END stumps",
@@ -2332,6 +2344,33 @@ if bowling_arm_choice == "Auto-detect (unreliable)":
         "⚠️ Auto-detect has produced wrong-arm results on real footage. "
         "Set Right-arm or Left-arm explicitly for a result you can trust."
     )
+
+# BOWLER TYPE (2026-08-04) — real audit found spin bowling needs its own
+# reference ranges, not fast bowling's: e.g. a wrist-spinner's natural
+# front-knee angle can sit well below what pace's "collapsing knee"
+# threshold would flag, because dropping the center of mass is part of
+# normal wrist-spin technique, not a fault. There is no auto-detection
+# for this (unlike bowling arm) — the coach knows what they filmed.
+# Only front-knee-bracing has a real, correctly-mapped source for
+# wrist-spin so far (see metric_ranges.SPIN_RANGE_OVERRIDES); every other
+# metric — and everything for finger-spin — shows as a plain measured
+# number with no green/amber/red verdict rather than silently borrowing
+# pace's band (a real spinner's normal technique could otherwise get
+# falsely flagged against fast-bowling-calibrated numbers).
+bowler_type_choice = st.sidebar.selectbox(
+    "🌀 Bowler Type",
+    ["Pace (fast bowling)", "Finger-Spin (off-spin / left-arm orthodox)",
+     "Wrist-Spin (leg-spin / left-arm wrist-spin)"],
+    help="Changes which reference ranges your metrics are judged against. "
+         "Where no validated spin-specific range exists yet, that metric shows "
+         "as a plain measurement instead of a pass/fail verdict — see the "
+         "Reference Ranges section in your report for exactly which ones."
+)
+bowler_type = {
+    "Pace (fast bowling)": None,
+    "Finger-Spin (off-spin / left-arm orthodox)": "finger_spin",
+    "Wrist-Spin (leg-spin / left-arm wrist-spin)": "wrist_spin",
+}[bowler_type_choice]
 
 # CAMERA ANGLE (optional manual override) — the geometry-based auto-detect
 # (shoulder-width/height ratio) has been verified to misclassify some real
@@ -3180,6 +3219,7 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     side_extra_seeds=side_extra_seeds, rear_extra_seeds=rear_extra_seeds,
                     side_precomputed=side_stage12_result, rear_precomputed=rear_stage12_result,
                     side_event_overrides=side_confirmed_events, rear_event_overrides=rear_confirmed_events,
+                    bowler_type=bowler_type,
                 )
                 active_camera_mode = "Dual Camera"
             else:
@@ -3261,6 +3301,7 @@ if (single_ready or dual_ready) and _usage["remaining"] > 0:
                     extra_seeds=single_extra_seeds,
                     camera_angle_override=confirmed_angle_functional,
                     precomputed=_stage12,
+                    bowler_type=bowler_type,
                 )
                 active_camera_mode = "Single Camera"
                 st.session_state.pending_angle_label = confirmed_angle_label
@@ -3393,6 +3434,32 @@ if st.session_state.get("pending_result_payload") is not None:
                 )
                 height_absolute_result = se.compute_release_height_absolute(
                     metrics.get("release_height", {}).get("debug_raw"), cap_h, meters_per_pixel=mpp
+                )
+                # Automatic bowler-height estimate — no manual entry, ever
+                # (a coach explicitly said no coach will realistically
+                # provide this): converted through the same stump
+                # calibration. Also a real cross-check on the release-
+                # height cm figure above — a release point taller than
+                # ~1.3x the bowler's own estimated height is implausible
+                # regardless of what the ratio-based check already allows.
+                #
+                # FIX (roadmap item #1, 2026-08-06): this used to reuse
+                # release_height's own debug_raw["body_height"] — the WIDE
+                # early-run-up segment-sum baseline. That's the right
+                # baseline for the release-height RATIO (scale-invariant),
+                # but wrong here: this feature divides by meters_per_pixel,
+                # a scale only valid at the stump-calibration plane's
+                # depth, and early run-up frames are physically much
+                # farther from the stumps than release is. That mismatch
+                # is exactly what produced a real, confirmed 444cm
+                # implausible reading. Use the separate BFC±15 narrow-
+                # window baseline instead — see orchestrator.py's
+                # segment_sum_body_height_for_cm and
+                # _compute_segment_sum_body_height's search_start_frame
+                # docstring for the full reasoning.
+                _segment_sum_for_height = metrics.get("release_height", {}).get("segment_sum_body_height_for_cm")
+                estimated_height_result = se.compute_estimated_standing_height(
+                    _segment_sum_for_height, cap_h, meters_per_pixel=mpp
                 )
 
             # --- RUN-UP ANALYSIS (stride detection + rhythm + strike pattern) ---
@@ -3540,14 +3607,31 @@ if st.session_state.get("pending_result_payload") is not None:
                 def ui_val(val):
                     return str(round(float(val), 4)) if val is not None else "N/A"
 
+                # kinematics.py's own "tier" strings (e.g. "Collapsing Knee
+                # Joint") are pace-calibrated absolute-angle labels,
+                # computed independently of metric_ranges.classify() —
+                # showing one directly for a bowler_type with no validated
+                # range for that metric (see SPIN_RANGE_OVERRIDES) would
+                # silently reintroduce the exact misleading pace-vs-spin
+                # verdict classify()'s "descriptive" tier exists to avoid.
+                _display_bowler_type = result_payload.get("bowler_type")
+                def _tier_caption(metric_key, raw_tier):
+                    if (_display_bowler_type in ("finger_spin", "wrist_spin")
+                            and (metric_key, _display_bowler_type) not in mr.SPIN_RANGE_OVERRIDES):
+                        return "No benchmark yet for this bowling style"
+                    return raw_tier
+
                 detected_arm = metrics.get("bowling_arm_detected")
                 if detected_arm:
                     arm_source = "manually selected" if bowling_arm_override else "auto-detected"
                     st.caption(f"🎯 Bowling arm ({arm_source}): **{detected_arm.title()}-arm**")
+                if _display_bowler_type in ("finger_spin", "wrist_spin"):
+                    _bt_label = {"finger_spin": "Finger-Spin", "wrist_spin": "Wrist-Spin"}[_display_bowler_type]
+                    st.caption(f"🌀 Bowler type: **{_bt_label}** — metrics without a 🔵 dot below have a validated benchmark; 🔵 means descriptive-only (see Reference Ranges).")
 
                 m1, m2 = st.columns(2)
                 m1.metric("Lead Knee Bracing Angle", ui_deg(knee_deg),
-                           metrics.get('front_knee_bracing', {}).get('tier', 'N/A'))
+                           _tier_caption("front_knee_bracing", metrics.get('front_knee_bracing', {}).get('tier', 'N/A')))
                 yield_delta = metrics.get('front_knee_bracing', {}).get('yield_delta_degrees')
                 yield_status = metrics.get('front_knee_bracing', {}).get('yield_status')
                 if yield_delta is not None:
@@ -3559,22 +3643,54 @@ if st.session_state.get("pending_result_payload") is not None:
                     else:
                         m1.caption(f"ℹ️ {round(deg_at_release, 1)}° at release ({yield_delta:+.1f}°)")
                 m2.metric("Hip-Shoulder Rotation Twist", ui_deg(hip_deg),
-                           metrics.get('hip_shoulder_separation', {}).get('tier', 'N/A'))
+                           _tier_caption("hip_shoulder_separation", metrics.get('hip_shoulder_separation', {}).get('tier', 'N/A')))
 
                 st.write("")
                 m3, m4, m5 = st.columns(3)
                 m3.metric("Trunk Lean Deflection", ui_deg(trunk_deg),
-                           metrics.get('trunk_lean', {}).get('tier', 'N/A'))
+                           _tier_caption("trunk_lean", metrics.get('trunk_lean', {}).get('tier', 'N/A')))
                 m4.metric("Release Height Ratio", ui_pct(rel_ratio),
-                           (metrics.get('release_height', {}).get('classification')
-                            or metrics.get('release_height', {}).get('tier', 'N/A')))
+                           _tier_caption("release_height", metrics.get('release_height', {}).get('classification')
+                                         or metrics.get('release_height', {}).get('tier', 'N/A')))
                 if height_absolute_result and height_absolute_result.get("status") == "success":
                     m4.caption(f"📏 {height_absolute_result['cm']} cm above ground (stump-calibrated)")
                 elif height_absolute_result and height_absolute_result.get("status") == "not_calibrated":
                     m4.caption("📏 Calibrate camera (sidebar) for an absolute height in cm")
+                if metrics.get('release_height', {}).get('recalibration_pending'):
+                    m4.caption(
+                        "🔵 Using a newly-corrected body-height measurement (2026-08-05 fix) — "
+                        "more trustworthy than before, but the Optimal/Acceptable bands above "
+                        "haven't been re-tuned for it yet. Treat this reading as directional, "
+                        "not a final verdict."
+                    )
+                if estimated_height_result.get("status") == "success":
+                    m4.caption(f"🧍 Estimated bowler height: ~{estimated_height_result['cm']:.0f} cm (auto, from stump calibration)")
+                    # Real cross-check: a release point taller than ~1.3x
+                    # the bowler's own estimated height is implausible
+                    # regardless of what the ratio-based check upstream
+                    # already allowed (see calculate_release_height_ratio_
+                    # safe's 1.30 ceiling — same real-world reasoning,
+                    # applied here in absolute cm instead of body-ratio terms).
+                    if height_absolute_result and height_absolute_result.get("status") == "success":
+                        _plausible_ceiling_cm = estimated_height_result["cm"] * 1.3
+                        if height_absolute_result["cm"] > _plausible_ceiling_cm:
+                            m4.warning(
+                                f"⚠️ Release height ({height_absolute_result['cm']:.0f}cm) exceeds "
+                                f"1.3x this bowler's estimated height ({estimated_height_result['cm']:.0f}cm) — "
+                                f"likely a tracking or calibration issue, not a real reading."
+                            )
+                elif estimated_height_result.get("status") == "error":
+                    m4.caption(f"⚠️ {estimated_height_result['message']}")
                 m5.metric("Head Stability Variance", ui_val(head_val),
-                           (metrics.get('head_stability', {}).get('classification')
-                            or metrics.get('head_stability', {}).get('tier', 'N/A')))
+                           _tier_caption("head_stability", metrics.get('head_stability', {}).get('classification')
+                                         or metrics.get('head_stability', {}).get('tier', 'N/A')))
+                if metrics.get('head_stability', {}).get('recalibration_pending'):
+                    m5.caption(
+                        "🔵 Using a newly-corrected measurement (2026-08-05 fix, normalized for "
+                        "camera distance) — more trustworthy than before, but the Optimal/Acceptable "
+                        "bands haven't been re-tuned for it yet. Treat this reading as directional, "
+                        "not a final verdict."
+                    )
                 rel_debug = metrics.get('release_height', {}).get('debug_raw')
                 if rel_debug:
                     with st.expander("🔧 Debug Info — Release Height Ratio"):
@@ -3615,14 +3731,21 @@ if st.session_state.get("pending_result_payload") is not None:
                         "release_height": rel_ratio,
                         "head_stability": head_val,
                     }
-                    dot = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪"}
+                    dot = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪", "descriptive": "🔵"}
                     for key in mr.all_metric_keys():
-                        r = mr.RANGES[key]
-                        tier = mr.classify(key, metric_value_lookup.get(key))
-                        st.markdown(
-                            f"**{r.label}** {dot[tier]} — "
-                            f"🟢 Optimal: `{r.display_optimal}`"
-                        ) 
+                        tier = mr.classify(key, metric_value_lookup.get(key), _display_bowler_type)
+                        if tier == "descriptive":
+                            r = mr.RANGES[key]
+                            st.markdown(
+                                f"**{r.label}** {dot[tier]} — "
+                                f"No validated benchmark yet for this bowling style (shown for reference only)"
+                            )
+                        else:
+                            r = mr.SPIN_RANGE_OVERRIDES.get((key, _display_bowler_type), mr.RANGES[key])
+                            st.markdown(
+                                f"**{r.label}** {dot[tier]} — "
+                                f"🟢 Optimal: `{r.display_optimal}`"
+                            )
                     
 
             with col_insights:
@@ -3660,6 +3783,7 @@ if st.session_state.get("pending_result_payload") is not None:
                     phase_durations=phase_durations,
                     speed_result=speed_result,
                     quality=quality,
+                    bowler_type=result_payload.get("bowler_type"),
                 )
                 st.download_button(
                     label="📄 Download Official PDF Report",
@@ -3702,6 +3826,14 @@ if st.session_state.get("pending_result_payload") is not None:
                         **metrics,
                         "_data_quality": quality,
                         "_run_up": {"analysis": run_up_result, "strike_summary": strike_summary},
+                        # Saved inside metrics (a flexible JSON column) rather
+                        # than as a new "sessions" table column — same reason
+                        # bowling_arm_detected already lives nested here, not
+                        # as its own column: no schema migration needed, and
+                        # the Bowler Profile history page can read it straight
+                        # back out to re-classify past sessions with the
+                        # correct spin/pace bands instead of assuming pace.
+                        "bowler_type": result_payload.get("bowler_type"),
                         # Coach-confirmed camera angle, not a guess — real labeled
                         # data for a future trained angle classifier (Phase 2),
                         # collected for free as a side effect of normal use.
@@ -3768,10 +3900,19 @@ st.sidebar.divider()
 with st.sidebar.expander("📐 Camera Positioning Guide", expanded=False):
     st.markdown("""
 **For maximum tracking accuracy:**
-- **Right-arm bowlers:** Camera on the **left** side of the pitch
-- **Left-arm bowlers:** Camera on the **right** side of the pitch
-- **Alignment:** Parallel to the popping crease line
-- **Distance:** 10–12 feet from the bowler
+
+*Camera setup*
+- **Right-arm bowlers:** Camera on the **left** side of the pitch. **Left-arm bowlers:** camera on the **right**
+- **Alignment:** Parallel to the popping crease line, roughly 10–12 feet back
+- **Mount:** Tripod or another stable stand — handheld shake degrades tracking on every metric
+
+*Framing*
+- Keep the bowler's **full body** (head to feet) in shot from run-up through follow-through — several measurements are built from early run-up frames, not just the release moment
+- Don't zoom out just to fit a longer run-up — if the bowler becomes a tiny speck early on, tracking can fail to detect them at all. A cropped start to the run-up is fine; staying a clearly-sized figure throughout matters more
+- Keep at least **one full stump** clearly visible and unobstructed — used for automatic speed/height calibration
+
+*Recording*
 - **Frame rate:** 30 or 60 FPS only
+- **Lighting:** Even lighting works best — avoid filming straight into the sun or floodlights
 - **Dual camera:** Both phones start recording before the bowler begins run-up
 """)

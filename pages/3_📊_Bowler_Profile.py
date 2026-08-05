@@ -187,7 +187,8 @@ if not history:
 
 METRIC_KEYS = ["front_knee_bracing", "hip_shoulder_separation", "trunk_lean", "release_height", "head_stability"]
 
-TIER_LABELS = {"green": "Optimal", "amber": "Acceptable", "red": "Concern", "unknown": "No data"}
+TIER_LABELS = {"green": "Optimal", "amber": "Acceptable", "red": "Concern", "unknown": "No data",
+               "descriptive": "Descriptive (no benchmark)"}
 
 
 def _parse_date(raw):
@@ -203,13 +204,17 @@ def _parse_date(raw):
 # reverse for chronological charting
 latest = history[0]
 latest_metrics = latest.get("metrics", {}) or {}
+# bowler_type lives inside the saved metrics blob (no schema migration —
+# same reasoning as bowling_arm_detected) — None for every session saved
+# before this feature existed, which correctly falls back to pace bands.
+latest_bowler_type = latest_metrics.get("bowler_type")
 
 st.subheader(f"Latest session — {(_parse_date(latest.get('session_date')) or datetime.now()).strftime('%b %d, %Y')}")
 
 stat_cols = st.columns(len(METRIC_KEYS))
 for col, key in zip(stat_cols, METRIC_KEYS):
     value = mr.extract_metric_value(latest_metrics, key)
-    tier = mr.classify(key, value)
+    tier = mr.classify(key, value, latest_bowler_type)
     tier_color = mr.TIER_COLORS[tier]
     display_value = mr.format_value(key, value) if value is not None else "—"
     with col:
@@ -233,8 +238,16 @@ st.caption("Shaded bands show the same optimal / acceptable / concern zones used
 chronological = list(reversed(history))
 dates = [_parse_date(s.get("session_date")) for s in chronological]
 
-def _zone_shapes(metric_key: str, y_axis_max: float, y_axis_min: float = 0.0):
-    r = mr.RANGES[metric_key]
+def _zone_shapes(metric_key: str, y_axis_max: float, y_axis_min: float = 0.0, bowler_type: str = None):
+    """
+    Shaded background bands for the chart. Uses the same bowler_type-aware
+    lookup as classify() — for a spin bowler_type with no validated range
+    for this metric (see SPIN_RANGE_OVERRIDES), there is no real band to
+    shade, so this returns no shapes rather than drawing pace's.
+    """
+    if bowler_type in ("finger_spin", "wrist_spin") and (metric_key, bowler_type) not in mr.SPIN_RANGE_OVERRIDES:
+        return []
+    r = mr.SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type), mr.RANGES[metric_key])
     shapes = []
 
     def band(lo, hi, tier):
@@ -267,13 +280,19 @@ chart_cols = st.columns(2)
 for i, key in enumerate(METRIC_KEYS):
     r = mr.RANGES[key]
     raw_values = [mr.extract_metric_value(s.get("metrics", {}) or {}, key) for s in chronological]
+    # Each session may be a different bowler_type (a bowler's own history
+    # could span before/after this feature existed, or a genuine style
+    # change) — classify each POINT against its own session's type. None
+    # for any session saved before bowler_type existed, which correctly
+    # falls back to pace bands, same as it always has.
+    session_bowler_types = [(s.get("metrics", {}) or {}).get("bowler_type") for s in chronological]
 
     plot_x, plot_y, plot_colors, plot_text = [], [], [], []
-    for d, v in zip(dates, raw_values):
+    for d, v, bt in zip(dates, raw_values, session_bowler_types):
         if d is None or v is None:
             continue
         display_v = v * 100 if r.unit == "%" else v
-        tier = mr.classify(key, v)
+        tier = mr.classify(key, v, bt)
         plot_x.append(d)
         plot_y.append(display_v)
         plot_colors.append(mr.TIER_COLORS[tier])
@@ -286,13 +305,20 @@ for i, key in enumerate(METRIC_KEYS):
             st.caption("Need at least 2 sessions with a valid reading to plot a trend." if plot_x else "No valid readings recorded yet for this metric.")
             continue
 
+        # The shaded background band can only show ONE reference at a
+        # time — uses the most recent session's bowler_type (most relevant
+        # to "where do I stand now"). Each POINT's own color/tooltip above
+        # is still always classified against ITS OWN session's type, so a
+        # style change over time still reads correctly point-by-point even
+        # though the background shading reflects only the latest one.
+        chart_range = mr.SPIN_RANGE_OVERRIDES.get((key, latest_bowler_type), r)
         y_scale = 100 if r.unit == "%" else 1
-        g_lo, g_hi = r.green[0] * y_scale, r.green[1] * y_scale
+        g_lo, g_hi = chart_range.green[0] * y_scale, chart_range.green[1] * y_scale
         data_max = max(plot_y)
         data_min = min(plot_y)
-        ceiling_ref = r.amber_high[1] * y_scale if r.kind == "band" else g_hi
+        ceiling_ref = chart_range.amber_high[1] * y_scale if chart_range.kind == "band" else g_hi
         y_axis_max = max(data_max, ceiling_ref) * 1.15
-        y_axis_min = min(data_min, r.amber[0] * y_scale) * 0.85 if r.kind != "lower_better" else 0
+        y_axis_min = min(data_min, chart_range.amber[0] * y_scale) * 0.85 if chart_range.kind != "lower_better" else 0
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(
@@ -309,7 +335,7 @@ for i, key in enumerate(METRIC_KEYS):
         )
         fig.update_layout(
             title=dict(text=f"{r.label} ({r.unit})" if r.unit else r.label, font=dict(color="#E2E8F0", size=15)),
-            shapes=_zone_shapes(key, y_axis_max, y_axis_min),
+            shapes=_zone_shapes(key, y_axis_max, y_axis_min, latest_bowler_type),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#94A3B8"),
             xaxis=dict(gridcolor="#1E3A5F", showgrid=False, zeroline=False),
@@ -333,10 +359,11 @@ for s in history:
         "Speed (km/h)": s.get("release_arm_speed_kmh") or "—",
     }
     m = s.get("metrics", {}) or {}
+    session_bowler_type = m.get("bowler_type")
     for key in METRIC_KEYS:
         value = mr.extract_metric_value(m, key)
-        tier = mr.classify(key, value)
-        icon = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪"}[tier]
+        tier = mr.classify(key, value, session_bowler_type)
+        icon = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪", "descriptive": "🔵"}[tier]
         row[mr.RANGES[key].label] = f"{icon} {mr.format_value(key, value)}" if value is not None else "⚪ —"
     table_rows.append(row)
 

@@ -195,3 +195,83 @@ class TestFormatValuePercentUnits:
         desc = mr.describe_range("batting_weight_transfer")
         assert "40%+" in desc
         assert "4000%" not in desc
+
+
+class TestBowlerTypeClassification:
+    """
+    Spin-bowling support (2026-08-04): bowler_type defaults to None, which
+    must behave IDENTICALLY to every pre-existing call site that doesn't
+    pass it — pace bowling's classification must never change. A spin
+    bowler_type with no entry in SPIN_RANGE_OVERRIDES for a given metric
+    must classify as "descriptive" (a real, measured value with no
+    invented pass/fail verdict) rather than silently falling back to
+    pace's band — a real spinner's normal technique could otherwise get
+    falsely flagged against fast-bowling-calibrated numbers.
+
+    front_knee_bracing/wrist_spin is sourced from Goswami, Srivastava &
+    Rajpoot (2016) — 5 real leg-spin bowlers, front/lead knee angle at
+    release: mean 162.4 +/- 13.3 deg, observed range 134-187 (their
+    "Knee Joint LEFT" column; all 5 bowlers were right-handed, so the
+    front/lead leg is the left one, same convention kinematics.py uses).
+    """
+
+    def test_no_bowler_type_matches_default_two_arg_call(self):
+        """Every existing call site in the codebase calls classify(key,
+        value) with no third argument — bowler_type must default to
+        exactly that same pace behavior, not require every caller to be
+        updated."""
+        assert mr.classify("front_knee_bracing", 160.0) == mr.classify("front_knee_bracing", 160.0, None)
+        assert mr.classify("front_knee_bracing", 150.0) == mr.classify("front_knee_bracing", 150.0, None)
+
+    def test_pace_bowler_type_is_identical_to_default(self):
+        assert mr.classify("front_knee_bracing", 150.0, "pace") == mr.classify("front_knee_bracing", 150.0)
+
+    def test_wrist_spin_front_knee_uses_the_real_override(self):
+        # Pace would call all three of these "amber" or "red" (below its
+        # 160/145 thresholds) — a real wrist-spinner's naturally lower,
+        # more-flexed knee at release is normal technique, not a flaw.
+        assert mr.classify("front_knee_bracing", 160.0, "wrist_spin") == "green"
+        assert mr.classify("front_knee_bracing", 150.0, "wrist_spin") == "green"
+        assert mr.classify("front_knee_bracing", 134.0, "wrist_spin") == "green"
+        assert mr.classify("front_knee_bracing", 125.0, "wrist_spin") == "amber"
+        assert mr.classify("front_knee_bracing", 110.0, "wrist_spin") == "red"
+
+    def test_finger_spin_front_knee_has_no_override_so_is_descriptive(self):
+        """No real, correctly-mapped source was found for finger-spin
+        front-knee angle — must show as descriptive, not inherit pace's
+        band or wrist-spin's override."""
+        assert mr.classify("front_knee_bracing", 160.0, "finger_spin") == "descriptive"
+        assert mr.classify("front_knee_bracing", 100.0, "finger_spin") == "descriptive"
+
+    @pytest.mark.parametrize("bowler_type", ["finger_spin", "wrist_spin"])
+    @pytest.mark.parametrize("metric_key", [
+        "hip_shoulder_separation", "trunk_lean", "release_height", "head_stability",
+    ])
+    def test_metrics_with_no_spin_override_are_descriptive_for_both_spin_types(self, metric_key, bowler_type):
+        """Only front_knee_bracing/wrist_spin has a real override — every
+        other metric, for either spin type, must never silently borrow
+        pace's band."""
+        assert mr.classify(metric_key, 30.0, bowler_type) == "descriptive"
+
+    def test_descriptive_never_fires_for_a_missing_value(self):
+        """A None/NaN value is "unknown" regardless of bowler_type — never
+        conflate "we have no benchmark" with "we have no measurement"."""
+        assert mr.classify("hip_shoulder_separation", None, "wrist_spin") == "unknown"
+        assert mr.classify("hip_shoulder_separation", float("nan"), "finger_spin") == "unknown"
+
+    def test_describe_range_states_no_benchmark_for_a_descriptive_metric(self):
+        desc = mr.describe_range("hip_shoulder_separation", "wrist_spin")
+        assert "no validated" in desc.lower()
+        assert "wrist-spin" in desc.lower()
+
+    def test_describe_range_reflects_the_real_wrist_spin_knee_override(self):
+        desc = mr.describe_range("front_knee_bracing", "wrist_spin")
+        assert "134" in desc
+        # Must NOT describe pace's 160-180 band for a wrist-spin bowler.
+        assert "160" not in desc
+
+    def test_describe_range_default_is_unaffected(self):
+        """Same regression this whole class exists to prevent, applied to
+        describe_range: the pre-existing 2-arg call must be untouched."""
+        assert mr.describe_range("front_knee_bracing") == mr.describe_range("front_knee_bracing", None)
+        assert "160" in mr.describe_range("front_knee_bracing")

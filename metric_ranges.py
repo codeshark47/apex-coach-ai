@@ -29,6 +29,11 @@ TIER_COLORS = {
     "amber": "#FFB300",
     "red": "#FF3D3D",
     "unknown": "#94A3B8",
+    # Distinct from "unknown" (value missing/NaN) — "descriptive" means the
+    # value IS real, but no validated green/amber/red benchmark exists for
+    # this bowler_type yet (see SPIN_RANGE_OVERRIDES). A neutral info-blue,
+    # not gray, so it doesn't read as "we failed to measure this."
+    "descriptive": "#3B82F6",
 }
 
 TIER_COLORS_PDF = {
@@ -37,6 +42,7 @@ TIER_COLORS_PDF = {
     "amber": "#FFF3D6",
     "red": "#FDE0E0",
     "unknown": "#EDF2F7",
+    "descriptive": "#DCEEFB",
 }
 
 
@@ -121,9 +127,20 @@ RANGES = {
         label="Head Stability",
         unit="",
         kind="lower_better",
-        green=(0.0, 0.02),
-        amber=(0.02, 0.05),
-        display_optimal="0.00–0.02",
+        # BUG FIX (2026-08-05): kinematics.calculate_head_stability used
+        # to measure raw std(nose_x) — a camera-distance-dependent number,
+        # same class of bug release_height's body-height baseline had —
+        # against these same 0.02/0.05 bounds. Now normalized by same-
+        # frame shoulder width (matching calculate_weight_transfer's
+        # stance-width pattern), so the underlying scale changed
+        # entirely. These bounds are a PROVISIONAL first-pass estimate
+        # (a rough conversion of the old, itself-never-validated
+        # thresholds), not yet checked against real multi-clip data —
+        # see calculate_head_stability's recalibration_pending flag,
+        # same reasoning as release_height's.
+        green=(0.0, 0.08),
+        amber=(0.08, 0.15),
+        display_optimal="0.00–0.08",
     ),
 
     # --- BATTING METRICS (2026-08-03) ---
@@ -140,9 +157,16 @@ RANGES = {
         label="Head Movement (Stance to Contact)",
         unit="",
         kind="lower_better",
-        green=(0.0, 0.02),
-        amber=(0.02, 0.05),
-        display_optimal="0.00–0.02",
+        # BUG FIX (2026-08-05): this reuses kinematics.calculate_head_
+        # stability wholesale (see that function), which was just fixed
+        # to normalize by same-frame shoulder width instead of measuring
+        # raw camera-distance-dependent pixel deviation — same class of
+        # bug release_height's body-height baseline had. These bounds
+        # moved to match that new scale; still a PROVISIONAL first-pass
+        # estimate, not yet checked against real multi-clip data.
+        green=(0.0, 0.08),
+        amber=(0.08, 0.15),
+        display_optimal="0.00–0.08",
     ),
     "batting_front_foot_alignment": MetricRange(
         # REDESIGNED (2026-08-03, coach requirement: front-foot alignment
@@ -222,6 +246,65 @@ RANGES = {
     ),
 }
 
+# --- SPIN-BOWLING SUPPORT (2026-08-04) ---
+#
+# bowler_type: None (default) | "pace" | "finger_spin" | "wrist_spin".
+# None and "pace" are equivalent — both mean "classify against RANGES
+# above, exactly as every existing caller already does." Every existing
+# call site that doesn't pass bowler_type keeps working identically; this
+# is purely additive.
+#
+# RULE (do not violate): a spin bowler_type NEVER silently falls back to
+# a pace-calibrated band for a metric it doesn't have its own entry for.
+# Evaluated and rejected doing that during design — a real spinner's
+# normal, correct technique could get falsely flagged against numbers
+# calibrated for fast bowlers (concretely: the front-knee-bracing
+# research below shows wrist-spinners' own natural range sits partly
+# below pace's "amber/red" cutoffs). Any (metric, bowler_type) pair not
+# listed in SPIN_RANGE_OVERRIDES classifies as "descriptive" instead —
+# the real measured value, shown with no invented pass/fail verdict.
+#
+# Real literature audit (full sourcing in project history — do not add an
+# entry here without an equally real, correctly-mapped source):
+#   - front_knee_bracing / wrist_spin: Goswami, Srivastava & Rajpoot
+#     (2016), "A Biomechanical Analysis of Spin Bowling in Cricket",
+#     European Journal of Physical Education and Sport Science 2(6).
+#     5 real leg-spin bowlers, 30 deliveries, joint angles at ball release
+#     via video analysis. All 5 bowlers were right-handed, so — same
+#     lead-side convention kinematics.py already uses (front/lead leg is
+#     opposite the bowling arm) — their "Knee Joint LEFT" column is the
+#     front/lead knee: mean 162.4 +/- 13.3 deg, observed range 134-187.
+#     (Their "Knee Joint RIGHT" column, 131.6 +/- 9.8, is the TRAILING
+#     leg — a real, checked mix-up an external AI suggestion made when
+#     proposing a range for this metric; the trailing leg is naturally
+#     more flexed than the bracing leg, which is exactly the 131.6 vs
+#     162.4 split observed.) N=5 at interuniversity level — a real
+#     starting reference, not a definitive international-elite standard;
+#     used here as the full observed range rather than a tighter mean+/-SD
+#     band, given how small the sample is.
+#   - Everything else (hip_shoulder_separation, release_height,
+#     trunk_lean, head_stability) for EITHER spin type, and everything
+#     for finger_spin including front_knee_bracing: no real, correctly-
+#     mapped source was found. Real finger-spin research exists (Chin et
+#     al. 2009; a 23-bowler Loughborough kinematics study) but reports
+#     correlation/variance-explained statistics for pelvis and hip
+#     rotation, not a validated target angle band for any metric this
+#     app currently computes — that's a real, separate metric worth
+#     building later, not a substitute range for an existing one.
+SPIN_RANGE_OVERRIDES = {
+    ("front_knee_bracing", "wrist_spin"): MetricRange(
+        label="Lead Knee Bracing",
+        unit="°",
+        kind="higher_better",
+        green=(134.0, 187.0),
+        amber=(119.0, 134.0),
+        display_optimal="134–187°",
+    ),
+}
+
+_SPIN_BOWLER_TYPES = ("finger_spin", "wrist_spin")
+
+
 # Explicit, hardcoded lists (not "everything in RANGES") so adding either
 # sport's metrics can never silently change what the OTHER sport's
 # coaching report/PDF iterates over — see all_metric_keys()/
@@ -237,10 +320,15 @@ _BATTING_METRIC_KEYS = [
 ]
 
 
-def classify(metric_key: str, value) -> str:
+def classify(metric_key: str, value, bowler_type: str = None) -> str:
     """
-    Returns one of "green", "amber", "red", "unknown".
-    "unknown" only fires when value is None/NaN — never fabricated.
+    Returns one of "green", "amber", "red", "unknown", "descriptive".
+    "unknown" fires when value is None/NaN — never fabricated.
+    "descriptive" fires when bowler_type is a spin type ("finger_spin" or
+    "wrist_spin") and no validated range exists for this metric+type in
+    SPIN_RANGE_OVERRIDES — the real value with no invented pass/fail
+    verdict, never a silent fallback to pace's band. See the module-level
+    comment above SPIN_RANGE_OVERRIDES for the full reasoning and sourcing.
     """
     if metric_key not in RANGES:
         raise KeyError(
@@ -256,7 +344,13 @@ def classify(metric_key: str, value) -> str:
     if v != v:  # NaN check without importing math/numpy
         return "unknown"
 
-    r = RANGES[metric_key]
+    r = None
+    if bowler_type in _SPIN_BOWLER_TYPES:
+        r = SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type))
+        if r is None:
+            return "descriptive"
+    if r is None:
+        r = RANGES[metric_key]
     g_lo, g_hi = r.green
     a_lo, a_hi = r.amber
 
@@ -302,13 +396,23 @@ def all_batting_metric_keys():
     return list(_BATTING_METRIC_KEYS)
 
 
-def describe_range(metric_key: str) -> str:
+def describe_range(metric_key: str, bowler_type: str = None) -> str:
     """
     Human-readable description of a metric's zones, generated from RANGES —
     used by the Gemini coaching prompt so it can never hardcode a second,
     driftable copy of these numbers.
+
+    For a spin bowler_type with no entry in SPIN_RANGE_OVERRIDES, returns a
+    line saying so explicitly instead of describing pace's band — the
+    prompt must never present a fast-bowling-calibrated range as if it
+    applied to a spinner (see classify()'s "descriptive" tier).
     """
-    r = RANGES[metric_key]
+    if bowler_type in _SPIN_BOWLER_TYPES and (metric_key, bowler_type) not in SPIN_RANGE_OVERRIDES:
+        label = RANGES[metric_key].label
+        return (f"- {label}: No validated {bowler_type.replace('_', '-')} benchmark yet — "
+                f"reported as a descriptive measurement only, not a pass/fail zone.")
+
+    r = SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type), RANGES[metric_key])
 
     def fv(v):
         if r.unit != "%":

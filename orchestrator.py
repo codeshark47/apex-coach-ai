@@ -110,6 +110,148 @@ def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm:
     return None
 
 
+def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_end_frame: int = None,
+                                      search_start_frame: int = None):
+    """
+    Real body-height reference for calculate_release_height_ratio_safe,
+    robust to whatever posture the release-adjacent reference frame
+    happens to show — see that function's body_height, which used to
+    just measure raw vertical head-to-ankle screen distance in ONE frame.
+    That collapses for ANY bent posture, correctly tracked or not:
+    confirmed on a real session where the reference frame visibly showed
+    the bowler bent forward with his head near his knee, body_height came
+    out at 0.0531 (barely above MIN_BODY_HEIGHT_SPAN's 0.05 floor), and
+    the resulting release-height ratio was 240% — reported as "OPTIMAL /
+    High-Release Leverage" with no warning at all.
+
+    Fix: sum the real skeletal segment lengths (nose-to-shoulder +
+    shoulder-to-hip + hip-to-knee + knee-to-ankle) from several EARLY
+    run-up frames — strictly before Back Foot Contact, i.e. before any
+    delivery-specific gather/bend — where a bowler is reliably upright
+    and just running. The head segment is included deliberately: the old
+    method measured ankle-to-NOSE (a near-full-body span), so leaving the
+    head out here would make this baseline systematically smaller than
+    the old one by a head+neck length (~10-13% of standing height) even
+    on a perfectly good clip — not fixing the bug, just replacing it with
+    a different, systematic distortion that would silently recalibrate
+    every existing High-Release-Leverage/Low-Sling threshold.
+    A person's actual bone lengths don't change frame to frame, so once
+    established this is valid for the rest of the clip regardless of
+    what posture ANY later reference frame shows. Euclidean segment
+    length (not a single vertical projection) is also far less sensitive
+    to a person angled somewhat toward/away from the camera than a raw
+    head-to-ankle screen span is.
+
+    Takes a HIGH PERCENTILE (not the median) across every plausible early
+    frame, for a real, confirmed reason: bending ANY joint along this
+    chain can only ever make its 2D Euclidean segment length look
+    SHORTER than the bowler's true, fully-extended length (a bent knee
+    brings the ankle closer to the hip in the image), never longer — so
+    the true length is best estimated near the top of the observed
+    distribution, not its middle. Median was tried first and found
+    broken on real footage: a coach is RUNNING during early run-up, so
+    at any given instant the lead leg is very often mid-swing (knee
+    lifted, ankle temporarily above the knee) — completely normal gait,
+    not a tracking problem, but it makes "the knee/ankle stay stacked in
+    strict top-to-bottom order" a bad plausibility test; on one real
+    clip it rejected all but 3 of 169 otherwise-good early frames,
+    landing right on this function's own minimum-samples floor, one run-
+    to-run wobble away from silently falling back to the very bug this
+    function exists to fix. Only the TORSO is checked for being upright
+    now (nose above shoulder above hip — no genuine trunk bend) since
+    that's the actual failure mode being guarded against; the leg chain
+    is allowed to be mid-stride, and the percentile step is what makes
+    that safe.
+
+    Returns None if fewer than MIN_PLAUSIBLE_SAMPLES qualifying early
+    frames exist (e.g. a clip that starts mid-run-up, already close to
+    delivery) — callers must fall back to the old single-frame method
+    rather than trust a baseline built from too little evidence.
+
+    search_start_frame (2026-08-06 roadmap item #1): optional lower bound,
+    for callers that want a NARROW window (e.g. BFC-15..BFC+15) instead of
+    the wide 0..BFC run-up scan above. This exists for a DIFFERENT purpose
+    than the ratio baseline this function was originally built for: the
+    release-height RATIO baseline is scale-invariant (it's a ratio of two
+    screen-space measurements from the same camera setup, so it doesn't
+    matter that early run-up frames are physically farther from the
+    stumps than the release point is) — but the absolute-cm standing-
+    height ESTIMATE feature divides by meters_per_pixel, a scale that's
+    only valid at the stump-calibration plane's depth. A bowler standing
+    30+ feet up the run-up is measurably smaller on screen than at the
+    crease purely from monocular perspective, NOT because he's actually
+    shorter — using the same wide early-run-up baseline for both was
+    exactly what produced a real, confirmed 444cm implausible reading.
+    Sampling only frames near BFC (much closer to the crease/stump depth)
+    keeps the absolute-height estimate on the same depth plane the
+    calibration was taken at, without touching the already-proven wide-
+    window ratio baseline at all.
+    """
+    lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+    required = [
+        "NOSE_x", "NOSE_y", "LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
+        f"{lead_side}_HIP_x", f"{lead_side}_HIP_y", f"{lead_side}_KNEE_x", f"{lead_side}_KNEE_y",
+        f"{lead_side}_ANKLE_x", f"{lead_side}_ANKLE_y",
+    ]
+
+    EARLY_FRAME_WINDOW = 300  # frames — used only when no BFC boundary is available
+    MIN_PLAUSIBLE_SAMPLES = 10  # raised now that a normal running window easily clears this
+    HEIGHT_PERCENTILE = 90  # near the top of the observed range, not the max (a single glitch that slipped past the upstream Hampel filter shouldn't set the whole baseline)
+
+    # REAL BUG FOUND (2026-08-05, via diagnostic logging on an actual live
+    # run): this used to cap the search at EARLY_FRAME_WINDOW*3 (180
+    # frames) on the theory that scanning further was wasteful. On a real
+    # clip, MediaPipe detected NO person at all for the first 200 frames
+    # (he's presumably too small/distant early on — the exact same
+    # phenomenon main.py's own min_pose_detection_confidence comment
+    # already documents) then tracked perfectly well from 201-388, right
+    # up to BFC — 188 good frames this cap made invisible, forcing a
+    # silent fallback to the broken old method every time. Scanning a
+    # few hundred extra already-loaded DataFrame rows costs nothing
+    # real; searching the FULL 0-to-BFC range (uncapped, aside from a
+    # generous absolute ceiling for the no-BFC fallback case) is the
+    # correct tradeoff, not scanning less.
+    end = search_end_frame if search_end_frame is not None else EARLY_FRAME_WINDOW
+    end = max(1, min(end, 700))  # generous absolute ceiling, not a tight multiple of the window
+    if search_start_frame is not None:
+        # Narrow-window mode (see docstring above) — bounded on both
+        # sides, unlike the wide 0..end run-up scan.
+        start = max(0, search_start_frame)
+        candidates = df[(df["frame"] >= start) & (df["frame"] < end)]
+    else:
+        candidates = df[df["frame"] < end]
+
+    segment_sums = []
+    for _, row in candidates.iterrows():
+        if any(pd.isna(row.get(c)) for c in required):
+            continue
+        nose_x, nose_y = float(row["NOSE_x"]), float(row["NOSE_y"])
+        sh_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
+        sh_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
+        hip_x, hip_y = float(row[f"{lead_side}_HIP_x"]), float(row[f"{lead_side}_HIP_y"])
+        knee_x, knee_y = float(row[f"{lead_side}_KNEE_x"]), float(row[f"{lead_side}_KNEE_y"])
+        ankle_x, ankle_y = float(row[f"{lead_side}_ANKLE_x"]), float(row[f"{lead_side}_ANKLE_y"])
+
+        # TORSO-ONLY plausibility gate: genuinely upright spine (no bend
+        # at the trunk — the actual failure mode this function guards
+        # against). Deliberately does NOT require the leg chain to be
+        # stacked too — see the docstring above for why that broke on
+        # real running footage.
+        if not (hip_y > sh_y > nose_y):
+            continue
+
+        head = float(np.hypot(sh_x - nose_x, sh_y - nose_y))
+        torso = float(np.hypot(hip_x - sh_x, hip_y - sh_y))
+        thigh = float(np.hypot(knee_x - hip_x, knee_y - hip_y))
+        shin = float(np.hypot(ankle_x - knee_x, ankle_y - knee_y))
+        segment_sums.append(head + torso + thigh + shin)
+
+    if len(segment_sums) < MIN_PLAUSIBLE_SAMPLES:
+        return None
+
+    return float(np.percentile(segment_sums, HEIGHT_PERCENTILE))
+
+
 def detect_bowling_arm(df: pd.DataFrame) -> str:
     """
     Auto-detects which arm is the bowling arm by comparing vertical
@@ -618,11 +760,27 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
 
 def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right",
                                          reference_row: pd.Series = None,
-                                         wrist_override_norm: tuple = None) -> dict:
+                                         wrist_override_norm: tuple = None,
+                                         segment_sum_body_height: float = None) -> dict:
     """
     Calculates release height leverage ratio with expanded real-world tolerances.
     Prevents N/A dropouts on high-arm actions or varied camera distances.
     bowling_arm: 'right' or 'left' — determines which wrist measures release.
+
+    segment_sum_body_height: optional pre-computed body-height reference
+    from _compute_segment_sum_body_height (real skeletal segment lengths
+    summed from several early, reliably-upright run-up frames) — used as
+    the denominator INSTEAD OF the raw vertical head-to-ankle span on
+    reference_row when given. Confirmed on real footage: that raw span
+    collapses for ANY bent reference-frame posture (0.0531 from a frame
+    showing the bowler bent forward near the ground), inflating the ratio
+    to 240% and reporting it as "OPTIMAL" with no warning. The ankle
+    landmark on reference_row is still used for the ratio's NUMERATOR
+    (how far above the ground the wrist reached) and for the plausibility
+    checks below — a standing bowler's ankle stays near ground level
+    regardless of trunk bend, so only the head-based DENOMINATOR was ever
+    the fragile part. Defaults to None (uses the old head/ankle span) for
+    backward compatibility with any caller not yet passing it.
 
     reference_row: optional row (typically the FFC/front-foot-plant frame)
     used for the ankle+head "body height" measurement instead of br_row.
@@ -687,13 +845,17 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
                 "error_message": "One or more landmarks missing on BR frame."
             }
 
-        body_height = abs(float(y_ankle) - float(y_head))
+        raw_span_body_height = abs(float(y_ankle) - float(y_head))
+        using_segment_sum = segment_sum_body_height is not None and segment_sum_body_height > 0
+        body_height = float(segment_sum_body_height) if using_segment_sum else raw_span_body_height
 
         debug_raw = {
             "y_wrist": round(float(y_wrist), 4),
             "y_head": round(float(y_head), 4),
             "y_ankle": round(float(y_ankle), 4),
             "body_height": round(float(body_height), 4),
+            "body_height_source": "segment_sum" if using_segment_sum else "head_ankle_span",
+            "raw_head_ankle_span": round(float(raw_span_body_height), 4),
             "bowl_side_used": bowl_side,
             "ankle_side_used": ankle_side,
         }
@@ -772,7 +934,29 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         else:
             classification = "Low-Sling Action"
 
-        return {"ratio": ratio, "classification": classification, "status": "success", "debug_raw": debug_raw}
+        # RECALIBRATION FLAG (2026-08-05): switching the denominator from a
+        # raw head-ankle span to the segment-sum baseline is a genuine
+        # measurement improvement (fixes a real 240% false-OPTIMAL bug),
+        # but it changes what the ratio typically comes out to — a
+        # forward-leaning release frame's raw span was often smaller than
+        # the bowler's true standing height, so ratios computed the old
+        # way ran systematically higher. The 0.85/0.75 tier cutoffs below
+        # were tuned via real testing against THAT old, more lenient
+        # basis, not a cited external standard — they have not yet been
+        # re-validated against this new, stricter measurement. Rather than
+        # present a newly-shifted classification with the same unqualified
+        # confidence as before, flag it so every caller (UI, PDF, AI
+        # narrative) can tell a coach honestly that the number is real and
+        # more trustworthy than before, but the pass/fail band it's
+        # compared against is still provisional. Remove this flag (and
+        # this comment) once real data across enough clips justifies
+        # re-tuning 0.85/0.75 for the new basis.
+        recalibration_pending = using_segment_sum
+
+        return {
+            "ratio": ratio, "classification": classification, "status": "success",
+            "debug_raw": debug_raw, "recalibration_pending": recalibration_pending,
+        }
 
     except Exception as e:
         monitoring.capture(e)
@@ -822,7 +1006,8 @@ def generate_fail_safe_video(video_path: str, output_path: str,
                               df: pd.DataFrame, events: dict,
                               slow_motion_factor: float = 4.0,
                               bowling_arm: str = "right",
-                              camera_angle: str = "side_on"):
+                              camera_angle: str = "side_on",
+                              bowler_type: str = None):
     """
     Thin delegating wrapper — the actual rendering logic now lives in
     video_overlay.render_annotated_video (moved out into its own module
@@ -834,6 +1019,9 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     behavior, side_on) — existing callers that don't pass it are
     unaffected; see video_overlay.py for what it actually changes (an
     on-video angle indicator, nothing that touches the skeleton/metrics).
+    bowler_type ("finger_spin"/"wrist_spin"/None) is new the same way —
+    changes only which metric_ranges.classify() band the skeleton
+    color-coding uses, defaults to None (pace behavior, unchanged).
     """
     import video_overlay
     return video_overlay.render_annotated_video(
@@ -841,6 +1029,7 @@ def generate_fail_safe_video(video_path: str, output_path: str,
         slow_motion_factor=slow_motion_factor,
         bowling_arm=bowling_arm,
         camera_angle=camera_angle,
+        bowler_type=bowler_type,
     )
 
 
@@ -1217,7 +1406,8 @@ def run_complete_bowling_analysis(video_path: str,
                                    seed_frame_index: int = 0,
                                    extra_seeds: list = None,
                                    camera_angle_override: str = None,
-                                   precomputed: dict = None) -> dict:
+                                   precomputed: dict = None,
+                                   bowler_type: str = None) -> dict:
     """
     Core orchestration loop.
     Extracts landmarks, detects events, calculates all 5 biomechanical
@@ -1249,6 +1439,12 @@ def run_complete_bowling_analysis(video_path: str,
     extract_and_detect_events — reuses it instead of re-running extraction,
     for callers (the Streamlit UI) that already ran that stage to show the
     camera-angle confirmation before this function is called.
+
+    bowler_type: None (default, = pace) | "finger_spin" | "wrist_spin" —
+    a coach-supplied classification (there's no auto-detection for this,
+    unlike bowling_arm), used only downstream at classification/video-
+    coloring time (see metric_ranges.SPIN_RANGE_OVERRIDES). Does not
+    change any of the actual kinematic calculations below.
     """
     if precomputed is not None and precomputed.get("status") == "success":
         stage12 = precomputed
@@ -1311,6 +1507,28 @@ def run_complete_bowling_analysis(video_path: str,
         height_reference_row = _nearest_complete_row(
             df, events["FFC"], ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
         )
+    # Real body-height reference for release_height, built from several
+    # reliably-upright early run-up frames (strictly before BFC) instead
+    # of a single reference frame's raw head-to-ankle span — see
+    # _compute_segment_sum_body_height's docstring for the real 240%
+    # false reading this fixes. None (falls back to the old method) if
+    # this clip doesn't have enough plausible early frames to trust.
+    segment_sum_body_height = _compute_segment_sum_body_height(df, bowling_arm, events.get("BFC"))
+    # SEPARATE narrow-window (BFC-15..BFC+15) baseline, for the absolute
+    # standing-height-in-cm estimate ONLY (roadmap item #1, 2026-08-06) —
+    # see _compute_segment_sum_body_height's search_start_frame docstring
+    # for why the wide run-up baseline above is right for the (scale-
+    # invariant) release-height RATIO but wrong for an absolute-cm reading
+    # that depends on matching the stump-calibration plane's depth. None
+    # if BFC isn't known or too few plausible frames exist nearby — the
+    # cm estimate feature already treats None as "can't estimate" safely.
+    segment_sum_body_height_for_cm = None
+    if events.get("BFC") is not None:
+        segment_sum_body_height_for_cm = _compute_segment_sum_body_height(
+            df, bowling_arm,
+            search_end_frame=events["BFC"] + 15,
+            search_start_frame=events["BFC"] - 15,
+        )
     # Coach-confirmed wrist/ball position, when given, overrides the
     # tracked landmark entirely — see calculate_release_height_ratio_safe's
     # docstring for why (verified real, sustained MediaPipe mistracking
@@ -1324,7 +1542,8 @@ def run_complete_bowling_analysis(video_path: str,
     )
     release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm,
                                                            reference_row=height_reference_row,
-                                                           wrist_override_norm=wrist_override_norm)
+                                                           wrist_override_norm=wrist_override_norm,
+                                                           segment_sum_body_height=segment_sum_body_height)
 
     # FFC-to-Release knee angle delta ("yielding knee" check flagged in
     # external biomechanical audit): a static single-frame knee angle at
@@ -1339,7 +1558,8 @@ def run_complete_bowling_analysis(video_path: str,
     # STAGE 5 — VIDEO GENERATION
     raw_output_video = os.path.join(output_dir, "annotated_raw.mp4")
     generate_fail_safe_video(video_path, raw_output_video, df, events, bowling_arm=bowling_arm,
-                              camera_angle=stage12.get("camera_angle", "side_on"))
+                              camera_angle=stage12.get("camera_angle", "side_on"),
+                              bowler_type=bowler_type)
     web_safe_video_file = transcode_to_h264(raw_output_video)
 
     # STAGE 6 — SAFE KEY EXTRACTION
@@ -1384,6 +1604,7 @@ def run_complete_bowling_analysis(video_path: str,
     # STAGE 7 — RETURN UNIFIED PAYLOAD
     return {
         "status": "success",
+        "bowler_type": bowler_type,
         "video_metadata": {
             "source_file": os.path.basename(video_path),
             "fps": fps,
@@ -1429,7 +1650,13 @@ def run_complete_bowling_analysis(video_path: str,
                 "classification": (release_height.get("classification") or
                                     release_height.get("tier") or "Unknown"),
                 "status": release_height.get("status", "error"),
-                "debug_raw": release_height.get("debug_raw")
+                "debug_raw": release_height.get("debug_raw"),
+                "recalibration_pending": release_height.get("recalibration_pending", False),
+                # BFC±15 body-height baseline for the absolute standing-
+                # height-in-cm estimate — deliberately NOT the same value
+                # as debug_raw["body_height"] (that one is the wide run-up
+                # window used for the ratio). See roadmap item #1 above.
+                "segment_sum_body_height_for_cm": segment_sum_body_height_for_cm,
             },
             "head_stability": {
                 "value": (head_stability.get("deviation_index") or
@@ -1437,7 +1664,8 @@ def run_complete_bowling_analysis(video_path: str,
                 "classification": (head_stability.get("tier") or
                                     head_stability.get("classification") or
                                     "Unknown"),
-                "status": head_stability.get("status", "error")
+                "status": head_stability.get("status", "error"),
+                "recalibration_pending": head_stability.get("recalibration_pending", False),
             }
         },
         "annotated_video_output": web_safe_video_file.replace("\\", "/")

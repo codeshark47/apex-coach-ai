@@ -168,8 +168,18 @@ def calculate_head_movement(df: pd.DataFrame, stance_frame: int, contact_frame: 
     # inventing a second, independent one.
     if result.get("status") == "success":
         std_dev = float(result["deviation_index"])
-        tier = "Head Still Over The Ball" if std_dev <= 0.02 else "Excess Head Drift"
-        return {"deviation_index": result["deviation_index"], "tier": tier, "status": "success"}
+        # BUG FIX (2026-08-05): threshold moved from 0.02 to 0.08 to match
+        # metric_ranges.py's batting_head_movement green band — that band
+        # itself moved because the underlying calculate_head_stability
+        # value changed scale entirely (now normalized by shoulder width,
+        # not raw camera-distance-dependent pixels). Same "keep this in
+        # sync with metric_ranges, don't invent a second boundary" fix
+        # already applied here once before.
+        tier = "Head Still Over The Ball" if std_dev <= 0.08 else "Excess Head Drift"
+        return {
+            "deviation_index": result["deviation_index"], "tier": tier, "status": "success",
+            "recalibration_pending": result.get("recalibration_pending", False),
+        }
     return {"deviation_index": None, "tier": result.get("tier", "Data Deficit"), "status": "error"}
 
 

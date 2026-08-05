@@ -426,3 +426,63 @@ def compute_release_height_absolute(release_height_debug: Optional[dict], frame_
     except Exception as e:
         monitoring.capture(e)
         return {"status": "error", "message": str(e)}
+
+
+def compute_estimated_standing_height(segment_sum_body_height: Optional[float], frame_height: int,
+                                       meters_per_pixel: Optional[float]) -> dict:
+    """
+    Estimated real-world standing height (nose-to-ankle) of the bowler,
+    computed automatically from the segment-sum body-height baseline
+    (orchestrator._compute_segment_sum_body_height — real skeletal
+    segment lengths measured from several reliably-upright early run-up
+    frames) converted through the same camera calibration (e.g. stump
+    height, 71.12cm) used for compute_release_height_absolute above.
+
+    This is the automatic path a coach asked for directly: no manual
+    height entry, ever — every stump is the same official standard
+    height regardless of ground, so once the camera is calibrated once
+    against it, every bowler's real height comes out "for free" from the
+    same tracking data already being collected. Coaches should not be
+    expected to know or measure a bowler's actual height; this replaces
+    that entirely.
+
+    Returns {"status": "not_calibrated"} if no calibration is set, or
+    {"status": "no_baseline"} if segment_sum_body_height is None (e.g. a
+    clip too short to find enough plausible early run-up frames) — never
+    invents either. Never returns a value outside a plausible human
+    standing-height range (100-230cm, generous enough for youth through
+    adult) — outside that means the calibration or tracking is
+    untrustworthy for this clip, not that the bowler is that height.
+    """
+    if meters_per_pixel is None:
+        return {
+            "status": "not_calibrated",
+            "message": (
+                "Camera not calibrated for this setup — calibrate using a "
+                "known real-world distance (e.g. stump height, 71.12cm) to "
+                "enable this."
+            ),
+        }
+    if segment_sum_body_height is None:
+        return {
+            "status": "no_baseline",
+            "message": "Not enough plausible upright early-run-up frames in this clip to estimate height.",
+        }
+
+    try:
+        height_m = float(segment_sum_body_height) * frame_height * meters_per_pixel
+        height_cm = height_m * 100
+
+        if height_cm < 100 or height_cm > 230:
+            return {
+                "status": "error",
+                "message": (
+                    f"Estimated height ({height_cm:.0f}cm) is outside a plausible human "
+                    f"range — check calibration accuracy rather than trusting this."
+                ),
+            }
+
+        return {"status": "success", "cm": round(height_cm, 1), "m": round(height_m, 3)}
+    except Exception as e:
+        monitoring.capture(e)
+        return {"status": "error", "message": str(e)}

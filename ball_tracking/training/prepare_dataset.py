@@ -25,6 +25,16 @@ same (clip, frame) — for direct_click_v1 rows, this is the radius the
 coach set once per clip in label_tool.py's size-calibration step, not a
 guessed constant.
 
+HARD NEGATIVES: a row with ball_x_px/ball_y_px = NULL is a confirmed
+"no ball, but a specific lookalike (glove/pad/helmet) is here" frame —
+see label_tool.py's hard-negative picker, added 2026-08-04 to target the
+false-positive pattern seen in ball_v1-6/v1-7 (model latching onto
+gloves). These need no radius (there's no box to draw) and are written
+as plain background images with NO matching .txt label file — the YOLO
+format for "this image has zero objects," which is what teaches the
+model these lookalikes are confirmed not-a-ball rather than merely
+unseen.
+
 SPLIT: by CLIP, not by random frame. Frames within one clip share the
 same background/lighting, so a random-frame split would let the model
 "see" near-duplicate scenes in both train and val and look like it
@@ -117,6 +127,7 @@ def main():
 
     total_written = 0
     total_val_written = 0
+    total_hard_neg = 0
     for filename, rows in by_clip.items():
         split = "val" if filename in VAL_CLIPS else "train"
         video_path = _find_video(filename)
@@ -139,23 +150,34 @@ def main():
                 break
             row = rows_by_frame.get(idx)
             if row is not None:
-                radius = radius_lookup.get(filename, {}).get(idx)
-                if radius is not None:
-                    x, y = row["ball_x_px"], row["ball_y_px"]
-                    box_w, box_h = radius * 2, radius * 2
-                    x_center_n = x / frame_w
-                    y_center_n = y / frame_h
-                    w_n = box_w / frame_w
-                    h_n = box_h / frame_h
-
+                if row["ball_x_px"] is None:
+                    # Confirmed hard negative (see module docstring) —
+                    # background image, no label file.
                     img_name = f"{clip_slug}_{idx}.jpg"
                     cv2.imwrite(os.path.join(OUT_ROOT, "images", split, img_name), frame)
-                    with open(os.path.join(OUT_ROOT, "labels", split, img_name.replace(".jpg", ".txt")), "w") as f:
-                        f.write(f"0 {x_center_n:.6f} {y_center_n:.6f} {w_n:.6f} {h_n:.6f}\n")
                     written_this_clip += 1
                     total_written += 1
+                    total_hard_neg += 1
                     if split == "val":
                         total_val_written += 1
+                else:
+                    radius = radius_lookup.get(filename, {}).get(idx)
+                    if radius is not None:
+                        x, y = row["ball_x_px"], row["ball_y_px"]
+                        box_w, box_h = radius * 2, radius * 2
+                        x_center_n = x / frame_w
+                        y_center_n = y / frame_h
+                        w_n = box_w / frame_w
+                        h_n = box_h / frame_h
+
+                        img_name = f"{clip_slug}_{idx}.jpg"
+                        cv2.imwrite(os.path.join(OUT_ROOT, "images", split, img_name), frame)
+                        with open(os.path.join(OUT_ROOT, "labels", split, img_name.replace(".jpg", ".txt")), "w") as f:
+                            f.write(f"0 {x_center_n:.6f} {y_center_n:.6f} {w_n:.6f} {h_n:.6f}\n")
+                        written_this_clip += 1
+                        total_written += 1
+                        if split == "val":
+                            total_val_written += 1
             idx += 1
         cap.release()
         print(f"{filename[:50]:50} -> {split:5} | {written_this_clip} frames written")
@@ -170,7 +192,7 @@ def main():
             "  0: ball\n"
         )
 
-    print(f"\nTotal images written: {total_written}")
+    print(f"\nTotal images written: {total_written} (of which {total_hard_neg} hard-negative/background)")
     print(f"Dataset config: {yaml_path}")
     if total_val_written == 0:
         print(

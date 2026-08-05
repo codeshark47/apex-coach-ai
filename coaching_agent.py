@@ -5,7 +5,12 @@ from typing import Dict, Any
 import metric_ranges as mr
 import monitoring
 
-ZONE_LABELS = {"green": "OPTIMAL", "amber": "ACCEPTABLE", "red": "CRITICAL", "unknown": "NO DATA"}
+ZONE_LABELS = {
+    "green": "OPTIMAL", "amber": "ACCEPTABLE", "red": "CRITICAL", "unknown": "NO DATA",
+    # No validated benchmark exists for this bowler_type/metric pair — see
+    # metric_ranges.classify()'s "descriptive" tier. Never CRITICAL/OPTIMAL.
+    "descriptive": "DESCRIPTIVE (no benchmark yet for this bowling style)",
+}
 
 
 def _strip_section_header(text: str) -> str:
@@ -46,6 +51,13 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     # 2. EXTRACT ALL 5 METRICS
     metrics = result_payload.get("biomechanical_metrics", {})
 
+    # bowler_type: None/"pace" (default) | "finger_spin" | "wrist_spin" — set
+    # by the coach's sidebar selection, carried through result_payload the
+    # same way bowling_arm_detected already is. Drives which metrics get a
+    # real green/amber/red verdict vs. a "descriptive" (no benchmark yet)
+    # one — see metric_ranges.SPIN_RANGE_OVERRIDES for what's real so far.
+    bowler_type = result_payload.get("bowler_type")
+
     knee_data = metrics.get("front_knee_bracing", {})
     knee_angle = knee_data.get("degrees")
     knee_descriptor = knee_data.get("tier", "Unknown")
@@ -61,12 +73,14 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     release_data = metrics.get("release_height", {})
     release_ratio = release_data.get("ratio")
     release_descriptor = release_data.get("classification") or release_data.get("tier") or "Unknown"
+    release_recalibration_pending = bool(release_data.get("recalibration_pending"))
 
     head_data = metrics.get("head_stability", {})
     head_val = head_data.get("value")
     if head_val is None:
         head_val = head_data.get("deviation_index")
     head_descriptor = head_data.get("classification") or head_data.get("tier") or "Unknown"
+    head_recalibration_pending = bool(head_data.get("recalibration_pending"))
 
     # --- SINGLE SOURCE OF TRUTH ---
     # ZONE below comes from metric_ranges.py — the SAME classifier used by
@@ -78,11 +92,11 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     # it didn't say "critical"). The descriptor is kept as supplementary
     # color commentary only — Gemini is instructed to make urgency/drill
     # decisions strictly from ZONE.
-    knee_zone = ZONE_LABELS[mr.classify("front_knee_bracing", knee_angle)]
-    lean_zone = ZONE_LABELS[mr.classify("trunk_lean", trunk_lean)]
-    hip_zone = ZONE_LABELS[mr.classify("hip_shoulder_separation", hip_sep)]
-    release_zone = ZONE_LABELS[mr.classify("release_height", release_ratio)]
-    head_zone = ZONE_LABELS[mr.classify("head_stability", head_val)]
+    knee_zone = ZONE_LABELS[mr.classify("front_knee_bracing", knee_angle, bowler_type)]
+    lean_zone = ZONE_LABELS[mr.classify("trunk_lean", trunk_lean, bowler_type)]
+    hip_zone = ZONE_LABELS[mr.classify("hip_shoulder_separation", hip_sep, bowler_type)]
+    release_zone = ZONE_LABELS[mr.classify("release_height", release_ratio, bowler_type)]
+    head_zone = ZONE_LABELS[mr.classify("head_stability", head_val, bowler_type)]
 
     # 3. VALIDATE — block only if majority of metrics are missing
     missing = []
@@ -119,13 +133,18 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     # hardcoded copy — so this can never drift out of sync with the UI/PDF
     # again (this used to be a third, independently-typed copy of these
     # numbers, and it had gone stale relative to the other two).
-    reference_ranges_block = "\n".join(mr.describe_range(k) for k in mr.all_metric_keys())
+    reference_ranges_block = "\n".join(mr.describe_range(k, bowler_type) for k in mr.all_metric_keys())
+
+    bowler_type_label = {
+        "finger_spin": "a finger-spin bowler (off-spin / left-arm orthodox)",
+        "wrist_spin": "a wrist-spin bowler (leg-spin / left-arm wrist-spin)",
+    }.get(bowler_type, "a fast (pace) bowler")
 
     # 5. BUILD PROMPT
     prompt = f"""
-You are the lead biomechanics analyst at a national cricket fast-bowling academy.
+You are the lead biomechanics analyst at a national cricket academy.
 
-Analyze the following fast-bowling tracking data.
+Analyze the following bowling tracking data. This delivery is from {bowler_type_label}.
 
 VIDEO METADATA:
 - Source file: {source_file}
@@ -141,8 +160,8 @@ descriptor in parentheses, which is supplementary color commentary only):
 1. Lead Knee Bracing Angle: {fmt(knee_angle)} — ZONE: {knee_zone} (descriptor: {knee_descriptor})
 2. Trunk Lean Deflection: {fmt(trunk_lean)} — ZONE: {lean_zone} (descriptor: {lean_descriptor})
 3. Hip-Shoulder Separation: {fmt(hip_sep)} — ZONE: {hip_zone} (descriptor: {hip_descriptor})
-4. Release Height Ratio: {release_display} — ZONE: {release_zone} (descriptor: {release_descriptor})
-5. Head Stability Variance: {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor})
+4. Release Height Ratio: {release_display} — ZONE: {release_zone} (descriptor: {release_descriptor}){" [RECALIBRATION PENDING - see rule below]" if release_recalibration_pending else ""}
+5. Head Stability Variance: {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor}){" [RECALIBRATION PENDING - see rule below]" if head_recalibration_pending else ""}
 {missing_note}
 REFERENCE RANGES (CBC-style classification — authoritative, matches the UI and PDF report exactly):
 {reference_ranges_block}
@@ -153,20 +172,22 @@ COACHING PHILOSOPHY:
 - Only prescribe drills for metrics whose ZONE is CRITICAL, or metrics showing severe technical blocks (like 'Blocked rotation' or extreme outliers).
 - If trunk lean exceeds 45 degrees, note that the absolute measurement may be exaggerated by a 2D camera angle artifact, but still comment on managing lateral torque.
 - CRITICAL INTERVENTION RULE: If Hip-Shoulder Separation ZONE is CRITICAL, this represents a critical developmental floor error where hips and shoulders fire simultaneously. Treat this as a high-priority CRITICAL coaching opportunity. Prescribe actionable drills to build rotational separation.
+- DESCRIPTIVE ZONE RULE: a ZONE of "DESCRIPTIVE (no benchmark yet for this bowling style)" means there is currently no validated pass/fail range for this metric for this bowler's style — this is common for spin bowlers, since most published research on spin bowling reports what correlates with performance, not a validated target angle. Report the number as neutral, informational context only (e.g. "for reference, X was measured at..."). NEVER call it optimal, acceptable, or critical, and NEVER prescribe a drill based on a DESCRIPTIVE metric alone.
+- RECALIBRATION-PENDING RULE: if ANY metric above is marked "[RECALIBRATION PENDING]", its underlying measurement was just corrected to fix a real false-reading bug, but the OPTIMAL/ACCEPTABLE/CRITICAL bands it's compared against were tuned for the OLD measurement and have not been re-validated for the new one yet. You may still report the number and its ZONE as useful, directional information, but explicitly note in the narrative that this specific reading is provisional pending re-validation, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 
 Your task is to produce a two-section technical coaching report.
 Separate the two sections with exactly one line containing only: ---
 
 SECTION 1 — BIOMECHANICAL NARRATIVE ASSESSMENT:
 Write 4-5 sentences analyzing the full kinetic chain from BFC through ball release.
-Reference each metric by name and its ZONE (OPTIMAL/ACCEPTABLE/CRITICAL) only — do NOT restate the
+Reference each metric by name and its ZONE (OPTIMAL/ACCEPTABLE/CRITICAL/DESCRIPTIVE) only — do NOT restate the
 exact numeric value yourself. The precise figures are already shown in the table directly above this
 narrative in the final report; a value you restate from memory risks not matching the table exactly,
 which has happened before and undermines trust in the whole report. Explicitly call out any missing data (N/A) without fabricating values.
-Clearly distinguish between what requires immediate correction (CRITICAL zone) versus what requires monitoring (ACCEPTABLE zone).
+Clearly distinguish between what requires immediate correction (CRITICAL zone), what requires monitoring (ACCEPTABLE zone), and what has no established benchmark yet (DESCRIPTIVE zone, per the rule above).
 
 SECTION 2 — PRESCRIBED DRILLS:
-Provide exactly 3 drills targeting the weakest CRITICAL zone or technically blocked metric.
+Provide exactly 3 drills targeting the weakest CRITICAL zone or technically blocked metric. If no metric is CRITICAL (common for a spin bowler whose metrics are mostly DESCRIPTIVE), say so plainly instead of inventing a drill for a DESCRIPTIVE or ACCEPTABLE metric.
 Format each drill exactly as a single line without extra line breaks:
 DRILL NAME: explaining what it corrects and how to perform it.
 """

@@ -73,7 +73,36 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 def calculate_head_stability(df: pd.DataFrame, start_frame: int, end_frame: int) -> dict:
-    """Tracks absolute trajectory path deviation of the head cluster during the delivery stride."""
+    """
+    Tracks lateral head-position stability during the delivery stride,
+    normalized by shoulder width in the same window.
+
+    BUG FIX (2026-08-05, found during a full audit of every biomechanical
+    calculation after tonight's release-height fix): this used to measure
+    raw std(nose_x) — a normalized-0-1 IMAGE coordinate — against a fixed
+    absolute threshold (0.015), with no accounting for camera distance.
+    The exact same real head movement produces a LARGER raw pixel
+    deviation when the bowler is filmed closer to the camera than when
+    filmed further away — pure framing, not real technique. Same class
+    of bug as release_height's original body-height issue (a fixed
+    threshold applied to a camera-distance-dependent raw measurement),
+    just not discovered until this audit.
+
+    Fix: divide each frame's nose_x by that SAME frame's shoulder width
+    before computing the deviation — the same same-frame self-
+    normalization batting_kinematics.calculate_weight_transfer already
+    does correctly with stance width. A person's shoulder width in the
+    image scales with camera distance in exactly the same way head
+    movement does, so the ratio cancels that dependence out.
+
+    The tier threshold below is a first-pass, explicitly PROVISIONAL
+    estimate (a rough conversion of the old, itself-never-validated 0.015
+    absolute threshold against a typical shoulder width) — there is not
+    yet real multi-clip evidence to properly re-tune it, hence
+    recalibration_pending=True on a successful reading. See
+    orchestrator.calculate_release_height_ratio_safe's own
+    recalibration_pending for the identical reasoning.
+    """
     try:
         window = df[(df["frame"] >= start_frame) & (df["frame"] <= end_frame)]
         if window.empty:
@@ -81,16 +110,28 @@ def calculate_head_stability(df: pd.DataFrame, start_frame: int, end_frame: int)
             # right inside this metric's own "Elite Fixed Gaze Focus" band,
             # so a tracking failure was silently reporting as a perfect
             # result instead of "unavailable."
-            return {"deviation_index": None, "tier": "Window Missing", "status": "error"}
+            return {"deviation_index": None, "tier": "Window Missing", "status": "error", "recalibration_pending": False}
 
-        nose_x = window["NOSE_x"].dropna().values
-        if len(nose_x) < 2:
-            return {"deviation_index": None, "tier": "Tracking Limited", "status": "error"}
+        required = ["NOSE_x", "LEFT_SHOULDER_x", "RIGHT_SHOULDER_x"]
+        valid = window.dropna(subset=required)
+        if len(valid) < 2:
+            return {"deviation_index": None, "tier": "Tracking Limited", "status": "error", "recalibration_pending": False}
 
-        # Standard deviation calculates absolute displacement variance across frames
-        std_dev = round(float(np.std(nose_x)), 4)
+        shoulder_width = (valid["LEFT_SHOULDER_x"] - valid["RIGHT_SHOULDER_x"]).abs()
+        # Guard against a degenerate/near-zero shoulder width (mistracked
+        # landmarks collapsed together, or a genuinely edge-on camera
+        # angle) blowing the ratio up to a huge, meaningless number —
+        # same "None, not a fabricated number" discipline as everywhere
+        # else in this codebase.
+        MIN_SHOULDER_WIDTH = 0.02
+        valid = valid[shoulder_width >= MIN_SHOULDER_WIDTH]
+        if len(valid) < 2:
+            return {"deviation_index": None, "tier": "Tracking Drop", "status": "error", "recalibration_pending": False}
 
-        tier = "Elite Fixed Gaze Focus" if std_dev <= 0.015 else "Erratic Lateral Head Drift"
-        return {"deviation_index": f"{std_dev}", "tier": tier, "status": "success"}
+        normalized_nose_x = valid["NOSE_x"] / (valid["LEFT_SHOULDER_x"] - valid["RIGHT_SHOULDER_x"]).abs()
+        std_dev = round(float(np.std(normalized_nose_x.values)), 4)
+
+        tier = "Elite Fixed Gaze Focus" if std_dev <= 0.08 else "Erratic Lateral Head Drift"
+        return {"deviation_index": f"{std_dev}", "tier": tier, "status": "success", "recalibration_pending": True}
     except Exception:
-        return {"deviation_index": None, "tier": "Data Deficit", "status": "error"}
+        return {"deviation_index": None, "tier": "Data Deficit", "status": "error", "recalibration_pending": False}

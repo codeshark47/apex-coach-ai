@@ -14,16 +14,22 @@ import pytest
 import batting_kinematics as bk
 
 
+def _batting_head_row(frame, nose_x, sh_left_x=0.6, sh_right_x=0.4):
+    """shoulder width defaults to 0.2 -- see kinematics.calculate_head_
+    stability's 2026-08-05 fix, which this function reuses wholesale."""
+    return {"frame": frame, "NOSE_x": nose_x, "LEFT_SHOULDER_x": sh_left_x, "RIGHT_SHOULDER_x": sh_right_x}
+
+
 class TestHeadMovement:
     def test_stable_head_is_still_over_the_ball(self):
-        rows = [{"frame": i, "NOSE_x": 0.50 + (0.001 if i % 2 == 0 else -0.001)} for i in range(10)]
+        rows = [_batting_head_row(i, 0.50 + (0.001 if i % 2 == 0 else -0.001)) for i in range(10)]
         df = pd.DataFrame(rows)
         result = bk.calculate_head_movement(df, stance_frame=0, contact_frame=9)
         assert result["status"] == "success"
         assert result["tier"] == "Head Still Over The Ball"
 
     def test_erratic_head_is_excess_drift(self):
-        rows = [{"frame": i, "NOSE_x": 0.30 + i * 0.03} for i in range(10)]
+        rows = [_batting_head_row(i, 0.30 + i * 0.03) for i in range(10)]
         df = pd.DataFrame(rows)
         result = bk.calculate_head_movement(df, stance_frame=0, contact_frame=9)
         assert result["status"] == "success"
@@ -31,23 +37,30 @@ class TestHeadMovement:
 
     def test_tier_threshold_matches_metric_ranges_green_band(self):
         """BUG FOUND (2026-08-03, real coach test): this function used to
-        cut its own "tier" text off at 0.015, while metric_ranges.py's
-        actual green/OPTIMAL band goes up to 0.02 -- a real result of
-        0.0162 landed inside the authoritative green band but showed the
-        contradictory "Excess Head Drift" descriptor. A value in the
-        0.015-0.02 gap must now report the tier consistent with
-        metric_ranges, not a second, independent boundary."""
+        cut its own "tier" text off at a different boundary than
+        metric_ranges.py's actual green/OPTIMAL band -- a real result
+        landed inside the authoritative green band but showed a
+        contradictory "Excess Head Drift" descriptor. A value just
+        inside the green band must report the tier consistent with
+        metric_ranges, not a second, independent boundary.
+
+        RECALIBRATED (2026-08-05): the underlying calculate_head_
+        stability value changed scale entirely (normalized by shoulder
+        width, not raw pixels), so the boundary this test exercises
+        moved from the old 0.015-0.02 gap to just under the new 0.08
+        green ceiling -- shoulder width 0.2 with alternating +-0.015
+        amplitude gives a normalized std of 0.015/0.2 = 0.075."""
         import metric_ranges as mr
         # Alternating +-a around a fixed mean gives std_dev == a exactly
-        # (population std, ddof=0) -- 0.0162 matches the real value from
-        # the coach test that exposed this bug.
-        rows = [{"frame": i, "NOSE_x": 0.50 + (0.0162 if i % 2 == 0 else -0.0162)} for i in range(10)]
+        # (population std, ddof=0).
+        rows = [_batting_head_row(i, 0.50 + (0.015 if i % 2 == 0 else -0.015)) for i in range(10)]
         df = pd.DataFrame(rows)
         result = bk.calculate_head_movement(df, stance_frame=0, contact_frame=9)
         assert result["status"] == "success"
         value = float(result["deviation_index"])
-        assert 0.015 < value <= 0.02, "test value must fall in the gap this bug lived in"
+        assert 0.0 < value <= 0.08, "test value must fall inside the new green band"
         assert result["tier"] == "Head Still Over The Ball"
+        assert mr.classify("batting_head_movement", value) == "green"
         assert mr.classify("batting_head_movement", value) == "green"
 
     def test_empty_window_is_error_not_fabricated(self):
