@@ -28,15 +28,49 @@ def calculate_knee_bracing(row: pd.Series, lead_side: str = "left") -> dict:
         cos_theta = np.dot(kh, ka) / denom
         angle = round(float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))), 1)
 
-        if angle >= 165.0: tier = "Elite Rigid Extension"
-        elif angle >= 145.0: tier = "Moderate Flexion"
-        else: tier = "Collapsing Knee Joint"
+        # FIX (2026-08-06, real literature audit): this used to imply a
+        # value judgment ("Elite Rigid Extension" vs "Collapsing Knee
+        # Joint") using unsourced 165/145-degree thresholds — this metric
+        # is now always-descriptive for pace (see
+        # metric_ranges._ALWAYS_DESCRIPTIVE_METRICS) because real research
+        # (Portus, Mason, Elliott, Pfitzner & Done, 2004) shows front knee
+        # action at release is a real TECHNIQUE CLASSIFICATION (Extended-
+        # Knee >=170deg vs Flexed-Knee <170deg), both legitimate at the
+        # elite level — one companion analysis even found non-injured
+        # bowlers had a MORE flexed knee than injured ones, the opposite
+        # of what "Collapsing" implied. Also fixes a real, separate
+        # inconsistency: this raw tier text didn't match the wrist-spin
+        # override's own real 134/119-degree thresholds (metric_ranges.
+        # SPIN_RANGE_OVERRIDES), so a wrist-spin bowler could see ZONE:
+        # green next to a contradictory "Collapsing Knee Joint" descriptor.
+        # The 170-degree split matches descriptive_note()'s real threshold
+        # for both bowler types now — this raw field is a fallback label
+        # only (metric_ranges.classify() is authoritative), but it should
+        # never contradict the real data.
+        tier = "Extended-Knee Technique" if angle >= 170.0 else "Flexed-Knee Technique"
         return {"degrees": angle, "tier": tier, "status": "success"}
     except Exception:
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 def calculate_trunk_lean(row: pd.Series) -> dict:
-    """Measures dynamic lateral deviation of the spinal column away from vertical orientation."""
+    """
+    Measures forward (sagittal-plane) deviation of the shoulder-hip line
+    from vertical, at ball release — NOT lateral flexion (side-to-side
+    bend), a different anatomical plane covered by separate real research
+    (spinal lateral flexion / spondylolysis risk, e.g. Senington, Lee &
+    Williams) that this 2D side-on formula was never measuring or citing.
+
+    DIRECTION FIX (2026-08-06, real literature audit): this used to score
+    MORE forward lean as WORSE ("Optimal Upright Posture" <= 8 degrees,
+    "Excessive Lateral Flexion" above it — the "Lateral" in that old label
+    was itself wrong, see above). Real research (Elliott, Foster & Gray,
+    1986; Portus, Mason, Elliott, Pfitzner & Done, 2004; Worthington, King
+    & Ranson, 2013a) consistently finds MORE forward trunk flexion at
+    release correlates with FASTER ball release speed, not less — see
+    metric_ranges.RANGES["trunk_lean"]'s comment for the real sourced
+    numbers this tier text now matches (mean ~20.5 degrees in elite male
+    fast bowlers, Felton, Lister, Worthington & King, 2018/19).
+    """
     try:
         mid_hip_x = (float(row["LEFT_HIP_x"]) + float(row["RIGHT_HIP_x"])) / 2
         mid_hip_y = (float(row["LEFT_HIP_y"]) + float(row["RIGHT_HIP_y"])) / 2
@@ -67,7 +101,13 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
         if angle > 90.0:
             return {"degrees": angle, "tier": "Tracking Unreliable (implausible angle)", "status": "error"}
 
-        tier = "Optimal Upright Posture" if angle <= 8.0 else "Excessive Lateral Flexion"
+        # Matches metric_ranges.RANGES["trunk_lean"]'s real green floor
+        # (13 degrees, mean-1SD of Felton et al.'s elite sample) — this raw
+        # tier string is a fallback label only (metric_ranges.classify()
+        # is the authoritative source of truth for the report/PDF/UI), but
+        # it should never contradict that real data the way the old
+        # "Optimal <= 8 degrees" cutoff did.
+        tier = "Effective Forward Drive" if angle >= 13.0 else "Insufficient Forward Lean"
         return {"degrees": angle, "tier": tier, "status": "success"}
     except Exception:
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}

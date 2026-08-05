@@ -66,6 +66,23 @@ class MetricRange:
 
 
 RANGES = {
+    # FIX (2026-08-06, real literature audit): these bounds (160-180/
+    # 145-160) had NO documented source anywhere in this project — traced
+    # via `git log -S` back to the very first commit ("Add files via
+    # upload"), predating every citation discipline built since. A real
+    # audit found the actual, heavily-cited primary research (Portus,
+    # Mason, Elliott, Pfitzner & Done, 2004, Sports Biomechanics 3(2))
+    # classifies front knee action at release into Extended-Knee (>=170
+    # degrees) vs Flexed-Knee (<170 degrees) TECHNIQUES — both are real,
+    # legitimate elite techniques, not a higher-is-better performance
+    # scale. A companion analysis from the same research group even found
+    # non-trunk-injured bowlers had a MORE flexed knee at release than
+    # injured bowlers — the opposite direction from what this range used
+    # to imply with "Elite Rigid Extension" (green) vs "Collapsing Knee
+    # Joint" (red). These numbers are now DEAD for classification (see
+    # _ALWAYS_DESCRIPTIVE_METRICS below — classify() never reaches them
+    # for bowler_type=pace) — kept only so label/unit/display_optimal
+    # still resolve for any legacy caller. Do not classify against them.
     "front_knee_bracing": MetricRange(
         label="Lead Knee Bracing",
         unit="°",
@@ -74,6 +91,15 @@ RANGES = {
         amber=(145.0, 160.0),
         display_optimal="160–180°",
     ),
+    # FIX (2026-08-06, same audit): also unsourced from the original
+    # commit. Real research (Senington, Lee & Williams, J Sports Sciences
+    # — 35 elite fast bowlers, mean 33.0 +/- SD 21.6 degrees) shows this
+    # varies enormously by bowling action TYPE (front-on/side-on/mixed),
+    # not by skill — a front-on bowler legitimately shows far less
+    # separation than a mixed-action bowler by design. No universal
+    # "optimal zone" exists independent of action type. Same as above:
+    # numbers below are DEAD for classification (_ALWAYS_DESCRIPTIVE_METRICS),
+    # kept only for label/unit/display_optimal.
     "hip_shoulder_separation": MetricRange(
         label="Hip-Shoulder Separation",
         unit="°",
@@ -90,13 +116,33 @@ RANGES = {
         # silently passing as optimal.
         display_optimal="25–50°",
     ),
+    # FIX (2026-08-06): direction REVERSED and bounds re-sourced. This used
+    # to score MORE forward lean as worse (kind="lower_better", green=0-20,
+    # "Optimal Upright Posture") — backwards from real research. Multiple
+    # real studies (Elliott, Foster & Gray, 1986; Portus, Mason, Elliott,
+    # Pfitzner & Done, 2004; Worthington, King & Ranson, 2013a) find MORE
+    # forward trunk flexion at release correlates with FASTER ball release
+    # speed — Worthington et al.'s regression names it one of four
+    # technique parameters explaining 74% of ball-speed variance. Felton,
+    # Lister, Worthington & King (2018/19, J Sports Sciences — real Vicon
+    # data, 20 elite male fast bowlers) measured upper trunk angle at
+    # release at 159.5 +/- SD 7.8 degrees on an anatomical-180-degrees-
+    # neutral convention, i.e. ~20.5 degrees of forward flexion. Bounds
+    # below use mean -/+ 1 SD (~13-28 degrees) as the green band — kept
+    # WIDE (not a tight cutoff) because that source measures upper-trunk-
+    # relative-to-lower-trunk, while this app's formula measures the whole
+    # shoulder-hip line relative to true vertical; the two conventions
+    # likely track closely but are not proven identical. No established
+    # upper ceiling exists in the literature for "too much" forward lean —
+    # same reasoning as release_height's own no-ceiling fix below, so this
+    # is "higher_better" like that metric, not "band".
     "trunk_lean": MetricRange(
         label="Trunk Lean",
         unit="°",
-        kind="lower_better",
-        green=(0.0, 20.0),
-        amber=(20.0, 35.0),
-        display_optimal="0–20°",
+        kind="higher_better",
+        green=(13.0, 30.0),
+        amber=(5.0, 13.0),
+        display_optimal="13°+ forward lean at release",
     ),
     "release_height": MetricRange(
         label="Release Height",
@@ -111,17 +157,39 @@ RANGES = {
         # routinely and legitimately release well above head height —
         # that's a documented trait of some elite fast bowlers, not a
         # fault. "band" was flagging that as "Critical" purely from an
-        # unjustified symmetric margin around the lower bound (the
-        # previous NOTE here already admitted this wasn't from any cited
-        # source). A separate, genuine implausibility ceiling already
-        # exists elsewhere (calculate_release_height_ratio_safe rejects
-        # anything above 1.30 as a likely tracking/geometry error before
-        # it ever reaches this classification) — that's the right place
-        # for a hard limit, not a "technique fault" label at 115%.
+        # unjustified symmetric margin around the lower bound. A separate,
+        # genuine implausibility ceiling already exists elsewhere
+        # (calculate_release_height_ratio_safe rejects anything above 1.30
+        # as a likely tracking/geometry error before it ever reaches this
+        # classification) — that's the right place for a hard limit, not
+        # a "technique fault" label.
+        #
+        # BOUNDS RE-SOURCED (2026-08-06, real literature audit): the old
+        # 85%/75% bounds had no documented source (same "Add files via
+        # upload" origin as the other unsourced ranges). Real data: Felton,
+        # Lister, Worthington & King (2018/19, J Sports Sciences — real
+        # Vicon data, 20 elite male fast bowlers) measured release height
+        # at 112.8% +/- SD 4.1% of TRUE STANDING HEIGHT (floor to crown).
+        # This app's ratio uses a DIFFERENT baseline (nose-to-ankle
+        # segment-sum, not full stature — MediaPipe has no reliable
+        # head-top landmark), so their number does not transfer directly;
+        # converted using real anthropometric ratios (standing eye/nose
+        # height ~93.4% of stature; ankle height ~7.9% of stature, both
+        # population averages, not bowling-specific) so nose-to-ankle ~=
+        # 85.5% of true stature. Worked through with real units (180cm
+        # bowler, their 112.8% = a genuine 203cm release point = 188.8cm
+        # above the ankle = 122.7% of an ~153.9cm nose-to-ankle span) —
+        # mean converts to ~122.7%, SD to ~4.8% in THIS app's units.
+        # Green = mean -/+ 1 SD (~118-128%); amber = mean -2SD to -1SD
+        # (~108-118%, a real "notably below elite" concern zone, same
+        # role the old 75-85% amber played). This stacks a population
+        # anthropometric approximation on top of a real elite-bowler
+        # dataset — a real, documented engineering judgment call, not a
+        # fabricated number, but flagged here as such.
         kind="higher_better",
-        green=(0.85, 1.30),
-        amber=(0.75, 0.85),          # genuine concern: under-extension/low-sling
-        display_optimal="85%+",
+        green=(1.18, 1.28),
+        amber=(1.08, 1.18),
+        display_optimal="118%+",
     ),
     "head_stability": MetricRange(
         label="Head Stability",
@@ -304,6 +372,77 @@ SPIN_RANGE_OVERRIDES = {
 
 _SPIN_BOWLER_TYPES = ("finger_spin", "wrist_spin")
 
+# REAL LITERATURE AUDIT (2026-08-06): these two metrics have no universal
+# validated pass/fail band for ANY bowler_type, including pace — unlike
+# trunk_lean/release_height/head_stability, which DO have a real pace band
+# (see RANGES above), just none yet for spin. front_knee_bracing (pace) is
+# a real TECHNIQUE CLASSIFICATION (Extended-Knee vs Flexed-Knee, Portus et
+# al. 2004), not a higher-is-better scale — both are legitimate elite
+# techniques. hip_shoulder_separation varies by bowling action TYPE (front-
+# on/side-on/mixed), not skill (Senington, Lee & Williams). Always
+# "descriptive" in classify() UNLESS a specific (metric, bowler_type) pair
+# has a real override in SPIN_RANGE_OVERRIDES (front_knee_bracing/
+# wrist_spin does).
+_ALWAYS_DESCRIPTIVE_METRICS = ("front_knee_bracing", "hip_shoulder_separation")
+
+
+def has_validated_range(metric_key: str, bowler_type: str = None) -> bool:
+    """
+    True if this (metric_key, bowler_type) pair has a real, validated
+    green/amber/red band to classify or draw a chart band against — False
+    means classify() returns "descriptive" for any real value. Single
+    source of truth for every gauge/chart/table that draws a green band,
+    so one can never be drawn for a metric+type combination that doesn't
+    have a real one (front_knee_bracing/hip_shoulder_separation for ANY
+    bowler_type; any metric with no SPIN_RANGE_OVERRIDES entry for a spin
+    bowler_type).
+    """
+    if metric_key in _ALWAYS_DESCRIPTIVE_METRICS:
+        return (metric_key, bowler_type) in SPIN_RANGE_OVERRIDES
+    if bowler_type in _SPIN_BOWLER_TYPES:
+        return (metric_key, bowler_type) in SPIN_RANGE_OVERRIDES
+    return True
+
+
+def descriptive_note(metric_key: str, value=None, bowler_type: str = None) -> str:
+    """
+    Real, honest text to show in place of an invented green/amber/red
+    verdict whenever has_validated_range()/classify() says "descriptive".
+    front_knee_bracing and hip_shoulder_separation get real, sourced,
+    metric-specific text (a technique classification, not a generic "no
+    data for your style" disclaimer) since they're always-descriptive
+    regardless of bowler_type — see _ALWAYS_DESCRIPTIVE_METRICS above.
+    Everything else falls back to the generic spin-specific message.
+    """
+    if metric_key == "front_knee_bracing":
+        if value is not None:
+            try:
+                v = float(value)
+                if v == v:  # not NaN
+                    technique = "Extended-Knee" if v >= 170.0 else "Flexed-Knee"
+                    return (
+                        f"{technique} technique at release — both are real, legitimate "
+                        f"elite techniques (Portus, Mason, Elliott, Pfitzner & Done, 2004), "
+                        f"not a pass/fail scale."
+                    )
+            except (TypeError, ValueError):
+                pass
+        return (
+            "Front knee action at release is a real technique CLASSIFICATION "
+            "(Extended-Knee vs Flexed-Knee — Portus et al. 2004), not a pass/fail scale."
+        )
+    if metric_key == "hip_shoulder_separation":
+        return (
+            "Varies substantially by bowling action type (front-on/side-on/mixed), not "
+            "by skill — elite bowlers average ~33° with a wide spread (±22°) across "
+            "action types (Senington, Lee & Williams). No universal target exists."
+        )
+    label = RANGES[metric_key].label
+    if bowler_type in _SPIN_BOWLER_TYPES:
+        return (f"No validated {bowler_type.replace('_', '-')} benchmark yet for {label} — "
+                f"reported as a measurement only, not a pass/fail zone.")
+    return f"No validated benchmark for {label} yet — reported as a measurement only."
+
 
 # Explicit, hardcoded lists (not "everything in RANGES") so adding either
 # sport's metrics can never silently change what the OTHER sport's
@@ -324,11 +463,14 @@ def classify(metric_key: str, value, bowler_type: str = None) -> str:
     """
     Returns one of "green", "amber", "red", "unknown", "descriptive".
     "unknown" fires when value is None/NaN — never fabricated.
-    "descriptive" fires when bowler_type is a spin type ("finger_spin" or
-    "wrist_spin") and no validated range exists for this metric+type in
-    SPIN_RANGE_OVERRIDES — the real value with no invented pass/fail
-    verdict, never a silent fallback to pace's band. See the module-level
-    comment above SPIN_RANGE_OVERRIDES for the full reasoning and sourcing.
+    "descriptive" fires whenever has_validated_range() says this
+    (metric_key, bowler_type) pair has no real validated band — either
+    because bowler_type is a spin type with no SPIN_RANGE_OVERRIDES entry,
+    or because the metric itself has no universal band for ANY bowler_type
+    (front_knee_bracing/hip_shoulder_separation — see
+    _ALWAYS_DESCRIPTIVE_METRICS). Never a silent fallback to pace's band.
+    See the module-level comment above SPIN_RANGE_OVERRIDES and
+    _ALWAYS_DESCRIPTIVE_METRICS for the full reasoning and sourcing.
     """
     if metric_key not in RANGES:
         raise KeyError(
@@ -344,13 +486,9 @@ def classify(metric_key: str, value, bowler_type: str = None) -> str:
     if v != v:  # NaN check without importing math/numpy
         return "unknown"
 
-    r = None
-    if bowler_type in _SPIN_BOWLER_TYPES:
-        r = SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type))
-        if r is None:
-            return "descriptive"
-    if r is None:
-        r = RANGES[metric_key]
+    if not has_validated_range(metric_key, bowler_type):
+        return "descriptive"
+    r = SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type), RANGES[metric_key])
     g_lo, g_hi = r.green
     a_lo, a_hi = r.amber
 
@@ -402,15 +540,19 @@ def describe_range(metric_key: str, bowler_type: str = None) -> str:
     used by the Gemini coaching prompt so it can never hardcode a second,
     driftable copy of these numbers.
 
-    For a spin bowler_type with no entry in SPIN_RANGE_OVERRIDES, returns a
-    line saying so explicitly instead of describing pace's band — the
-    prompt must never present a fast-bowling-calibrated range as if it
-    applied to a spinner (see classify()'s "descriptive" tier).
+    Whenever has_validated_range() says this (metric_key, bowler_type) pair
+    has no real band — a spin bowler_type with no SPIN_RANGE_OVERRIDES
+    entry, OR a metric with no universal band at all (front_knee_bracing/
+    hip_shoulder_separation, see _ALWAYS_DESCRIPTIVE_METRICS) — returns the
+    real, sourced descriptive_note() text instead of describing a band
+    that doesn't exist. The prompt must never present a fast-bowling-
+    calibrated range as if it applied to a spinner, and must never present
+    front_knee_bracing/hip_shoulder_separation as a pass/fail scale (see
+    classify()'s "descriptive" tier).
     """
-    if bowler_type in _SPIN_BOWLER_TYPES and (metric_key, bowler_type) not in SPIN_RANGE_OVERRIDES:
+    if not has_validated_range(metric_key, bowler_type):
         label = RANGES[metric_key].label
-        return (f"- {label}: No validated {bowler_type.replace('_', '-')} benchmark yet — "
-                f"reported as a descriptive measurement only, not a pass/fail zone.")
+        return f"- {label}: {descriptive_note(metric_key, None, bowler_type)}"
 
     r = SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type), RANGES[metric_key])
 

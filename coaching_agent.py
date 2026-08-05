@@ -7,9 +7,18 @@ import monitoring
 
 ZONE_LABELS = {
     "green": "OPTIMAL", "amber": "ACCEPTABLE", "red": "CRITICAL", "unknown": "NO DATA",
-    # No validated benchmark exists for this bowler_type/metric pair — see
-    # metric_ranges.classify()'s "descriptive" tier. Never CRITICAL/OPTIMAL.
-    "descriptive": "DESCRIPTIVE (no benchmark yet for this bowling style)",
+    # No validated pass/fail band exists for this metric/bowler_type pair —
+    # see metric_ranges.classify()'s "descriptive" tier. Never CRITICAL/
+    # OPTIMAL. FIX (2026-08-06): was "no benchmark yet for this bowling
+    # style", which read oddly for front_knee_bracing/hip_shoulder_separation
+    # — both are descriptive for PACE too (no universal band for either
+    # metric, for any bowler_type — see
+    # metric_ranges._ALWAYS_DESCRIPTIVE_METRICS), so "this bowling style"
+    # made no sense when the style literally was pace. The real, specific
+    # reason is already in the reference-ranges block below (via
+    # describe_range() -> descriptive_note()) — this tag just needs to be
+    # generically true.
+    "descriptive": "DESCRIPTIVE (see reference ranges below)",
 }
 
 
@@ -170,9 +179,8 @@ COACHING PHILOSOPHY:
 - Some bowlers have unconventional but effective actions built through years of muscle memory.
 - Do not recommend correcting a metric whose ZONE is ACCEPTABLE if the bowler appears injury-free.
 - Only prescribe drills for metrics whose ZONE is CRITICAL, or metrics showing severe technical blocks (like 'Blocked rotation' or extreme outliers).
-- If trunk lean exceeds 45 degrees, note that the absolute measurement may be exaggerated by a 2D camera angle artifact, but still comment on managing lateral torque.
-- CRITICAL INTERVENTION RULE: If Hip-Shoulder Separation ZONE is CRITICAL, this represents a critical developmental floor error where hips and shoulders fire simultaneously. Treat this as a high-priority CRITICAL coaching opportunity. Prescribe actionable drills to build rotational separation.
-- DESCRIPTIVE ZONE RULE: a ZONE of "DESCRIPTIVE (no benchmark yet for this bowling style)" means there is currently no validated pass/fail range for this metric for this bowler's style — this is common for spin bowlers, since most published research on spin bowling reports what correlates with performance, not a validated target angle. Report the number as neutral, informational context only (e.g. "for reference, X was measured at..."). NEVER call it optimal, acceptable, or critical, and NEVER prescribe a drill based on a DESCRIPTIVE metric alone.
+- If trunk lean exceeds 45 degrees, note that the absolute measurement may be exaggerated by a 2D camera angle artifact, but still comment on managing the load from excessive forward trunk flexion at release.
+- DESCRIPTIVE ZONE RULE: a ZONE of "DESCRIPTIVE (see reference ranges below)" means there is currently no validated pass/fail range for this metric — either because published research doesn't give a validated target for this bowler's style (common for spin bowlers), or because the metric itself has no universal target for ANY style (Lead Knee Bracing and Hip-Shoulder Separation are always descriptive now — real research shows both are technique classifications, not a higher/lower-is-better scale: Lead Knee Bracing splits into real Extended-Knee/Flexed-Knee techniques that are both legitimate at the elite level, and Hip-Shoulder Separation varies by bowling action type, not skill). Report the number as neutral, informational context only (e.g. "for reference, X was measured at..."). NEVER call it optimal, acceptable, or critical, and NEVER prescribe a drill based on a DESCRIPTIVE metric alone.
 - RECALIBRATION-PENDING RULE: if ANY metric above is marked "[RECALIBRATION PENDING]", its underlying measurement was just corrected to fix a real false-reading bug, but the OPTIMAL/ACCEPTABLE/CRITICAL bands it's compared against were tuned for the OLD measurement and have not been re-validated for the new one yet. You may still report the number and its ZONE as useful, directional information, but explicitly note in the narrative that this specific reading is provisional pending re-validation, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 
 Your task is to produce a two-section technical coaching report.

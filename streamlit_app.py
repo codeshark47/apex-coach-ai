@@ -3615,10 +3615,32 @@ if st.session_state.get("pending_result_payload") is not None:
                 # silently reintroduce the exact misleading pace-vs-spin
                 # verdict classify()'s "descriptive" tier exists to avoid.
                 _display_bowler_type = result_payload.get("bowler_type")
-                def _tier_caption(metric_key, raw_tier):
-                    if (_display_bowler_type in ("finger_spin", "wrist_spin")
-                            and (metric_key, _display_bowler_type) not in mr.SPIN_RANGE_OVERRIDES):
-                        return "No benchmark yet for this bowling style"
+                def _tier_caption(metric_key, raw_tier, value=None):
+                    # FIX (2026-08-06): used to only check bowler_type, so
+                    # front_knee_bracing/hip_shoulder_separation (real audit
+                    # found NO universal pass/fail band exists for either,
+                    # for ANY bowler_type — see metric_ranges._ALWAYS_
+                    # DESCRIPTIVE_METRICS) still showed kinematics.py's raw
+                    # "Elite Rigid Extension"/"Collapsing Knee Joint" pace
+                    # verdict text for pace bowlers. mr.has_validated_range
+                    # is the single source of truth every render site now
+                    # shares (also used by video_overlay.py's hero chart and
+                    # the Bowler Profile history chart).
+                    #
+                    # REGRESSION FOUND (2026-08-06, real clip test): this
+                    # override fired even when value was None (a genuine
+                    # tracking failure this delivery) — confirmed on a real
+                    # session where Lead Knee Bracing showed "N/A" right
+                    # next to the confident-sounding "Front knee action at
+                    # release is a real technique CLASSIFICATION..." text,
+                    # hiding the real diagnostic (raw_tier would have said
+                    # "Data Deficit"/"Tracking Drop"). A missing value must
+                    # show the real error state, not a classification note
+                    # that implies something was actually measured.
+                    if value is None or (isinstance(value, float) and value != value):  # None or NaN
+                        return raw_tier
+                    if not mr.has_validated_range(metric_key, _display_bowler_type):
+                        return mr.descriptive_note(metric_key, value, _display_bowler_type)
                     return raw_tier
 
                 detected_arm = metrics.get("bowling_arm_detected")
@@ -3627,11 +3649,20 @@ if st.session_state.get("pending_result_payload") is not None:
                     st.caption(f"🎯 Bowling arm ({arm_source}): **{detected_arm.title()}-arm**")
                 if _display_bowler_type in ("finger_spin", "wrist_spin"):
                     _bt_label = {"finger_spin": "Finger-Spin", "wrist_spin": "Wrist-Spin"}[_display_bowler_type]
-                    st.caption(f"🌀 Bowler type: **{_bt_label}** — metrics without a 🔵 dot below have a validated benchmark; 🔵 means descriptive-only (see Reference Ranges).")
+                    st.caption(f"🌀 Bowler type: **{_bt_label}**")
+                # FIX (2026-08-06): used to only show this explanation for
+                # spin bowler_types, but Lead Knee Bracing and Hip-Shoulder
+                # Separation are ALWAYS descriptive now (real audit found
+                # no universal pass/fail band for either, for any bowler
+                # type — see metric_ranges._ALWAYS_DESCRIPTIVE_METRICS), so
+                # every pace bowler now sees 🔵 dots too and needs the same
+                # explanation.
+                st.caption("Metrics without a 🔵 dot below have a validated benchmark; "
+                           "🔵 means descriptive-only (see Reference Ranges).")
 
                 m1, m2 = st.columns(2)
                 m1.metric("Lead Knee Bracing Angle", ui_deg(knee_deg),
-                           _tier_caption("front_knee_bracing", metrics.get('front_knee_bracing', {}).get('tier', 'N/A')))
+                           _tier_caption("front_knee_bracing", metrics.get('front_knee_bracing', {}).get('tier', 'N/A'), knee_deg))
                 yield_delta = metrics.get('front_knee_bracing', {}).get('yield_delta_degrees')
                 yield_status = metrics.get('front_knee_bracing', {}).get('yield_status')
                 if yield_delta is not None:
@@ -3643,15 +3674,15 @@ if st.session_state.get("pending_result_payload") is not None:
                     else:
                         m1.caption(f"ℹ️ {round(deg_at_release, 1)}° at release ({yield_delta:+.1f}°)")
                 m2.metric("Hip-Shoulder Rotation Twist", ui_deg(hip_deg),
-                           _tier_caption("hip_shoulder_separation", metrics.get('hip_shoulder_separation', {}).get('tier', 'N/A')))
+                           _tier_caption("hip_shoulder_separation", metrics.get('hip_shoulder_separation', {}).get('tier', 'N/A'), hip_deg))
 
                 st.write("")
                 m3, m4, m5 = st.columns(3)
                 m3.metric("Trunk Lean Deflection", ui_deg(trunk_deg),
-                           _tier_caption("trunk_lean", metrics.get('trunk_lean', {}).get('tier', 'N/A')))
+                           _tier_caption("trunk_lean", metrics.get('trunk_lean', {}).get('tier', 'N/A'), trunk_deg))
                 m4.metric("Release Height Ratio", ui_pct(rel_ratio),
                            _tier_caption("release_height", metrics.get('release_height', {}).get('classification')
-                                         or metrics.get('release_height', {}).get('tier', 'N/A')))
+                                         or metrics.get('release_height', {}).get('tier', 'N/A'), rel_ratio))
                 if height_absolute_result and height_absolute_result.get("status") == "success":
                     m4.caption(f"📏 {height_absolute_result['cm']} cm above ground (stump-calibrated)")
                 elif height_absolute_result and height_absolute_result.get("status") == "not_calibrated":
@@ -3683,7 +3714,7 @@ if st.session_state.get("pending_result_payload") is not None:
                     m4.caption(f"⚠️ {estimated_height_result['message']}")
                 m5.metric("Head Stability Variance", ui_val(head_val),
                            _tier_caption("head_stability", metrics.get('head_stability', {}).get('classification')
-                                         or metrics.get('head_stability', {}).get('tier', 'N/A')))
+                                         or metrics.get('head_stability', {}).get('tier', 'N/A'), head_val))
                 if metrics.get('head_stability', {}).get('recalibration_pending'):
                     m5.caption(
                         "🔵 Using a newly-corrected measurement (2026-08-05 fix, normalized for "
@@ -3734,17 +3765,31 @@ if st.session_state.get("pending_result_payload") is not None:
                     dot = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪", "descriptive": "🔵"}
                     for key in mr.all_metric_keys():
                         tier = mr.classify(key, metric_value_lookup.get(key), _display_bowler_type)
-                        if tier == "descriptive":
-                            r = mr.RANGES[key]
+                        r = mr.RANGES[key]
+                        # FIX (2026-08-06): a genuinely missing value (tier
+                        # "unknown") used to fall into the same branch as a
+                        # real validated band, showing "Optimal: 160-180°"
+                        # for front_knee_bracing even though that band is
+                        # now DEAD for classification (always-descriptive
+                        # for pace — see metric_ranges._ALWAYS_DESCRIPTIVE_
+                        # METRICS). Confirmed on a real clip: Lead Knee
+                        # Bracing showed "N/A" (no data this delivery) right
+                        # next to "Optimal: 160-180deg" as if that stale
+                        # band still applied. tier=="unknown" must be
+                        # checked FIRST and independently of whether a
+                        # validated band exists at all.
+                        if tier == "unknown":
+                            st.markdown(f"**{r.label}** {dot[tier]} — No data available this session")
+                        elif tier == "descriptive":
                             st.markdown(
                                 f"**{r.label}** {dot[tier]} — "
-                                f"No validated benchmark yet for this bowling style (shown for reference only)"
+                                f"{mr.descriptive_note(key, metric_value_lookup.get(key), _display_bowler_type)}"
                             )
                         else:
-                            r = mr.SPIN_RANGE_OVERRIDES.get((key, _display_bowler_type), mr.RANGES[key])
+                            band_r = mr.SPIN_RANGE_OVERRIDES.get((key, _display_bowler_type), r)
                             st.markdown(
                                 f"**{r.label}** {dot[tier]} — "
-                                f"🟢 Optimal: `{r.display_optimal}`"
+                                f"🟢 Optimal: `{band_r.display_optimal}`"
                             )
                     
 

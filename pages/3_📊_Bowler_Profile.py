@@ -240,12 +240,16 @@ dates = [_parse_date(s.get("session_date")) for s in chronological]
 
 def _zone_shapes(metric_key: str, y_axis_max: float, y_axis_min: float = 0.0, bowler_type: str = None):
     """
-    Shaded background bands for the chart. Uses the same bowler_type-aware
-    lookup as classify() — for a spin bowler_type with no validated range
-    for this metric (see SPIN_RANGE_OVERRIDES), there is no real band to
-    shade, so this returns no shapes rather than drawing pace's.
+    Shaded background bands for the chart. Uses mr.has_validated_range() —
+    the same single source of truth every other render site (dashboard,
+    PDF, in-video hero chart) shares — so a spin bowler_type with no
+    validated range for this metric, OR a metric with no universal band
+    for ANY bowler_type (front_knee_bracing/hip_shoulder_separation, per
+    the 2026-08-06 literature audit — see
+    metric_ranges._ALWAYS_DESCRIPTIVE_METRICS), correctly shows no shaded
+    band rather than drawing one from dead, unused numbers.
     """
-    if bowler_type in ("finger_spin", "wrist_spin") and (metric_key, bowler_type) not in mr.SPIN_RANGE_OVERRIDES:
+    if not mr.has_validated_range(metric_key, bowler_type):
         return []
     r = mr.SPIN_RANGE_OVERRIDES.get((metric_key, bowler_type), mr.RANGES[metric_key])
     shapes = []
@@ -311,14 +315,22 @@ for i, key in enumerate(METRIC_KEYS):
         # is still always classified against ITS OWN session's type, so a
         # style change over time still reads correctly point-by-point even
         # though the background shading reflects only the latest one.
-        chart_range = mr.SPIN_RANGE_OVERRIDES.get((key, latest_bowler_type), r)
         y_scale = 100 if r.unit == "%" else 1
-        g_lo, g_hi = chart_range.green[0] * y_scale, chart_range.green[1] * y_scale
         data_max = max(plot_y)
         data_min = min(plot_y)
-        ceiling_ref = chart_range.amber_high[1] * y_scale if chart_range.kind == "band" else g_hi
-        y_axis_max = max(data_max, ceiling_ref) * 1.15
-        y_axis_min = min(data_min, chart_range.amber[0] * y_scale) * 0.85 if chart_range.kind != "lower_better" else 0
+        if mr.has_validated_range(key, latest_bowler_type):
+            chart_range = mr.SPIN_RANGE_OVERRIDES.get((key, latest_bowler_type), r)
+            g_lo, g_hi = chart_range.green[0] * y_scale, chart_range.green[1] * y_scale
+            ceiling_ref = chart_range.amber_high[1] * y_scale if chart_range.kind == "band" else g_hi
+            y_axis_max = max(data_max, ceiling_ref) * 1.15
+            y_axis_min = min(data_min, chart_range.amber[0] * y_scale) * 0.85 if chart_range.kind != "lower_better" else 0
+        else:
+            # No validated band to size the axis against (front_knee_bracing/
+            # hip_shoulder_separation for any bowler_type, or a spin type with
+            # no override) — scale from the plotted data alone rather than
+            # dead RANGES numbers that no longer mean anything for this metric.
+            y_axis_max = data_max * 1.15
+            y_axis_min = data_min * 0.85 if data_min > 0 else data_min * 1.15
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(

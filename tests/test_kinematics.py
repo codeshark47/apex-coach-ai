@@ -52,7 +52,10 @@ class TestKneeBracing:
         assert result["degrees"] is None
         assert result["status"] == "error"
 
-    def test_elite_tier_boundary(self):
+    def test_extended_knee_tier_boundary(self):
+        """FIX (2026-08-06): tier text is now the real Portus et al. (2004)
+        Extended-Knee/Flexed-Knee classification (170-degree split), not
+        the old unsourced "Elite Rigid Extension" value judgment."""
         # A straight leg: hip directly above knee, ankle directly below —
         # ~180 degrees.
         row = _row(LEFT_HIP_x=0.5, LEFT_HIP_y=0.3,
@@ -60,8 +63,8 @@ class TestKneeBracing:
                     LEFT_ANKLE_x=0.5, LEFT_ANKLE_y=0.9)
         result = k.calculate_knee_bracing(row, lead_side="left")
         assert result["status"] == "success"
-        assert result["degrees"] >= 165.0
-        assert result["tier"] == "Elite Rigid Extension"
+        assert result["degrees"] >= 170.0
+        assert result["tier"] == "Extended-Knee Technique"
 
     def test_lead_side_right_for_left_arm_bowler(self):
         """A left-arm bowler's lead leg is the RIGHT leg — regression
@@ -94,14 +97,22 @@ class TestTrunkLean:
     def test_genuine_zero_degree_lean_passes_through_as_success(self):
         """A REAL perfectly-upright bowler (shoulders directly above
         hips) must still report 0.0 and 'success' — the fix for the NaN
-        case above must not have broken this legitimate case."""
+        case above must not have broken this legitimate case.
+
+        DIRECTION FIX (2026-08-06): real research (Elliott 1986; Portus
+        et al. 2004; Worthington et al. 2013a) shows MORE forward lean at
+        release correlates with FASTER ball speed — 0 degrees (no forward
+        lean at all) is now correctly the weak end, not "Optimal", per
+        this function's own updated tier text (matches
+        metric_ranges.RANGES["trunk_lean"]'s real green floor of 13
+        degrees)."""
         row = _row(LEFT_HIP_x=0.45, RIGHT_HIP_x=0.55, LEFT_HIP_y=0.5, RIGHT_HIP_y=0.5,
                     LEFT_SHOULDER_x=0.45, RIGHT_SHOULDER_x=0.55,
                     LEFT_SHOULDER_y=0.2, RIGHT_SHOULDER_y=0.2)
         result = k.calculate_trunk_lean(row)
         assert result["status"] == "success"
         assert result["degrees"] == 0.0
-        assert result["tier"] == "Optimal Upright Posture"
+        assert result["tier"] == "Insufficient Forward Lean"
 
     def test_implausible_angle_above_90_flagged_as_unreliable(self):
         """>90 degrees is physically nonsensical for lean-from-vertical —

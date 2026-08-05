@@ -15,86 +15,175 @@ import metric_ranges as mr
 
 
 class TestClassifyHigherBetter:
-    """front_knee_bracing: green=(160,180), amber=(145,160)."""
+    """release_height: green=(1.18,1.28), amber=(1.08,1.18) — real
+    thresholds re-sourced 2026-08-06 (was front_knee_bracing before that
+    metric became always-descriptive; see TestAlwaysDescriptiveMetrics)."""
 
     def test_green_at_lower_boundary(self):
-        assert mr.classify("front_knee_bracing", 160.0) == "green"
+        assert mr.classify("release_height", 1.18) == "green"
 
     def test_green_above_upper_boundary_still_green(self):
         """A higher_better metric has no upper red ceiling — values
         above the green band's top are still fine, per the documented
         fix for release_height (a genuinely high release/leaping action
         isn't a fault)."""
-        assert mr.classify("front_knee_bracing", 179.9) == "green"
-        assert mr.classify("front_knee_bracing", 200.0) == "green"
+        assert mr.classify("release_height", 1.279) == "green"
+        assert mr.classify("release_height", 2.0) == "green"
 
     def test_amber_band(self):
-        assert mr.classify("front_knee_bracing", 150.0) == "amber"
+        assert mr.classify("release_height", 1.12) == "amber"
 
     def test_amber_lower_boundary_is_amber_not_red(self):
-        assert mr.classify("front_knee_bracing", 145.0) == "amber"
+        assert mr.classify("release_height", 1.08) == "amber"
 
     def test_just_below_amber_is_red(self):
-        assert mr.classify("front_knee_bracing", 144.9) == "red"
+        assert mr.classify("release_height", 1.079) == "red"
 
 
 class TestClassifyLowerBetter:
-    """trunk_lean: green=(0,20), amber=(20,35)."""
+    """head_stability: green=(0.0,0.08), amber=(0.08,0.15) — was trunk_lean
+    before that metric's direction was reversed to higher_better (real
+    research shows more forward lean at release correlates with faster
+    ball speed; see TestTrunkLeanReversedDirection)."""
 
     def test_green_at_zero(self):
-        assert mr.classify("trunk_lean", 0.0) == "green"
+        assert mr.classify("head_stability", 0.0) == "green"
 
     def test_green_upper_boundary(self):
-        assert mr.classify("trunk_lean", 20.0) == "green"
+        assert mr.classify("head_stability", 0.08) == "green"
 
     def test_amber_band(self):
-        assert mr.classify("trunk_lean", 30.0) == "amber"
+        assert mr.classify("head_stability", 0.1) == "amber"
 
     def test_amber_upper_boundary_is_amber_not_red(self):
-        assert mr.classify("trunk_lean", 35.0) == "amber"
+        assert mr.classify("head_stability", 0.15) == "amber"
 
     def test_just_above_amber_is_red(self):
-        assert mr.classify("trunk_lean", 35.1) == "red"
+        assert mr.classify("head_stability", 0.151) == "red"
 
     def test_below_green_floor_still_green(self):
         """lower_better has no floor — values below the green band's
-        bottom are still fine (can't have "too little" trunk lean)."""
-        assert mr.classify("trunk_lean", -5.0) == "green"
+        bottom are still fine (can't have "too little" head stability)."""
+        assert mr.classify("head_stability", -0.01) == "green"
 
 
 class TestClassifyBand:
-    """hip_shoulder_separation: green=(25,50), amber=(15,25), amber_high=(50,65)."""
+    """batting_xfactor_separation: green=(25,50), amber=(15,25),
+    amber_high=(50,65) — was hip_shoulder_separation before that metric
+    became always-descriptive (see TestAlwaysDescriptiveMetrics); same
+    numbers, since batting_xfactor_separation reuses the identical
+    computation and bounds."""
 
     def test_green_middle(self):
-        assert mr.classify("hip_shoulder_separation", 35.0) == "green"
+        assert mr.classify("batting_xfactor_separation", 35.0) == "green"
 
     def test_low_amber(self):
-        assert mr.classify("hip_shoulder_separation", 20.0) == "amber"
+        assert mr.classify("batting_xfactor_separation", 20.0) == "amber"
 
     def test_low_red(self):
-        assert mr.classify("hip_shoulder_separation", 5.0) == "red"
+        assert mr.classify("batting_xfactor_separation", 5.0) == "red"
 
     def test_high_amber(self):
         """Regression test for a real bug this session: the high-side
         amber/red split was inverted (amber band computed as zero-width,
         everything above green immediately red) until fixed."""
-        assert mr.classify("hip_shoulder_separation", 60.0) == "amber"
+        assert mr.classify("batting_xfactor_separation", 60.0) == "amber"
 
     def test_high_red(self):
-        assert mr.classify("hip_shoulder_separation", 84.0) == "red"
+        assert mr.classify("batting_xfactor_separation", 84.0) == "red"
 
     def test_band_kind_raises_without_amber_high_configured(self):
         """A 'band' kind metric MUST define amber_high — this should
         fail loudly, not silently misclassify, if that's ever missing."""
         from dataclasses import replace
-        broken = replace(mr.RANGES["hip_shoulder_separation"], amber_high=None)
-        original = mr.RANGES["hip_shoulder_separation"]
-        mr.RANGES["hip_shoulder_separation"] = broken
+        broken = replace(mr.RANGES["batting_xfactor_separation"], amber_high=None)
+        original = mr.RANGES["batting_xfactor_separation"]
+        mr.RANGES["batting_xfactor_separation"] = broken
         try:
             with pytest.raises(ValueError):
-                mr.classify("hip_shoulder_separation", 60.0)
+                mr.classify("batting_xfactor_separation", 60.0)
         finally:
-            mr.RANGES["hip_shoulder_separation"] = original
+            mr.RANGES["batting_xfactor_separation"] = original
+
+
+class TestAlwaysDescriptiveMetrics:
+    """REAL LITERATURE AUDIT (2026-08-06): front_knee_bracing and
+    hip_shoulder_separation have no universal validated pass/fail band for
+    ANY bowler_type, including pace — unlike trunk_lean/release_height/
+    head_stability, which do have a real pace band. front_knee_bracing is
+    a real technique CLASSIFICATION (Extended-Knee >=170deg vs Flexed-Knee
+    <170deg — Portus, Mason, Elliott, Pfitzner & Done, 2004), not a
+    higher-is-better scale; hip_shoulder_separation varies by bowling
+    action type (front-on/side-on/mixed), not skill (Senington, Lee &
+    Williams)."""
+
+    def test_front_knee_bracing_is_descriptive_for_pace_default(self):
+        assert mr.classify("front_knee_bracing", 170.0) == "descriptive"
+        assert mr.classify("front_knee_bracing", 150.0) == "descriptive"
+
+    def test_front_knee_bracing_is_descriptive_for_pace_explicit(self):
+        assert mr.classify("front_knee_bracing", 170.0, "pace") == "descriptive"
+
+    def test_front_knee_bracing_wrist_spin_override_still_works(self):
+        """The one real, validated override (Goswami et al. 2016) must
+        still fire — _ALWAYS_DESCRIPTIVE_METRICS only applies where no
+        override exists for that specific bowler_type."""
+        assert mr.classify("front_knee_bracing", 160.0, "wrist_spin") == "green"
+
+    def test_hip_shoulder_separation_is_descriptive_for_every_bowler_type(self):
+        assert mr.classify("hip_shoulder_separation", 35.0) == "descriptive"
+        assert mr.classify("hip_shoulder_separation", 35.0, "pace") == "descriptive"
+        assert mr.classify("hip_shoulder_separation", 35.0, "wrist_spin") == "descriptive"
+        assert mr.classify("hip_shoulder_separation", 35.0, "finger_spin") == "descriptive"
+
+    def test_has_validated_range_matches_classify(self):
+        assert mr.has_validated_range("front_knee_bracing", None) is False
+        assert mr.has_validated_range("front_knee_bracing", "wrist_spin") is True
+        assert mr.has_validated_range("hip_shoulder_separation", None) is False
+        assert mr.has_validated_range("release_height", None) is True
+
+    def test_descriptive_note_classifies_extended_vs_flexed_knee(self):
+        extended = mr.descriptive_note("front_knee_bracing", 175.0)
+        flexed = mr.descriptive_note("front_knee_bracing", 150.0)
+        assert "Extended-Knee" in extended
+        assert "Flexed-Knee" in flexed
+        assert "Portus" in extended and "Portus" in flexed
+
+    def test_descriptive_note_hip_shoulder_separation_explains_action_type(self):
+        note = mr.descriptive_note("hip_shoulder_separation")
+        assert "action type" in note.lower()
+        assert "Senington" in note
+
+
+class TestTrunkLeanReversedDirection:
+    """DIRECTION FIX (2026-08-06): trunk_lean used to score less forward
+    lean as better (lower_better, green 0-20deg). Real research (Elliott
+    1986; Portus et al. 2004; Worthington et al. 2013a) shows MORE forward
+    lean at release correlates with FASTER ball speed — now higher_better,
+    green=(13,30), amber=(5,13), sourced from Felton, Lister, Worthington
+    & King (2018/19): elite male mean ~20.5 degrees forward flexion at
+    release (159.5 +/- 7.8 on an anatomical-180-neutral convention)."""
+
+    def test_green_at_real_elite_mean(self):
+        assert mr.classify("trunk_lean", 20.5) == "green"
+
+    def test_green_at_lower_boundary(self):
+        assert mr.classify("trunk_lean", 13.0) == "green"
+
+    def test_very_upright_no_longer_reads_as_optimal(self):
+        """The OLD range called 0 degrees "green" (Optimal Upright
+        Posture) — real research says minimal forward lean is now the
+        concerning end, not the ideal one."""
+        assert mr.classify("trunk_lean", 0.0) == "red"
+
+    def test_amber_transition_band(self):
+        assert mr.classify("trunk_lean", 8.0) == "amber"
+
+    def test_high_lean_still_green_no_established_ceiling(self):
+        """No real upper ceiling exists in the literature for "too much"
+        forward lean at release — same reasoning as release_height's own
+        no-ceiling fix."""
+        assert mr.classify("trunk_lean", 45.0) == "green"
 
 
 class TestClassifyUnknownAndInvalid:
@@ -155,7 +244,7 @@ class TestDescribeRangeMatchesClassify:
         classify() doesn't actually enforce."""
         desc = mr.describe_range("release_height")
         assert "130%" not in desc
-        assert "85%+" in desc
+        assert "118%+" in desc
 
     def test_a_high_release_height_is_not_contradicted_by_the_range_text(self):
         value = 1.45
@@ -260,9 +349,13 @@ class TestBowlerTypeClassification:
         assert mr.classify("hip_shoulder_separation", float("nan"), "finger_spin") == "unknown"
 
     def test_describe_range_states_no_benchmark_for_a_descriptive_metric(self):
+        """hip_shoulder_separation is always-descriptive now (real audit,
+        2026-08-06 — see TestAlwaysDescriptiveMetrics), so its real text
+        is the same technique-dependence note regardless of bowler_type,
+        not a generic "no {style} benchmark" message."""
         desc = mr.describe_range("hip_shoulder_separation", "wrist_spin")
-        assert "no validated" in desc.lower()
-        assert "wrist-spin" in desc.lower()
+        assert "action type" in desc.lower()
+        assert "senington" in desc.lower()
 
     def test_describe_range_reflects_the_real_wrist_spin_knee_override(self):
         desc = mr.describe_range("front_knee_bracing", "wrist_spin")
@@ -272,6 +365,10 @@ class TestBowlerTypeClassification:
 
     def test_describe_range_default_is_unaffected(self):
         """Same regression this whole class exists to prevent, applied to
-        describe_range: the pre-existing 2-arg call must be untouched."""
+        describe_range: the pre-existing 2-arg call must be untouched.
+        front_knee_bracing is always-descriptive for pace now (real audit,
+        2026-08-06 — see TestAlwaysDescriptiveMetrics), so the real text
+        is the Extended/Flexed-Knee classification note, not the old
+        160-180 band description."""
         assert mr.describe_range("front_knee_bracing") == mr.describe_range("front_knee_bracing", None)
-        assert "160" in mr.describe_range("front_knee_bracing")
+        assert "Portus" in mr.describe_range("front_knee_bracing")

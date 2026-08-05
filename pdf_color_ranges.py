@@ -46,9 +46,29 @@ def build_color_coded_range_table(metrics: dict, bold_body: ParagraphStyle, bowl
         tier = mr.classify(key, val, bowler_type)
         zone_label = {"green": "Optimal", "amber": "Acceptable", "red": "Critical",
                       "unknown": "No Data", "descriptive": "Descriptive (no benchmark yet)"}[tier]
-        if tier == "descriptive":
-            r = mr.RANGES[key]
-            rows.append([r.label, _format_value(key, val), zone_label, "N/A for this bowling style"])
+        r = mr.RANGES[key]
+        if tier == "unknown":
+            # FIX (2026-08-06, found on a real clip): "unknown" (a genuine
+            # tracking failure this delivery) used to fall into the same
+            # branch as a real validated band, showing e.g. "No Data" next
+            # to "Optimal: 160-180deg" for front_knee_bracing — a band
+            # that's DEAD for classification now regardless (always-
+            # descriptive for pace — see metric_ranges._ALWAYS_DESCRIPTIVE_
+            # METRICS). A missing value must never be shown next to ANY
+            # band text, real or not.
+            rows.append([r.label, "No Data", zone_label, "—"])
+        elif tier == "descriptive":
+            # FIX (2026-08-06): was a generic "N/A for this bowling style"
+            # for every descriptive-tier metric — confusing for
+            # front_knee_bracing/hip_shoulder_separation, which are
+            # descriptive for PACE too (real audit found no universal
+            # band exists for either, for any bowler_type — see
+            # metric_ranges._ALWAYS_DESCRIPTIVE_METRICS), so "this bowling
+            # style" read oddly when the style literally was pace.
+            # descriptive_note() gives the real, metric-specific, sourced
+            # text instead (e.g. the actual Extended/Flexed-Knee
+            # classification for front_knee_bracing).
+            rows.append([r.label, _format_value(key, val), zone_label, mr.descriptive_note(key, val, bowler_type)])
         else:
             r = mr.SPIN_RANGE_OVERRIDES.get((key, bowler_type), mr.RANGES[key])
             optimal_text = r.display_optimal

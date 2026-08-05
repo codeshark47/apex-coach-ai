@@ -687,12 +687,17 @@ def render_annotated_video(video_path: str, output_path: str,
     else:
         CHART_MIN, CHART_MAX = 0.0, 180.0
         CHART_GRIDLINES = (0, 90, 180)
-    # Same bowler_type-aware lookup _tier_and_color uses below — a spin
-    # bowler with no validated range for hero_key must not have this chart
-    # silently draw pace's green band as if it applied (see
-    # SPIN_RANGE_OVERRIDES / classify()'s "descriptive" tier).
-    _hero_range = mr.SPIN_RANGE_OVERRIDES.get((hero_key, bowler_type)) if bowler_type in ("finger_spin", "wrist_spin") else None
-    _hero_has_validated_range = _hero_range is not None or bowler_type not in ("finger_spin", "wrist_spin")
+    # Same mr.has_validated_range() lookup _tier_and_color uses below — a
+    # spin bowler with no validated range for hero_key must not have this
+    # chart silently draw pace's green band as if it applied, and (real
+    # audit, 2026-08-06) front_knee_bracing/hip_shoulder_separation must
+    # not draw one for PACE either — neither has a universal validated
+    # band for ANY bowler_type (see metric_ranges._ALWAYS_DESCRIPTIVE_METRICS
+    # / classify()'s "descriptive" tier). has_validated_range() is the
+    # single source of truth every render site (dashboard, PDF, this
+    # chart, the Bowler Profile history chart) now shares.
+    _hero_has_validated_range = mr.has_validated_range(hero_key, bowler_type)
+    _hero_range = mr.SPIN_RANGE_OVERRIDES.get((hero_key, bowler_type))
     _hero_green_lo, _hero_green_hi = (_hero_range or mr.RANGES[hero_key]).green
     # SHRUNK from 38% of frame height to a slim ~16% strip — the old chart
     # dominated a third of the video, which read as a dashboard bolted onto
