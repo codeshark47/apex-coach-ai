@@ -49,14 +49,15 @@ def _hip_shoulder_row(**overrides):
 class TestHipShoulderSeparation:
     def test_nan_landmark_returns_none_not_blocked_rotation(self):
         """The exact bug found on real footage: a NaN shoulder landmark
-        used to fall through to tier='Blocked rotation', status='success'
-        — a confident, false coaching claim generated from a pure
-        tracking failure."""
+        used to fall through to tier='Blocked rotation' (renamed 'Low
+        Separation' 2026-08-07, see TestHipShoulderTierText below),
+        status='success' — a confident, false coaching claim generated
+        from a pure tracking failure."""
         df = pd.DataFrame([_hip_shoulder_row(LEFT_SHOULDER_x=np.nan)])
         result = o.calculate_hip_shoulder_separation(df, ffc_frame=10)
         assert result["degrees"] is None
         assert result["status"] == "error"
-        assert result["tier"] != "Blocked rotation"
+        assert result["tier"] not in ("Blocked rotation", "Low Separation", "Moderate Separation", "High Separation")
 
     def test_missing_frame_returns_error(self):
         df = pd.DataFrame([_hip_shoulder_row(frame=1)])
@@ -84,10 +85,44 @@ class TestHipShoulderSeparation:
         # or a value anywhere near the raw (unwrapped) ~356 degree diff.
         assert 0 <= result["degrees"] <= 90
 
-    def test_optimal_stretch_tier_boundary(self):
+    def test_computes_successfully_for_a_plausible_rotated_pose(self):
         assert o.calculate_hip_shoulder_separation(
             pd.DataFrame([_hip_shoulder_row()]), ffc_frame=10
         )["status"] == "success"
+
+
+class TestHipShoulderTierText:
+    """FIX (2026-08-07, real literature audit + a real coach test that
+    surfaced it): "Optimal stretch"/"Moderate separation"/"Blocked
+    rotation" were value judgments using unsourced 25/15-degree cutoffs.
+    This metric is now always-descriptive (real research — Senington, Lee
+    & Williams, 2018 — shows separation varies by bowling action type, not
+    skill), so the raw tier text is now purely descriptive of magnitude,
+    with no "good/bad" framing. Confirmed live: Gemini's coaching
+    narrative had repeated "described as blocked rotation" straight from
+    this field even though the ZONE correctly said DESCRIPTIVE."""
+
+    def test_high_separation(self):
+        row = _hip_shoulder_row(RIGHT_SHOULDER_y=0.42)  # verified 30.96 degrees
+        result = o.calculate_hip_shoulder_separation(pd.DataFrame([row]), ffc_frame=10)
+        assert result["status"] == "success"
+        assert result["degrees"] >= 25.0
+        assert result["tier"] == "High Separation"
+
+    def test_moderate_separation(self):
+        row = _hip_shoulder_row(RIGHT_SHOULDER_y=0.38)  # verified 21.8 degrees
+        result = o.calculate_hip_shoulder_separation(pd.DataFrame([row]), ffc_frame=10)
+        assert result["status"] == "success"
+        assert 15.0 <= result["degrees"] < 25.0
+        assert result["tier"] == "Moderate Separation"
+
+    def test_low_separation(self):
+        row = _hip_shoulder_row(RIGHT_SHOULDER_y=0.35)  # verified 14.04 degrees, default row
+        result = o.calculate_hip_shoulder_separation(pd.DataFrame([row]), ffc_frame=10)
+        assert result["status"] == "success"
+        assert result["degrees"] < 15.0
+        assert result["tier"] == "Low Separation"
+        assert result["tier"] not in ("Blocked rotation", "Optimal stretch", "Moderate separation")
 
 
 def _release_row(wrist_y=0.40, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20):
@@ -151,6 +186,39 @@ class TestReleaseHeightRatio:
             "Standard Mid-Arm Release", "High-Release Leverage", "Low-Sling Action",
         )
 
+
+class TestReleaseHeightClassificationThresholds:
+    """FIX (2026-08-07, real bug found on a live clip): this raw
+    classification string is computed independently of metric_ranges.
+    RANGES["release_height"] and drifted out of sync with it when the
+    real literature audit re-sourced that range to 1.18/1.08 (Felton et
+    al. 2018) — confirmed live, a 60.9% ratio (deep red by the real
+    bounds) showed the passable-sounding "Low-Sling Action" from a stale
+    0.75 threshold that no longer matched anything in metric_ranges.py.
+    Pins the real, current thresholds down directly so they can't drift
+    again without a test noticing."""
+
+    def test_high_release_leverage_at_the_real_green_floor(self):
+        row = _release_row(wrist_y=0.07, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20)
+        result = o.calculate_release_height_ratio_safe(row, bowling_arm="right", reference_row=row)
+        assert result["status"] == "success"
+        assert result["ratio"] >= 1.18
+        assert result["classification"] == "High-Release Leverage"
+
+    def test_standard_mid_arm_at_the_real_amber_floor(self):
+        row = _release_row(wrist_y=0.148, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20)
+        result = o.calculate_release_height_ratio_safe(row, bowling_arm="right", reference_row=row)
+        assert result["status"] == "success"
+        assert 1.08 <= result["ratio"] < 1.18
+        assert result["classification"] == "Standard Mid-Arm Release"
+
+    def test_low_sling_below_the_real_amber_floor(self):
+        row = _release_row(wrist_y=0.55, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20)
+        result = o.calculate_release_height_ratio_safe(row, bowling_arm="right", reference_row=row)
+        assert result["status"] == "success"
+        assert result["ratio"] < 1.08
+        assert result["classification"] == "Low-Sling Action"
+
     def test_default_call_reports_head_ankle_span_source_not_recalibrating(self):
         """Every pre-existing caller (not passing segment_sum_body_height)
         must see body_height_source="head_ankle_span" and
@@ -207,6 +275,49 @@ class TestReleaseHeightRatio:
         assert new_result["status"] == "success"
         assert new_result["ratio"] < 1.30
         assert new_result["recalibration_pending"] is True
+
+
+class TestReleaseFrameTrackingUncertain:
+    """Regression coverage for a real bug found testing a live clip
+    (2026-08-07): release_height came back 35.1% ("Low-Sling Action", a
+    confident verdict) on a delivery whose OWN speed-estimate section
+    already said tracking around release was too unstable for a reliable
+    reading — the same wrist landmark this ratio's numerator depends on.
+    br_tracking_confidence threads that existing signal through instead of
+    computing anything new."""
+
+    def test_low_confidence_flags_the_result_without_changing_the_ratio(self):
+        row = _release_row(wrist_y=0.40, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20)
+        high = o.calculate_release_height_ratio_safe(
+            row, bowling_arm="right", reference_row=row, br_tracking_confidence="high",
+        )
+        low = o.calculate_release_height_ratio_safe(
+            row, bowling_arm="right", reference_row=row, br_tracking_confidence="low",
+        )
+        assert high["release_frame_tracking_uncertain"] is False
+        assert low["release_frame_tracking_uncertain"] is True
+        # The flag discloses, it never alters the actual measurement.
+        assert high["ratio"] == low["ratio"]
+
+    def test_default_call_with_no_confidence_arg_does_not_flag(self):
+        """Every pre-existing caller (not passing br_tracking_confidence)
+        must see release_frame_tracking_uncertain=False — this must be
+        fully opt-in, same discipline as segment_sum_body_height's own
+        backward-compatibility test above."""
+        row = _release_row(wrist_y=0.40, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20)
+        result = o.calculate_release_height_ratio_safe(row, bowling_arm="right", reference_row=row)
+        assert result["release_frame_tracking_uncertain"] is False
+
+    def test_coach_confirmed_wrist_point_bypasses_the_flag(self):
+        """A human directly clicking the real wrist/ball position isn't
+        subject to the tracker's own confidence — same reasoning as the
+        1.30 implausibility ceiling already skipping wrist_override_norm."""
+        row = _release_row(wrist_y=0.40, ankle_y=0.85, hip_y=0.55, knee_y=0.70, nose_y=0.20)
+        result = o.calculate_release_height_ratio_safe(
+            row, bowling_arm="right", reference_row=row,
+            wrist_override_norm=(0.5, 0.40), br_tracking_confidence="low",
+        )
+        assert result["release_frame_tracking_uncertain"] is False
 
 
 class TestSegmentSumBodyHeight:
@@ -292,15 +403,121 @@ class TestSegmentSumBodyHeight:
     def test_rejects_a_genuinely_bent_over_torso(self):
         """The real failure mode this function guards against: a genuine
         trunk bend (nose not above shoulder/hip) — unlike a lifted leg,
-        this must still be excluded."""
+        this must still be excluded.
+
+        VALUE UPDATED (2026-08-07, independent-per-segment redesign): a
+        minority of compressed head/torso rows now gets washed out by
+        THAT segment's own 90th percentile specifically, while thigh/shin
+        — unaffected by the bad rows (same knee/hip/ankle values as the
+        good rows) — independently contribute their own full, undiminished
+        90th percentile. Summing four independently-maximized segments can
+        legitimately land slightly ABOVE what one combined-per-frame
+        percentile gave (0.60), since each segment's best evidence no
+        longer has to occur in the same single frame — a real, intended
+        consequence of no longer being bottlenecked by whichever body part
+        tracks worst in any one frame (see the real 2026-08-07 clip this
+        whole redesign was found on: thigh/shin data was 10x scarcer than
+        head/torso data early in a real run-up)."""
         good_rows = [self._upright_row(f) for f in range(12)]
         bad_rows = [self._upright_row(f, nose_y=0.86, sh_y=0.87, hip_y=0.88) for f in range(12, 15)]
         df = pd.DataFrame(good_rows + bad_rows)
         result = o._compute_segment_sum_body_height(df, "right", search_end_frame=20)
-        # The bent-over rows would drag a percentile down/skew it if
-        # included - result should stay close to the genuinely upright
-        # rows' true ~0.60 value.
+        assert result == pytest.approx(0.631, abs=0.01)
+
+    @staticmethod
+    def _distant_row(frame, scale=0.2, center=0.5):
+        """A genuinely SMALLER, more distant subject — every landmark
+        scaled toward the frame center, simulating a real person standing
+        much farther from the camera (same relative pose, smaller on
+        screen). Used to simulate a batsman/bystander visible before the
+        bowler enters frame."""
+        base = TestSegmentSumBodyHeight._upright_row(frame)
+        return {
+            k: (frame if k == "frame" else center + (v - center) * scale)
+            for k, v in base.items()
+        }
+
+    def test_real_bug_scenario_distant_bystander_before_bowler_no_longer_contaminates(self):
+        """Regression test for a real bug the coach caught (2026-08-07):
+        on his actual clip, the batsman was visible (small, distant) for
+        the first ~75 frames before the bowler entered frame — confirmed
+        directly on that clip that shoulder width jumped ~3.7x right at
+        the entry point. Even correct seeding on the bowler didn't fully
+        prevent the identity walk from bridging back through the gap and
+        locking onto the distant bystander for a stretch of frames (a
+        real, documented limitation of that walk, not fixed here). This
+        function's own scale-consistency guard must now exclude those
+        distant frames using the genuinely-bowler frames near the window
+        end as the reference scale, instead of quietly blending a much
+        smaller, unrelated person into the body-height baseline."""
+        bystander_rows = [self._distant_row(f) for f in range(20)]
+        bowler_rows = [self._upright_row(f) for f in range(20, 35)]
+        df = pd.DataFrame(bystander_rows + bowler_rows)
+        result = o._compute_segment_sum_body_height(df, "right", search_end_frame=35)
+        assert result is not None
+        # Must reflect the real bowler's ~0.60 body height, not a value
+        # dragged down by 20 much-smaller bystander frames.
         assert result == pytest.approx(0.60, abs=0.03)
+
+    def test_bystander_frame_that_coincidentally_matches_bowler_scale_still_excluded(self):
+        """FIX (2026-08-08, after independently evaluating a Gemini
+        suggestion — see [[feedback_evaluate_external_ai_advice]]): the
+        first version of the scale guard checked each frame's scale in
+        isolation and leaked 8 of 35 real contaminated frames through on
+        the coach's actual clip, because a bystander's own pose variation
+        let a few individual frames' values coincidentally fall inside
+        the bowler's normal range. This is that exact scenario: an
+        otherwise-small, DISTANT bystander with one frame that happens to
+        match the bowler's scale (e.g. leaning toward camera), sitting on
+        the wrong side of a real gap. A per-frame-only check would wrongly
+        include it; the backward walk must not, since it isn't reachable
+        by an unbroken run back from the trusted anchor near the window's
+        end. Made numerically detectable: the leaking frame is scaled
+        LARGER than the true bowler (not just "big enough to pass"), so if
+        it wrongly slipped into a 90th-percentile aggregate the result
+        would measurably shift upward — this isn't just a plausible-
+        looking number, it's evidence the frame was truly excluded."""
+        bystander_rows = [self._distant_row(f) for f in range(20)]
+        bystander_rows[10] = self._distant_row(10, scale=1.4)  # briefly matches/exceeds bowler scale
+        bowler_rows = [self._upright_row(f) for f in range(20, 35)]
+        df = pd.DataFrame(bystander_rows + bowler_rows)
+        result = o._compute_segment_sum_body_height(df, "right", search_end_frame=35)
+        clean_result = o._compute_segment_sum_body_height(
+            pd.DataFrame([self._distant_row(f) for f in range(20)][:10]
+                         + [self._distant_row(f) for f in range(20)][11:] + bowler_rows),
+            "right", search_end_frame=35,
+        )
+        assert result is not None
+        # If the inflated frame 10 had leaked in, a 90th-percentile
+        # aggregate over the bowler-era samples would be measurably
+        # pulled toward its larger value - confirm it wasn't.
+        assert result == pytest.approx(clean_result, abs=0.001)
+
+    def test_real_bug_scenario_scarce_leg_landmarks_no_longer_forces_a_fallback(self):
+        """Regression test for the real bug found on a live clip
+        (2026-08-07): 67 of 93 early frames had a real nose+shoulders+hip
+        detection, but only 6 also had the knee+ankle (legs frequently out
+        of frame/undetected that early, a real framing limitation, not a
+        tracking glitch) — requiring the full chain threw away the 61
+        extra good head/torso frames and left too few samples to trust,
+        forcing a silent fallback to the OLD single-frame method this
+        function exists to replace. This is the same shape of scenario,
+        scaled down: plenty of head/torso frames, only just enough
+        (MIN_LEG_SEGMENT_SAMPLES) leg frames — must now succeed instead of
+        returning None."""
+        rows = []
+        for f in range(30):
+            row = self._upright_row(f)
+            if f >= 6:  # only the first 6 frames keep real leg landmarks
+                row["LEFT_KNEE_x"] = np.nan
+                row["LEFT_KNEE_y"] = np.nan
+                row["LEFT_ANKLE_x"] = np.nan
+                row["LEFT_ANKLE_y"] = np.nan
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        result = o._compute_segment_sum_body_height(df, "right", search_end_frame=35)
+        assert result is not None
+        assert result == pytest.approx(0.60, abs=0.02)
 
     def test_returns_none_with_too_few_plausible_frames(self):
         """Too little evidence to trust a baseline from - caller must fall

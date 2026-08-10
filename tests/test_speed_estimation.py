@@ -171,6 +171,28 @@ class TestComputeReleaseArmSpeedNeverFabricatesImpossibleNumbers:
         else:
             assert result["status"] == "error"
 
+    def test_tracking_unstable_failure_carries_a_machine_readable_reason(self):
+        """FIX (2026-08-07, real bug found on a live clip): this failure
+        used to be identifiable only by string-matching the human message
+        — orchestrator.py's release_height/head_stability tracking-
+        uncertain flag relies on a DIFFERENT signal (detect_delivery_
+        events' br_confidence, a coarser whole-window aggregate) that can
+        stay "high" even when this stricter frame-level check fails,
+        confirmed live: the UI showed this exact instability message for
+        the speed estimate while release_height's own warning never
+        appeared. streamlit_app.py now cross-checks this "reason" field
+        directly instead of relying on br_confidence alone — this test
+        pins down that the field actually exists and is set correctly
+        whenever this specific failure fires."""
+        df, fw, fh = self._df_with_glitch()  # fixed seed=42 - deterministic
+        events = {"BFC": 0, "FFC": 10, "BR": 20}
+        result = se.compute_release_arm_speed(
+            df, events, fps=30, frame_width=fw, frame_height=fh,
+            meters_per_pixel=0.025, video_path=None, bowling_arm_override="right",
+        )
+        assert result["status"] == "error"
+        assert result["reason"] == "tracking_unstable"
+
 
 class TestComputeEstimatedStandingHeight:
     """

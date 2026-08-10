@@ -290,6 +290,7 @@ def render_annotated_video(video_path: str, output_path: str,
         _find_grounded_reference_near,
         _nearest_complete_row,
         _draw_panel,
+        _compute_segment_sum_body_height,
     )
 
     cap = cv2.VideoCapture(video_path)
@@ -625,6 +626,19 @@ def render_annotated_video(video_path: str, output_path: str,
     # the video can never disagree with the report, respects bowling_arm
     # instead of always assuming right-arm, and shows nothing rather than a
     # fabricated number when tracking is unreliable.
+    #
+    # REAL BUG FOUND (2026-08-07, live coach test): this call omitted
+    # segment_sum_body_height entirely, so it silently fell back to the
+    # OLD raw head-ankle span baseline — while the report card (orchestrator.
+    # run_complete_bowling_analysis) had already been using the real
+    # segment-sum fix for two days. On the coach's actual clip this burned
+    # 147% into the video while the report correctly said 53.4% — the
+    # exact "can never disagree with the report" claim this comment made,
+    # silently broken. Computed fresh here with the identical call
+    # orchestrator.py itself uses (same bowling_arm, same BFC-anchored
+    # search window) so both numbers are guaranteed to come from the same
+    # formula again.
+    segment_sum_body_height_for_video = _compute_segment_sum_body_height(df, bowling_arm, events.get("BFC"))
     release_height_pct = None
     # Normalized (0-1) points for the release-height line drawn on the BR
     # frame: from the bowling-arm wrist straight down to ground level (the
@@ -656,7 +670,8 @@ def render_annotated_video(video_path: str, output_path: str,
             )
             rh = calculate_release_height_ratio_safe(br_row_for_release, bowling_arm=bowling_arm,
                                                       reference_row=height_ref_for_release,
-                                                      wrist_override_norm=wrist_override_norm)
+                                                      wrist_override_norm=wrist_override_norm,
+                                                      segment_sum_body_height=segment_sum_body_height_for_video)
             if rh.get("ratio") is not None:
                 release_height_pct = rh["ratio"] * 100
                 dbg = rh.get("debug_raw") or {}

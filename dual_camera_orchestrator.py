@@ -133,7 +133,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm,
                                                               reference_row=side_height_ref,
                                                               wrist_override_norm=side_wrist_override_norm,
-                                                              segment_sum_body_height=side_segment_sum_body_height)
+                                                              segment_sum_body_height=side_segment_sum_body_height,
+                                                              br_tracking_confidence=side_events.get("BR_confidence"))
 
     # FFC-to-Release knee angle delta ("yielding knee" check from external
     # biomechanical audit) — same logic as Single Camera mode.
@@ -196,7 +197,8 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         rear_release_height = calculate_release_height_ratio_safe(rear_br_rows.iloc[0], bowling_arm=bowling_arm,
                                                                     reference_row=rear_height_ref,
                                                                     wrist_override_norm=rear_wrist_override_norm,
-                                                                    segment_sum_body_height=rear_segment_sum_body_height)
+                                                                    segment_sum_body_height=rear_segment_sum_body_height,
+                                                                    br_tracking_confidence=rear_events.get("BR_confidence"))
 
     release_height_source = "side"
     if release_height.get("status") != "success" and rear_release_height.get("status") == "success":
@@ -289,6 +291,12 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                 # stream's coach-corrected wrist point produced a real one)
                 "measured_from": release_height_source,
                 "recalibration_pending": release_height.get("recalibration_pending", False),
+                # See Single Camera's orchestrator.calculate_release_height_
+                # ratio_safe br_tracking_confidence docstring (2026-08-07) —
+                # already correctly reflects whichever stream (side/rear)
+                # ended up being used, since release_height was reassigned
+                # to rear_release_height above when the side reading failed.
+                "release_frame_tracking_uncertain": release_height.get("release_frame_tracking_uncertain", False),
             },
             "hip_shoulder_separation": {
                 "degrees": clean_numeric(hip_separation.get("degrees")),
@@ -300,6 +308,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
                 "tier": head_stability.get("tier", "Unknown"),
                 "status": head_stability.get("status", "error"),
                 "recalibration_pending": head_stability.get("recalibration_pending", False),
+                # head_stability is computed from the rear stream here (see
+                # the call above) — same motion-blur-at-release reasoning as
+                # Single Camera's identical flag.
+                "release_window_tracking_uncertain": rear_events.get("BR_confidence") == "low",
             },
             # BUG FIX (found during a broader audit): this used to only
             # exist at the TOP level of this return dict. Single Camera's

@@ -83,6 +83,11 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     release_ratio = release_data.get("ratio")
     release_descriptor = release_data.get("classification") or release_data.get("tier") or "Unknown"
     release_recalibration_pending = bool(release_data.get("recalibration_pending"))
+    # See orchestrator.calculate_release_height_ratio_safe's br_tracking_
+    # confidence docstring (2026-08-07) — motion blur at release can
+    # corrupt the exact wrist landmark this ratio depends on without
+    # tripping the numeric implausibility ceiling.
+    release_tracking_uncertain = bool(release_data.get("release_frame_tracking_uncertain"))
 
     head_data = metrics.get("head_stability", {})
     head_val = head_data.get("value")
@@ -90,6 +95,7 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
         head_val = head_data.get("deviation_index")
     head_descriptor = head_data.get("classification") or head_data.get("tier") or "Unknown"
     head_recalibration_pending = bool(head_data.get("recalibration_pending"))
+    head_tracking_uncertain = bool(head_data.get("release_window_tracking_uncertain"))
 
     # --- SINGLE SOURCE OF TRUTH ---
     # ZONE below comes from metric_ranges.py — the SAME classifier used by
@@ -169,8 +175,8 @@ descriptor in parentheses, which is supplementary color commentary only):
 1. Lead Knee Bracing Angle: {fmt(knee_angle)} — ZONE: {knee_zone} (descriptor: {knee_descriptor})
 2. Trunk Lean Deflection: {fmt(trunk_lean)} — ZONE: {lean_zone} (descriptor: {lean_descriptor})
 3. Hip-Shoulder Separation: {fmt(hip_sep)} — ZONE: {hip_zone} (descriptor: {hip_descriptor})
-4. Release Height Ratio: {release_display} — ZONE: {release_zone} (descriptor: {release_descriptor}){" [RECALIBRATION PENDING - see rule below]" if release_recalibration_pending else ""}
-5. Head Stability Variance: {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor}){" [RECALIBRATION PENDING - see rule below]" if head_recalibration_pending else ""}
+4. Release Height Ratio: {release_display} — ZONE: {release_zone} (descriptor: {release_descriptor}){" [RECALIBRATION PENDING - see rule below]" if release_recalibration_pending else ""}{" [TRACKING UNCERTAIN - see rule below]" if release_tracking_uncertain else ""}
+5. Head Stability Variance: {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor}){" [RECALIBRATION PENDING - see rule below]" if head_recalibration_pending else ""}{" [TRACKING UNCERTAIN - see rule below]" if head_tracking_uncertain else ""}
 {missing_note}
 REFERENCE RANGES (CBC-style classification — authoritative, matches the UI and PDF report exactly):
 {reference_ranges_block}
@@ -178,10 +184,12 @@ REFERENCE RANGES (CBC-style classification — authoritative, matches the UI and
 COACHING PHILOSOPHY:
 - Some bowlers have unconventional but effective actions built through years of muscle memory.
 - Do not recommend correcting a metric whose ZONE is ACCEPTABLE if the bowler appears injury-free.
-- Only prescribe drills for metrics whose ZONE is CRITICAL, or metrics showing severe technical blocks (like 'Blocked rotation' or extreme outliers).
+- Only prescribe drills for metrics whose ZONE is CRITICAL, or metrics showing severe technical blocks (extreme outliers) — but see the DESCRIPTIVE/RECALIBRATION-PENDING/TRACKING-UNCERTAIN rules below FIRST, which override this and exclude a metric from drill-prescription entirely regardless of how alarming its descriptor text reads.
+  FIX (2026-08-07, real bug found in an actual coaching report): this rule used to name 'Blocked rotation' as an example trigger — that was Hip-Shoulder Separation's OLD raw descriptor, before the real literature audit found this metric is always-descriptive (varies by bowling action type, not skill; see the DESCRIPTIVE ZONE RULE). That example directly contradicted the DESCRIPTIVE ZONE RULE below and was confirmed live: a report correctly said in its narrative "there are no metrics identified as requiring immediate correction," then prescribed 3 real drills targeting Hip-Shoulder Separation anyway — the exact metric its own narrative had just excluded. A metric's ZONE (DESCRIPTIVE/RECALIBRATION-PENDING/TRACKING-UNCERTAIN) always wins over how its descriptor text sounds.
 - If trunk lean exceeds 45 degrees, note that the absolute measurement may be exaggerated by a 2D camera angle artifact, but still comment on managing the load from excessive forward trunk flexion at release.
 - DESCRIPTIVE ZONE RULE: a ZONE of "DESCRIPTIVE (see reference ranges below)" means there is currently no validated pass/fail range for this metric — either because published research doesn't give a validated target for this bowler's style (common for spin bowlers), or because the metric itself has no universal target for ANY style (Lead Knee Bracing and Hip-Shoulder Separation are always descriptive now — real research shows both are technique classifications, not a higher/lower-is-better scale: Lead Knee Bracing splits into real Extended-Knee/Flexed-Knee techniques that are both legitimate at the elite level, and Hip-Shoulder Separation varies by bowling action type, not skill). Report the number as neutral, informational context only (e.g. "for reference, X was measured at..."). NEVER call it optimal, acceptable, or critical, and NEVER prescribe a drill based on a DESCRIPTIVE metric alone.
 - RECALIBRATION-PENDING RULE: if ANY metric above is marked "[RECALIBRATION PENDING]", its underlying measurement was just corrected to fix a real false-reading bug, but the OPTIMAL/ACCEPTABLE/CRITICAL bands it's compared against were tuned for the OLD measurement and have not been re-validated for the new one yet. You may still report the number and its ZONE as useful, directional information, but explicitly note in the narrative that this specific reading is provisional pending re-validation, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
+- TRACKING-UNCERTAIN RULE (2026-08-07): if ANY metric above is marked "[TRACKING UNCERTAIN]", the pose tracking right around ball release was flagged unstable (heavy motion blur is the common cause) for THIS specific delivery — the same landmark data that metric is computed from. This is a data-quality flag, not a technique finding: explicitly note in the narrative that this specific reading may be affected by tracking quality rather than real technique, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 
 Your task is to produce a two-section technical coaching report.
 Separate the two sections with exactly one line containing only: ---
@@ -195,7 +203,9 @@ which has happened before and undermines trust in the whole report. Explicitly c
 Clearly distinguish between what requires immediate correction (CRITICAL zone), what requires monitoring (ACCEPTABLE zone), and what has no established benchmark yet (DESCRIPTIVE zone, per the rule above).
 
 SECTION 2 — PRESCRIBED DRILLS:
-Provide exactly 3 drills targeting the weakest CRITICAL zone or technically blocked metric. If no metric is CRITICAL (common for a spin bowler whose metrics are mostly DESCRIPTIVE), say so plainly instead of inventing a drill for a DESCRIPTIVE or ACCEPTABLE metric.
+FIRST, build the real eligible-metric list: a metric qualifies ONLY if its ZONE is CRITICAL AND it is not marked DESCRIPTIVE, RECALIBRATION-PENDING, or TRACKING-UNCERTAIN anywhere above. (A real bug in an actual report: this exact scenario occurred with Hip-Shoulder Separation DESCRIPTIVE — 3 drills got prescribed for it anyway. That must never happen again.)
+If that list is empty, say so plainly in one sentence (e.g. "No metric currently qualifies for a corrective drill — flagged readings are either descriptive or provisional pending re-validation.") and stop — do NOT then prescribe drills for a DESCRIPTIVE/RECALIBRATION-PENDING/TRACKING-UNCERTAIN metric as a fallback, no matter how alarming its descriptor text reads.
+If the list is non-empty, provide exactly 3 drills targeting the weakest qualifying metric.
 Format each drill exactly as a single line without extra line breaks:
 DRILL NAME: explaining what it corrects and how to perform it.
 """

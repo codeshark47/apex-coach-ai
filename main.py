@@ -494,6 +494,89 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
     }
 
 
+def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: list,
+                                  start_idx: int, end_idx: int) -> dict:
+    """
+    Re-extracts RAW (unsmoothed, un-outlier-filtered) normalized (0-1)
+    positions for specific named landmarks, directly from the source
+    video, for frames [start_idx, end_idx] inclusive.
+
+    WHY THIS EXISTS (2026-08-07): speed_estimation._extract_raw_wrist_window
+    already proved and fixed this exact problem for wrist velocity — the
+    saved landmarks CSV has been through Hampel-filter outlier rejection
+    AND a 5-frame rolling-mean smoothing pass, correct for a stable-
+    looking skeleton and reliable event timing, but that same smoothing
+    dilutes a landmark's TRUE position at a sharp, brief moment like ball
+    release exactly the same way it dilutes peak velocity. That fix was
+    only ever applied to the wrist for the speed estimate — release_height
+    (ankle/nose/knee/hip) and head_stability (nose/shoulders across a
+    whole window) kept reading the smoothed CSV, unnecessarily carrying
+    the same diluted-position problem the wrist fix already solved
+    elsewhere. This generalizes that proven pattern to any set of named
+    landmarks over any window, instead of one hardcoded landmark.
+
+    Processes every frame from 0 up to end_idx (not just the window) to
+    preserve VIDEO mode's real temporal continuity — matches the proven
+    wrist-window pattern exactly; detection needs earlier frames to have
+    "warmed up" properly.
+
+    Returns {frame_index: {landmark_name: (x_norm, y_norm, visibility)}}
+    — a frame/landmark with no confident detection is simply absent,
+    never a fabricated position. Callers must fall back to the existing
+    smoothed-CSV values when a needed frame/landmark isn't present here
+    (e.g. real occlusion, or the video ended before end_idx).
+    """
+    import os
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    model_path = os.path.join("models", "pose_landmarker_full.task")
+    landmark_indices = {name: LANDMARK_NAMES.index(name) for name in landmark_names}
+
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        output_segmentation_masks=False,
+        num_poses=1,
+        min_pose_detection_confidence=0.3,
+        min_pose_presence_confidence=0.3,
+        min_tracking_confidence=0.4,
+    )
+    landmarker = vision.PoseLandmarker.create_from_options(options)
+    cap = cv2.VideoCapture(video_path)
+    ms_per_frame = 1000.0 / fps
+
+    positions = {}
+    idx = 0
+    last_ts = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok or idx > end_idx:
+            break
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        ts = int(round(idx * ms_per_frame))
+        if ts <= last_ts:
+            ts = last_ts + 1
+        last_ts = ts
+        res = landmarker.detect_for_video(img, ts)
+        if idx >= start_idx and res.pose_landmarks:
+            frame_landmarks = {}
+            for name, lm_idx in landmark_indices.items():
+                lm = res.pose_landmarks[0][lm_idx]
+                if lm.visibility is None or lm.visibility >= 0.5:
+                    frame_landmarks[name] = (lm.x, lm.y, lm.visibility)
+            if frame_landmarks:
+                positions[idx] = frame_landmarks
+        idx += 1
+    cap.release()
+    landmarker.close()
+    return positions
+
+
 if __name__ == "__main__":
     print("=== STARTING KINEMATIC EXTRACTION STATE ===")
     extraction_state = extract_video_landmarks("input/input_video.mp4", "output/landmarks.csv")

@@ -2526,14 +2526,36 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             "Scrub to any frame where the bowler is clearly visible, then click "
             "directly on him. This tells the app exactly who to track for the "
             "whole clip, instead of guessing — the single most reliable fix for "
-            "the skeleton ever locking onto the wrong person."
+            "the skeleton ever locking onto the wrong person. ⚠️ If someone else "
+            "(a batter, umpire, teammate) is visible before the bowler comes into "
+            "frame, make sure you're clicking on the actual bowler, not them — "
+            "this click is treated as ground truth, so it's the one step nothing "
+            "else in the app can catch or correct if it's wrong."
         )
         if total_frames > 1:
             _render_frame_jump_box(f"{key_prefix}_seed_slider", 0, max(total_frames - 1, 0))
             frame_idx = st.slider(
                 "Scrub to a frame with the bowler visible",
                 min_value=0, max_value=max(total_frames - 1, 0),
-                value=min(total_frames - 1, total_frames // 3),
+                # FIX (2026-08-08, real bug the coach caught): was
+                # total_frames // 3 — for a typical bowling recording
+                # (run-up, then delivery, then follow-through, with
+                # recording often starting before the bowler even enters
+                # frame — see orchestrator._compute_segment_sum_body_
+                # height's scale-consistency-guard comment for the real
+                # clip this was found on), 1/3 of the way through a clip
+                # is frequently still early run-up or even before the
+                # bowler has entered frame at all — confirmed directly:
+                # for the coach's actual 173-frame clip (bowler entering
+                # at frame ~75), this default landed on frame 57, squarely
+                # in the region where a DIFFERENT person (the batsman) was
+                # the only one visible. A coach who clicks without
+                # scrubbing first could seed the wrong person entirely —
+                # the single most severe version of that failure mode,
+                # since a coach-given seed is trusted as absolute ground
+                # truth. 3/4 of the way through lands much more reliably
+                # at or after delivery, well past any pre-entry footage.
+                value=min(total_frames - 1, total_frames * 3 // 4),
                 key=f"{key_prefix}_seed_slider"
             )
         else:
@@ -3432,6 +3454,47 @@ if st.session_state.get("pending_result_payload") is not None:
                     video_path=video_path,
                     bowling_arm_override=metrics.get("bowling_arm_detected")
                 )
+                # release_height/head_stability's "tracking uncertain" flag
+                # (see orchestrator.calculate_release_height_ratio_safe's
+                # br_tracking_confidence docstring) is driven by detect_
+                # delivery_events' br_confidence — a coarse, whole-search-
+                # window aggregate. speed_result's OWN instability check
+                # (_corroborated_peak_speed_px_s, a much stricter frame-by-
+                # frame R^2 fit-quality test right around release) is a
+                # SEPARATE signal that can fire even when br_confidence
+                # still reads "high" — confirmed live: a real session showed
+                # "Tracking around release was too unstable..." for the
+                # speed estimate while release_height's warning never
+                # appeared. Both checks look at the same underlying release-
+                # frame landmark quality from different angles — combine
+                # them here (the one place both results already exist)
+                # rather than trusting either signal alone.
+                #
+                # REAL BUG FOUND (2026-08-07, coach pushed back hard and was
+                # right): this unconditionally set release_height's flag
+                # even when the coach had manually clicked the exact release
+                # point (_wrist_confirmed_point) — the ONE piece of real
+                # human ground truth this whole app is built to prioritize
+                # (calculate_release_height_ratio_safe already correctly
+                # skips its OWN br_tracking_confidence check for a coach-
+                # confirmed point; this cross-check was silently overriding
+                # that correct behavior from outside). speed_result's
+                # instability check has no way to know about or use the
+                # coach's click at all — it measures raw frame-to-frame
+                # velocity, which a single confirmed point can't fix — so it
+                # can fail for reasons a confirmed release point doesn't
+                # address, but that's not evidence the confirmed point
+                # itself is wrong. head_stability has no equivalent
+                # confirmable point (it's a whole-window variance, not one
+                # click), so it keeps applying the cross-check unconditionally.
+                _coach_confirmed_release_point = (
+                    st.session_state.get("_wrist_confirmed_point") is not None
+                    and st.session_state.get("_br_confirmed_frame") is not None
+                )
+                if speed_result.get("reason") == "tracking_unstable":
+                    if not _coach_confirmed_release_point:
+                        metrics.setdefault("release_height", {})["release_frame_tracking_uncertain"] = True
+                    metrics.setdefault("head_stability", {})["release_window_tracking_uncertain"] = True
                 height_absolute_result = se.compute_release_height_absolute(
                     metrics.get("release_height", {}).get("debug_raw"), cap_h, meters_per_pixel=mpp
                 )
@@ -3694,6 +3757,13 @@ if st.session_state.get("pending_result_payload") is not None:
                         "haven't been re-tuned for it yet. Treat this reading as directional, "
                         "not a final verdict."
                     )
+                if metrics.get('release_height', {}).get('release_frame_tracking_uncertain'):
+                    m4.warning(
+                        "⚠️ Tracking around the release frame was flagged unstable (heavy motion "
+                        "blur is the common cause) — this same instability affects the wrist "
+                        "landmark this ratio is measured from. Treat this reading with real "
+                        "caution, or confirm the release point manually to override it."
+                    )
                 if estimated_height_result.get("status") == "success":
                     m4.caption(f"🧍 Estimated bowler height: ~{estimated_height_result['cm']:.0f} cm (auto, from stump calibration)")
                     # Real cross-check: a release point taller than ~1.3x
@@ -3721,6 +3791,12 @@ if st.session_state.get("pending_result_payload") is not None:
                         "camera distance) — more trustworthy than before, but the Optimal/Acceptable "
                         "bands haven't been re-tuned for it yet. Treat this reading as directional, "
                         "not a final verdict."
+                    )
+                if metrics.get('head_stability', {}).get('release_window_tracking_uncertain'):
+                    m5.warning(
+                        "⚠️ Tracking near the end of this window (right around release) was "
+                        "flagged unstable (heavy motion blur is the common cause) — that can "
+                        "inflate this variance reading. Treat it with real caution."
                     )
                 rel_debug = metrics.get('release_height', {}).get('debug_raw')
                 if rel_debug:

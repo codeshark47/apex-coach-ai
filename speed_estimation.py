@@ -340,6 +340,22 @@ def compute_release_arm_speed(df: pd.DataFrame, events: dict, fps: float,
         if peak_px_per_s is None:
             return {
                 "status": "error",
+                # Machine-readable reason (2026-08-07), not just a human
+                # message to string-match: this specific failure means the
+                # R^2-fit-quality corroboration check found no consistent
+                # frame-to-frame motion around release — a real, direct
+                # signal that the wrist landmark right at release is
+                # untrustworthy. Real bug found on a live clip: this exact
+                # message fired, but orchestrator.detect_delivery_events'
+                # OWN br_confidence signal (a coarser, whole-search-window
+                # aggregate, used to flag release_height/head_stability —
+                # see calculate_release_height_ratio_safe's br_tracking_
+                # confidence docstring) still came back "high" for the same
+                # delivery — the two checks measure different things
+                # (window-level plausibility vs. frame-level velocity-fit
+                # quality) and can disagree. streamlit_app.py combines both
+                # signals now instead of trusting br_confidence alone.
+                "reason": "tracking_unstable",
                 "message": (
                     "Tracking around release was too unstable for a reliable "
                     "speed estimate — no consistent frame-to-frame motion was "

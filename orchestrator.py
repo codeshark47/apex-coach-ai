@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 
 import monitoring
-from main import extract_video_landmarks
+from main import extract_video_landmarks, extract_raw_landmarks_window
 from kinematics import (
     calculate_knee_bracing,
     calculate_trunk_lean,
@@ -186,16 +186,41 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
     keeps the absolute-height estimate on the same depth plane the
     calibration was taken at, without touching the already-proven wide-
     window ratio baseline at all.
+
+    INDEPENDENT PER-SEGMENT ESTIMATION (2026-08-07, real bug found on a
+    live clip): this used to require ALL of nose+both shoulders+hip+knee+
+    ankle present in the SAME single frame before that frame could
+    contribute anything. Confirmed on a real clip: 67 of 93 early frames
+    had a real nose+shoulders+hip detection, but only 6 of 93 also had
+    the knee AND ankle — the bowler's lower legs were frequently out of
+    frame or undetected that early (a real framing/distance limitation,
+    not a code bug) even though his head and torso were reliably tracked
+    the whole time. Requiring the full chain meant those 61 extra good
+    head/torso frames were thrown away entirely, landing right on this
+    function's own minimum-samples floor for no real reason. The four
+    segments (head, torso, thigh, shin) are now estimated INDEPENDENTLY,
+    each from whichever frames have THAT segment's own landmarks visible
+    — a frame missing an ankle can still contribute its head/torso
+    length. Each segment still takes its own 90th percentile (bending
+    only ever shortens a segment, never lengthens it — see above), so
+    this is the same statistical logic, just no longer bottlenecked by
+    whichever single body part happens to track worst.
     """
     lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
-    required = [
-        "NOSE_x", "NOSE_y", "LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y",
-        f"{lead_side}_HIP_x", f"{lead_side}_HIP_y", f"{lead_side}_KNEE_x", f"{lead_side}_KNEE_y",
-        f"{lead_side}_ANKLE_x", f"{lead_side}_ANKLE_y",
-    ]
 
     EARLY_FRAME_WINDOW = 300  # frames — used only when no BFC boundary is available
-    MIN_PLAUSIBLE_SAMPLES = 10  # raised now that a normal running window easily clears this
+    MIN_PLAUSIBLE_SAMPLES = 10  # raised now that a normal running window easily clears this for head/torso
+    # LOWERED specifically for the harder-to-track leg segments (2026-08-07):
+    # confirmed on a real clip that thigh/shin samples can genuinely be
+    # this scarce early in a run-up (legs out of frame/undetected far
+    # more often than head/torso) even when the SAME clip has 10x more
+    # good head/torso frames available. The alternative to accepting a
+    # smaller-but-real sample here isn't "no measurement" — it's silently
+    # falling back to the OLD single-frame method this whole function
+    # exists to replace, which has a CONFIRMED, worse failure mode (the
+    # real 240% bug). A 90th-percentile estimate from 5-9 real samples is
+    # still meaningfully better than that.
+    MIN_LEG_SEGMENT_SAMPLES = 5
     HEIGHT_PERCENTILE = 90  # near the top of the observed range, not the max (a single glitch that slipped past the upstream Hampel filter shouldn't set the whole baseline)
 
     # REAL BUG FOUND (2026-08-05, via diagnostic logging on an actual live
@@ -221,35 +246,122 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
     else:
         candidates = df[df["frame"] < end]
 
-    segment_sums = []
+    # SCALE-CONSISTENCY GUARD (2026-08-07/08, real bug the coach caught,
+    # refined after independently evaluating a Gemini suggestion — see
+    # [[feedback_evaluate_external_ai_advice]]): a batsman or other
+    # bystander visible before the bowler enters frame can get mistakenly
+    # tracked for a stretch of early frames — even with correct seeding
+    # on the bowler, verified directly that main.py's backward identity
+    # walk can still bridge the gap and lock onto a far more distant,
+    # unrelated person once its search tolerance grows enough (a real,
+    # pre-existing limitation of that walk, not something safe to change
+    # here — its own history is 9 reverted attempts at exactly this class
+    # of fix). Confirmed on the coach's real clip: the bowler entered at
+    # frame ~75, and shoulder width jumped from a median of 0.023 (frames
+    # <73, a small, distant subject) to 0.086 (frames >=73, someone much
+    # closer) — roughly 3.7x.
+    #
+    # FIRST VERSION (2026-08-07) checked each candidate frame's scale
+    # independently against a reference — worked for most contaminated
+    # frames but leaked 8 of 35 through, because a person's own natural
+    # pose variation means SOME individual bystander frames can coincide
+    # with a value inside the bowler's normal range purely by chance
+    # (confirmed: frames 51-57 on the real clip). Gemini correctly
+    # flagged this as a real weakness — its proposed fix (hard-code the
+    # entry frame, or auto-"detect" one and hard-cut there) was rejected
+    # after evaluation: fine for THIS clip, but assumes every filming
+    # setup has a bystander-then-entry discontinuity at all, which isn't
+    # true (e.g. genuine side-on footage capturing the whole run-up from
+    # frame 0, where the bowler is just small and gradually grows closer
+    # — no discontinuity exists to "detect", and a hard temporal cutoff
+    # built for one pattern would misfire or need its own fallback on the
+    # other). The real fix keeps this same graceful-degradation property
+    # but replaces "does THIS frame's value pass" with a WALK: starting
+    # from the trusted anchor near the window's end and moving backward,
+    # a frame only counts if it's part of an UNBROKEN run back from that
+    # anchor — so an isolated frame's value coincidentally matching the
+    # reference can no longer sneak in from the wrong side of a real gap,
+    # while a genuinely gradual, uninterrupted growth curve (no real
+    # person-swap) still walks all the way back with nothing excluded.
+    # Verified directly on the real clip: 0 of 35 contaminated frames
+    # included (down from 8), and the walk independently rediscovered
+    # frame 75 as its own stopping point — without ever being told that
+    # number — purely from the same relative-scale signal.
+    SCALE_REFERENCE_TAIL_FRAMES = 15  # closest to `end`, most likely to genuinely be the bowler
+    SCALE_MIN_RATIO = 0.5  # must be at least half the reference shoulder width
+    SCALE_WALK_MAX_GAP = 8  # consecutive non-matching/missing frames tolerated before stopping the walk
+    if "LEFT_SHOULDER_x" in candidates.columns and "RIGHT_SHOULDER_x" in candidates.columns:
+        candidates = candidates.sort_values("frame")
+        _shoulder_width = (candidates["LEFT_SHOULDER_x"] - candidates["RIGHT_SHOULDER_x"]).abs()
+        _valid_sw = _shoulder_width.dropna()
+        _tail_idx = candidates.loc[_valid_sw.index, "frame"].sort_values().tail(SCALE_REFERENCE_TAIL_FRAMES).index
+        _tail_sw = _shoulder_width.loc[_tail_idx]
+        if len(_tail_sw) >= 3:
+            _reference_scale = float(_tail_sw.median())
+            if _reference_scale > 0:
+                _walk_included_idx = []
+                _consecutive_gap = 0
+                # Walk backward from the end of the window (closest to the
+                # trusted anchor) toward the start — matches candidates'
+                # own iteration order elsewhere in this function, just
+                # traversed in reverse.
+                for _idx in reversed(candidates.index):
+                    _sw = _shoulder_width.loc[_idx]
+                    _matches = (not pd.isna(_sw)) and (_sw >= SCALE_MIN_RATIO * _reference_scale)
+                    if _matches:
+                        _walk_included_idx.append(_idx)
+                        _consecutive_gap = 0
+                    else:
+                        _consecutive_gap += 1
+                        if _consecutive_gap > SCALE_WALK_MAX_GAP:
+                            break
+                candidates = candidates.loc[_walk_included_idx]
+
+    head_lengths, torso_lengths, thigh_lengths, shin_lengths = [], [], [], []
+    head_torso_cols = ["NOSE_x", "NOSE_y", "LEFT_SHOULDER_x", "LEFT_SHOULDER_y",
+                        "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y", f"{lead_side}_HIP_x", f"{lead_side}_HIP_y"]
+    thigh_cols = [f"{lead_side}_HIP_x", f"{lead_side}_HIP_y", f"{lead_side}_KNEE_x", f"{lead_side}_KNEE_y"]
+    shin_cols = [f"{lead_side}_KNEE_x", f"{lead_side}_KNEE_y", f"{lead_side}_ANKLE_x", f"{lead_side}_ANKLE_y"]
+
     for _, row in candidates.iterrows():
-        if any(pd.isna(row.get(c)) for c in required):
-            continue
-        nose_x, nose_y = float(row["NOSE_x"]), float(row["NOSE_y"])
-        sh_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
-        sh_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
-        hip_x, hip_y = float(row[f"{lead_side}_HIP_x"]), float(row[f"{lead_side}_HIP_y"])
-        knee_x, knee_y = float(row[f"{lead_side}_KNEE_x"]), float(row[f"{lead_side}_KNEE_y"])
-        ankle_x, ankle_y = float(row[f"{lead_side}_ANKLE_x"]), float(row[f"{lead_side}_ANKLE_y"])
+        # HEAD + TORSO: need nose + both shoulders + hip — independent of
+        # whether the leg chain is visible in this same frame at all.
+        if not any(pd.isna(row.get(c)) for c in head_torso_cols):
+            nose_x, nose_y = float(row["NOSE_x"]), float(row["NOSE_y"])
+            sh_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
+            sh_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
+            hip_x, hip_y = float(row[f"{lead_side}_HIP_x"]), float(row[f"{lead_side}_HIP_y"])
+            # TORSO-ONLY plausibility gate: genuinely upright spine (no
+            # bend at the trunk — the actual failure mode this function
+            # guards against). Deliberately does NOT require the leg
+            # chain to be stacked too — see the docstring above for why
+            # that broke on real running footage.
+            if hip_y > sh_y > nose_y:
+                head_lengths.append(float(np.hypot(sh_x - nose_x, sh_y - nose_y)))
+                torso_lengths.append(float(np.hypot(hip_x - sh_x, hip_y - sh_y)))
 
-        # TORSO-ONLY plausibility gate: genuinely upright spine (no bend
-        # at the trunk — the actual failure mode this function guards
-        # against). Deliberately does NOT require the leg chain to be
-        # stacked too — see the docstring above for why that broke on
-        # real running footage.
-        if not (hip_y > sh_y > nose_y):
-            continue
+        # THIGH: hip-to-knee, independent of head/shoulder/ankle visibility.
+        if not any(pd.isna(row.get(c)) for c in thigh_cols):
+            hip_x, hip_y = float(row[f"{lead_side}_HIP_x"]), float(row[f"{lead_side}_HIP_y"])
+            knee_x, knee_y = float(row[f"{lead_side}_KNEE_x"]), float(row[f"{lead_side}_KNEE_y"])
+            thigh_lengths.append(float(np.hypot(knee_x - hip_x, knee_y - hip_y)))
 
-        head = float(np.hypot(sh_x - nose_x, sh_y - nose_y))
-        torso = float(np.hypot(hip_x - sh_x, hip_y - sh_y))
-        thigh = float(np.hypot(knee_x - hip_x, knee_y - hip_y))
-        shin = float(np.hypot(ankle_x - knee_x, ankle_y - knee_y))
-        segment_sums.append(head + torso + thigh + shin)
+        # SHIN: knee-to-ankle, independent of everything else.
+        if not any(pd.isna(row.get(c)) for c in shin_cols):
+            knee_x, knee_y = float(row[f"{lead_side}_KNEE_x"]), float(row[f"{lead_side}_KNEE_y"])
+            ankle_x, ankle_y = float(row[f"{lead_side}_ANKLE_x"]), float(row[f"{lead_side}_ANKLE_y"])
+            shin_lengths.append(float(np.hypot(ankle_x - knee_x, ankle_y - knee_y)))
 
-    if len(segment_sums) < MIN_PLAUSIBLE_SAMPLES:
+    if (len(head_lengths) < MIN_PLAUSIBLE_SAMPLES or len(torso_lengths) < MIN_PLAUSIBLE_SAMPLES
+            or len(thigh_lengths) < MIN_LEG_SEGMENT_SAMPLES or len(shin_lengths) < MIN_LEG_SEGMENT_SAMPLES):
         return None
 
-    return float(np.percentile(segment_sums, HEIGHT_PERCENTILE))
+    return (
+        float(np.percentile(head_lengths, HEIGHT_PERCENTILE))
+        + float(np.percentile(torso_lengths, HEIGHT_PERCENTILE))
+        + float(np.percentile(thigh_lengths, HEIGHT_PERCENTILE))
+        + float(np.percentile(shin_lengths, HEIGHT_PERCENTILE))
+    )
 
 
 def detect_bowling_arm(df: pd.DataFrame) -> str:
@@ -739,12 +851,27 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
 
         separation = round(separation, 2)
 
+        # FIX (2026-08-07, real literature audit + a real coach test that
+        # surfaced it): "Optimal stretch"/"Blocked rotation" were value
+        # judgments using unsourced 25/15-degree cutoffs — this metric is
+        # now always-descriptive (see metric_ranges._ALWAYS_DESCRIPTIVE_
+        # METRICS), because real research (Senington, Lee & Williams,
+        # 2018) shows separation varies by bowling action TYPE (front-on/
+        # side-on/mixed), not skill — a front-on bowler's naturally low
+        # separation isn't "blocked," it's normal for that technique.
+        # Confirmed live: Gemini's coaching narrative repeated "described
+        # as blocked rotation" straight from this raw tier text even
+        # though the ZONE correctly said DESCRIPTIVE, giving a low
+        # front-on/mixed-action reading a negative connotation the real
+        # data doesn't support. Purely descriptive magnitude labels now,
+        # same neutral-technique-language fix as calculate_knee_bracing's
+        # "Extended-Knee/Flexed-Knee Technique" above.
         if separation >= 25.0:
-            tier = "Optimal stretch"
+            tier = "High Separation"
         elif separation >= 15.0:
-            tier = "Moderate separation"
+            tier = "Moderate Separation"
         else:
-            tier = "Blocked rotation"
+            tier = "Low Separation"
 
         return {"degrees": separation, "tier": tier, "status": "success"}
 
@@ -758,10 +885,116 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
         }
 
 
+def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
+                                   br_frame: int, height_ref_frame: int):
+    """
+    Re-extracts RAW (unsmoothed) landmark positions directly from the
+    source video for the EXACT br_frame/height_ref_frame the existing
+    pipeline already selected — does not search for a different frame,
+    only gets a more trustworthy READING at the frames already chosen
+    (including a coach-confirmed BR frame, when one was given).
+
+    WHY (2026-08-07): speed_estimation.py already proved and fixed this
+    exact dilution problem for wrist velocity (the saved landmarks CSV
+    has been through Hampel-filter outlier rejection AND 5-frame rolling-
+    mean smoothing — right for a stable skeleton, wrong for a landmark's
+    TRUE position at a brief, sharp moment like release) but that fix was
+    never extended to release_height's ankle/nose/knee/hip readings,
+    which have exactly the same problem. See main.extract_raw_landmarks_
+    window's docstring for the full reasoning.
+
+    Returns (br_row, height_row) as pd.Series with the same column names
+    calculate_release_height_ratio_safe already expects, built ONLY from
+    frames/landmarks a real detection actually confirmed — or (None, None)
+    if raw re-extraction didn't yield usable data for either needed frame,
+    in which case the caller must fall back to the existing smoothed-CSV
+    rows. Never fabricates a reading for a frame/landmark it couldn't
+    actually detect.
+    """
+    lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
+    trail_side = "RIGHT" if lead_side == "LEFT" else "LEFT"
+    bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
+
+    needed = ["NOSE", f"{bowl_side}_WRIST",
+              f"{lead_side}_ANKLE", f"{trail_side}_ANKLE",
+              f"{lead_side}_KNEE", f"{trail_side}_KNEE",
+              f"{lead_side}_HIP", f"{trail_side}_HIP"]
+
+    start = int(min(br_frame, height_ref_frame))
+    end = int(max(br_frame, height_ref_frame))
+    try:
+        raw = extract_raw_landmarks_window(video_path, fps, needed, start, end)
+    except Exception as e:
+        monitoring.capture(e)
+        return None, None
+
+    def _row_from_raw(frame_idx):
+        frame_data = raw.get(int(frame_idx))
+        if not frame_data:
+            return None
+        row = {}
+        for name in needed:
+            if name in frame_data:
+                x, y, _vis = frame_data[name]
+                row[f"{name}_x"] = x
+                row[f"{name}_y"] = y
+        return pd.Series(row) if row else None
+
+    return _row_from_raw(br_frame), _row_from_raw(height_ref_frame)
+
+
+def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFrame,
+                                       start_frame: int, end_frame: int) -> pd.DataFrame:
+    """
+    Re-extracts RAW (unsmoothed) NOSE/LEFT_SHOULDER/RIGHT_SHOULDER
+    positions directly from the source video for every frame in
+    [start_frame, end_frame] (the exact BFC-to-BR window
+    calculate_head_stability already uses) — same dilution problem and
+    same fix as _refine_release_landmarks_raw's docstring, just applied
+    across a whole window instead of two single frames, since head
+    stability is a variance computed over the whole window, not a
+    one-frame reading.
+
+    Merges raw values OVER the existing smoothed df (raw preferred, but
+    never loses a frame the smoothed pass had that raw re-extraction
+    missed) and returns a DataFrame covering the same frame range, ready
+    to pass straight into calculate_head_stability in place of the
+    original df. On any failure, returns the original df unchanged —
+    this can only strengthen the window, never break or block it.
+
+    BFC-to-BR is typically short (the final delivery stride only, ~10-40
+    frames on real clips seen this project) — re-extracting it costs a
+    real but bounded amount of time, not the hundreds of frames the wide
+    early-run-up baseline would need.
+    """
+    try:
+        raw = extract_raw_landmarks_window(
+            video_path, fps, ["NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER"],
+            int(start_frame), int(end_frame),
+        )
+    except Exception as e:
+        monitoring.capture(e)
+        return df
+
+    if not raw:
+        return df
+
+    window = df[(df["frame"] >= start_frame) & (df["frame"] <= end_frame)].copy()
+    for frame_idx, landmarks in raw.items():
+        mask = window["frame"] == frame_idx
+        if not mask.any():
+            continue
+        for name, (x, y, _vis) in landmarks.items():
+            window.loc[mask, f"{name}_x"] = x
+            window.loc[mask, f"{name}_y"] = y
+    return window
+
+
 def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right",
                                          reference_row: pd.Series = None,
                                          wrist_override_norm: tuple = None,
-                                         segment_sum_body_height: float = None) -> dict:
+                                         segment_sum_body_height: float = None,
+                                         br_tracking_confidence: str = None) -> dict:
     """
     Calculates release height leverage ratio with expanded real-world tolerances.
     Prevents N/A dropouts on high-arm actions or varied camera distances.
@@ -808,6 +1041,26 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
     as the mandatory BFC/FFC/BR frame confirmation elsewhere. Only the y
     (height) component is actually used, but both are accepted since the
     coach clicks a single point in the UI.
+
+    br_tracking_confidence (2026-08-07): "high"/"low", forwarded from
+    detect_delivery_events' own br_confidence — an honest, decode-
+    independent signal for how much of the release-window search had real
+    (non-gap-filled, anatomically-plausible) wrist data, computed for a
+    DIFFERENT reason (disclosing when the auto-detected BR frame number
+    itself might be off by a few frames). Real bug found on an actual
+    clip: a release-height ratio came back 35.1% ("Low-Sling Action", a
+    confident-sounding verdict) on a delivery where the report's OWN speed
+    section, right above it, already said tracking around release was too
+    unstable for a reliable estimate — the exact same wrist landmark this
+    ratio's numerator depends on. The existing implausibility ceiling
+    (0.30-1.30) didn't catch it because 0.351 is inside those bounds; nothing
+    upstream was gating on tracking quality at all. This doesn't reject or
+    alter the number (we don't know FOR CERTAIN it's wrong, just that
+    confidence is reduced) — it flags it, same "disclose, never hide or
+    fabricate" pattern as recalibration_pending. wrist_override_norm (a
+    coach's direct click) bypasses this entirely, same reasoning as the
+    implausibility ceiling above: a human-confirmed point isn't subject to
+    the tracker's own confidence.
     """
     try:
         bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
@@ -927,9 +1180,25 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
                 "debug_raw": debug_raw
             }
 
-        if ratio >= 0.85:
+        # FIX (2026-08-07, real bug found on a live clip): these thresholds
+        # (0.85/0.75) were the OLD, unsourced bounds — when the real
+        # literature audit re-sourced metric_ranges.RANGES["release_height"]
+        # to 1.18/1.08 (Felton et al. 2018, converted to this app's own
+        # baseline — see that file's comment for the full math), this
+        # SEPARATE, independently-computed classification string was missed
+        # and kept the stale thresholds. Same class of bug as calculate_
+        # knee_bracing's/calculate_hip_shoulder_separation's raw tier text,
+        # just found later: confirmed live, a 60.9% ratio (deep red by the
+        # real bounds) showed here as "Low-Sling Action" using a 0.75 floor
+        # that no longer matches metric_ranges.py at all — right answer by
+        # coincidence at this value, but the boundary itself was wrong, and
+        # a ratio like 0.80 would have shown the OLD "Standard Mid-Arm
+        # Release" (a passable-sounding label) for what the real, current
+        # data calls a critical reading. Now matches metric_ranges.py's
+        # real bounds exactly.
+        if ratio >= 1.18:
             classification = "High-Release Leverage"
-        elif ratio >= 0.75:
+        elif ratio >= 1.08:
             classification = "Standard Mid-Arm Release"
         else:
             classification = "Low-Sling Action"
@@ -953,9 +1222,17 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
         # re-tuning 0.85/0.75 for the new basis.
         recalibration_pending = using_segment_sum
 
+        # See br_tracking_confidence's docstring above for the real 35.1%
+        # case this guards against — a coach-confirmed wrist point isn't
+        # subject to the tracker's own confidence, so it never flags.
+        release_frame_tracking_uncertain = (
+            wrist_override_norm is None and br_tracking_confidence == "low"
+        )
+
         return {
             "ratio": ratio, "classification": classification, "status": "success",
             "debug_raw": debug_raw, "recalibration_pending": recalibration_pending,
+            "release_frame_tracking_uncertain": release_frame_tracking_uncertain,
         }
 
     except Exception as e:
@@ -1490,7 +1767,14 @@ def run_complete_bowling_analysis(video_path: str,
     knee_analysis = calculate_knee_bracing(ffc_row, lead_side=lead_side)
     knee_at_release = calculate_knee_bracing(br_row, lead_side=lead_side)
     lean_analysis = calculate_trunk_lean(br_row)
-    head_stability = calculate_head_stability(df, events["BFC"], events["BR"])
+    # RAW RE-EXTRACTION (2026-08-08): same dilution problem/fix as
+    # release_height's _refine_release_landmarks_raw above, applied to
+    # head_stability's whole BFC-BR window instead of two single frames —
+    # see _refine_head_stability_window_raw's docstring. Falls back to
+    # the original smoothed df on any failure, so this can only
+    # strengthen the reading, never block the analysis.
+    _head_stability_df = _refine_head_stability_window_raw(video_path, fps, df, events["BFC"], events["BR"])
+    head_stability = calculate_head_stability(_head_stability_df, events["BFC"], events["BR"])
     hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
     # Anchored on BR (the release frame — coach-confirmable, see the
     # Streamlit release-frame-confirmation step), not FFC. FFC's own
@@ -1540,10 +1824,41 @@ def run_complete_bowling_analysis(video_path: str,
         (wrist_override_x, wrist_override_y)
         if wrist_override_x is not None and wrist_override_y is not None else None
     )
-    release_height = calculate_release_height_ratio_safe(br_row, bowling_arm=bowling_arm,
-                                                           reference_row=height_reference_row,
-                                                           wrist_override_norm=wrist_override_norm,
-                                                           segment_sum_body_height=segment_sum_body_height)
+    # RAW RE-EXTRACTION (2026-08-07): get a more trustworthy reading for
+    # the EXACT br_row/height_reference_row frames already selected above
+    # — see _refine_release_landmarks_raw's docstring for the full
+    # reasoning (the same smoothing-dilution problem speed_estimation.py
+    # already fixed for wrist velocity, extended here to release_height's
+    # ankle/nose/knee/hip readings, which never got that same fix). Never
+    # searches for a DIFFERENT frame, never blocks the analysis on
+    # failure — falls back to the existing smoothed-CSV values for
+    # anything raw re-extraction didn't confidently detect, so this can
+    # only strengthen a reading, never lose data the smoothed pass had.
+    _raw_br_row, _raw_height_row = None, None
+    if height_reference_row is not None:
+        try:
+            _height_ref_frame = int(height_reference_row.get("frame", events["BR"]))
+            _raw_br_row, _raw_height_row = _refine_release_landmarks_raw(
+                video_path, fps, bowling_arm, events["BR"], _height_ref_frame
+            )
+        except Exception as e:
+            monitoring.capture(e)
+
+    def _merge_raw_over_smoothed(raw_row, original_row):
+        if raw_row is None:
+            return original_row
+        merged = original_row.copy() if original_row is not None else pd.Series(dtype=float)
+        for key, val in raw_row.items():
+            merged[key] = val
+        return merged
+
+    release_height = calculate_release_height_ratio_safe(
+        _merge_raw_over_smoothed(_raw_br_row, br_row),
+        bowling_arm=bowling_arm,
+        reference_row=_merge_raw_over_smoothed(_raw_height_row, height_reference_row),
+        wrist_override_norm=wrist_override_norm,
+        segment_sum_body_height=segment_sum_body_height,
+        br_tracking_confidence=events.get("BR_confidence"))
 
     # FFC-to-Release knee angle delta ("yielding knee" check flagged in
     # external biomechanical audit): a static single-frame knee angle at
@@ -1652,6 +1967,12 @@ def run_complete_bowling_analysis(video_path: str,
                 "status": release_height.get("status", "error"),
                 "debug_raw": release_height.get("debug_raw"),
                 "recalibration_pending": release_height.get("recalibration_pending", False),
+                # See calculate_release_height_ratio_safe's br_tracking_
+                # confidence docstring (2026-08-07) for the real 35.1% case
+                # this flags — motion blur at release can corrupt the same
+                # wrist landmark this ratio's numerator depends on, without
+                # tripping the existing 0.30-1.30 implausibility ceiling.
+                "release_frame_tracking_uncertain": release_height.get("release_frame_tracking_uncertain", False),
                 # BFC±15 body-height baseline for the absolute standing-
                 # height-in-cm estimate — deliberately NOT the same value
                 # as debug_raw["body_height"] (that one is the wide run-up
@@ -1666,6 +1987,14 @@ def run_complete_bowling_analysis(video_path: str,
                                     "Unknown"),
                 "status": head_stability.get("status", "error"),
                 "recalibration_pending": head_stability.get("recalibration_pending", False),
+                # head_stability's window is BFC->BR (see the call above) —
+                # its LAST frames are the same low-confidence region a low
+                # BR confidence flags, for the same motion-blur reason as
+                # release_height's identical flag. No coach-override escape
+                # hatch here (unlike release_height's wrist_override_norm)
+                # since there's no equivalent manual correction for a whole
+                # multi-frame window.
+                "release_window_tracking_uncertain": events.get("BR_confidence") == "low",
             }
         },
         "annotated_video_output": web_safe_video_file.replace("\\", "/")
