@@ -2537,25 +2537,21 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             frame_idx = st.slider(
                 "Scrub to a frame with the bowler visible",
                 min_value=0, max_value=max(total_frames - 1, 0),
-                # FIX (2026-08-08, real bug the coach caught): was
-                # total_frames // 3 — for a typical bowling recording
-                # (run-up, then delivery, then follow-through, with
-                # recording often starting before the bowler even enters
-                # frame — see orchestrator._compute_segment_sum_body_
-                # height's scale-consistency-guard comment for the real
-                # clip this was found on), 1/3 of the way through a clip
-                # is frequently still early run-up or even before the
-                # bowler has entered frame at all — confirmed directly:
-                # for the coach's actual 173-frame clip (bowler entering
-                # at frame ~75), this default landed on frame 57, squarely
-                # in the region where a DIFFERENT person (the batsman) was
-                # the only one visible. A coach who clicks without
-                # scrubbing first could seed the wrong person entirely —
-                # the single most severe version of that failure mode,
-                # since a coach-given seed is trusted as absolute ground
-                # truth. 3/4 of the way through lands much more reliably
-                # at or after delivery, well past any pre-entry footage.
-                value=min(total_frames - 1, total_frames * 3 // 4),
+                # FIX (2026-08-10, coach caught the deeper issue): any fixed
+                # fraction (this was total_frames // 3, then 3*total_frames
+                # // 4) is itself a baked-in assumption about WHERE the
+                # bowler shows up. That assumption holds for a typical
+                # run-up-then-delivery clip but breaks for anything atypical
+                # — a clip starting right at delivery, a long clip with an
+                # extended pre-run-up dead spell, a bowler entering at frame
+                # 20 of 300 instead of near the end. A default position that
+                # happens to be right most of the time is still a guess a
+                # non-vigilant coach could click without scrubbing. The only
+                # default with no assumption baked in is the actual start of
+                # the recording (frame 0) — it never LOOKS plausible enough
+                # to click without scrubbing first, so it can't be mistaken
+                # for "the app already found him."
+                value=0,
                 key=f"{key_prefix}_seed_slider"
             )
         else:

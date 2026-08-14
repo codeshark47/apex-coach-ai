@@ -111,7 +111,7 @@ def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm:
 
 
 def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_end_frame: int = None,
-                                      search_start_frame: int = None):
+                                      search_start_frame: int = None, target_scale_frame: int = None):
     """
     Real body-height reference for calculate_release_height_ratio_safe,
     robust to whatever posture the release-adjacent reference frame
@@ -205,6 +205,37 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
     only ever shortens a segment, never lengthens it — see above), so
     this is the same statistical logic, just no longer bottlenecked by
     whichever single body part happens to track worst.
+
+    target_scale_frame (2026-08-13, real bug found on the coach's own
+    live-demo session): after normalizing each frame's segments by that
+    SAME frame's own shoulder width (see the per-row rescale below), the
+    result must be converted back to an ABSOLUTE scale before summing —
+    and that has to be the scale near the frame this baseline will
+    actually be compared against (calculate_release_height_ratio_safe's
+    reference_row), NOT an arbitrary frame from this search window.
+    Confirmed directly on a real rear-view clip (M.Rauf.mp4): the bowler
+    runs AWAY from a rear-mounted camera during his run-up, so he's
+    SMALLER at release than during the run-up frames near BFC this
+    function searches — rescaling to the near-BFC frames (this
+    function's OWN internal contamination-guard reference, which exists
+    only to decide which frames are trustworthy same-identity
+    candidates, a completely separate concern) silently expressed the
+    result at the wrong depth. A FRAME NUMBER, not a single row's reading
+    — verified on the same clip that the single release frame's own
+    shoulder width is itself noisy (release is a fast, sometimes
+    motion-blurred instant, and this clip's own BR confidence was
+    already flagged "low"): anchoring to that one frame reintroduced the
+    exact single-frame fragility this whole multi-frame-percentile
+    approach exists to avoid, producing a body-height baseline noticeably
+    SMALLER than even the simple raw span at that same upright frame —
+    mathematically impossible for a 90th-percentile-of-extended-segments
+    measure. Uses a median shoulder width across a small window around
+    this frame instead (matches how the near-BFC reference itself is
+    already computed — several frames, not one), for the same noise-
+    robustness reason. Defaults to None (falls back to the internal
+    near-BFC reference scale, prior behavior) for the separate for_cm
+    caller, which intentionally wants the near-BFC/calibration-plane
+    depth, not the release depth.
     """
     lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
 
@@ -289,7 +320,29 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
     # number — purely from the same relative-scale signal.
     SCALE_REFERENCE_TAIL_FRAMES = 15  # closest to `end`, most likely to genuinely be the bowler
     SCALE_MIN_RATIO = 0.5  # must be at least half the reference shoulder width
+    # UPPER BOUND ADDED (2026-08-10, real bug found via a coach's actual
+    # session — release_height came back 24% on a well-tracked clip,
+    # "Low-Sling Action", debug_raw showing segment_sum_body_height
+    # (1.012) over 6x the SAME reference frame's raw head-ankle span
+    # (0.164), which is physically impossible for one real person).
+    # Traced directly: this guard only ever had a FLOOR (reject anyone
+    # SMALLER/more distant than the reference) because the original bug
+    # it was built for was a distant bystander. It never rejected anyone
+    # LARGER than the reference. Confirmed on the coach's real clip
+    # (M.Rauf.mp4): frames 25-34, early in the search window, had
+    # shoulder width up to 0.60 against a near-BFC reference of 0.115 —
+    # a 5.2x jump, almost certainly the camera being held close to
+    # someone during setup before the actual run-up begins, not the
+    # bowler himself at any real distance. Those frames' inflated
+    # segment lengths dominated 3 of the 4 independent 90th-percentile
+    # sums. A genuine run-up's gradual approach can plausibly show some
+    # growth toward the reference (taken near BFC, already close to the
+    # crease), but not several times LARGER than the closest point in a
+    # normal delivery stride — the same logic as the floor, just facing
+    # the other direction.
+    SCALE_MAX_RATIO = 2.0  # must not be more than 2x the reference shoulder width
     SCALE_WALK_MAX_GAP = 8  # consecutive non-matching/missing frames tolerated before stopping the walk
+    _reference_scale = None  # set below when shoulder columns exist; drives the per-row rescale too
     if "LEFT_SHOULDER_x" in candidates.columns and "RIGHT_SHOULDER_x" in candidates.columns:
         candidates = candidates.sort_values("frame")
         _shoulder_width = (candidates["LEFT_SHOULDER_x"] - candidates["RIGHT_SHOULDER_x"]).abs()
@@ -307,7 +360,10 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
                 # traversed in reverse.
                 for _idx in reversed(candidates.index):
                     _sw = _shoulder_width.loc[_idx]
-                    _matches = (not pd.isna(_sw)) and (_sw >= SCALE_MIN_RATIO * _reference_scale)
+                    _matches = (
+                        not pd.isna(_sw)
+                        and SCALE_MIN_RATIO * _reference_scale <= _sw <= SCALE_MAX_RATIO * _reference_scale
+                    )
                     if _matches:
                         _walk_included_idx.append(_idx)
                         _consecutive_gap = 0
@@ -316,14 +372,60 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
                         if _consecutive_gap > SCALE_WALK_MAX_GAP:
                             break
                 candidates = candidates.loc[_walk_included_idx]
+            else:
+                _reference_scale = None
 
+    # PER-ROW SCALE NORMALIZATION (2026-08-13, real bug found on the
+    # coach's own live-demo session, reported as "24% release height"):
+    # the ceiling above (2026-08-10) fixed the worst case — a handful of
+    # frames with a wildly different scale (camera held close during
+    # setup) — but a real, smaller-magnitude version of the same problem
+    # survives WITHIN the walked set itself. Confirmed directly on the
+    # coach's actual M.Rauf.mp4 session: even after the ceiling, the
+    # walked candidates still spanned a real 2.7x range in shoulder width
+    # (0.085-0.230) — a normal, gradual run-up approaching the camera,
+    # not contamination. Each of the 4 segments takes its OWN 90th
+    # percentile independently (by design — see the 2026-08-07 docstring
+    # above), so nothing stopped different segments from drawing their
+    # best evidence from frames at meaningfully different camera
+    # distances within that legitimate range, inflating the SUM beyond
+    # what any single consistent-distance frame would show. Verified: the
+    # release-adjacent reference frame itself (upright, no bend) gave a
+    # raw ankle-to-nose span implying ~130% release height, matching what
+    # the video visibly shows (a clean overhead release) — but the summed
+    # segments came out 41%, over 3x the physically consistent scale a
+    # true measurement at that same frame's distance should give.
+    #
+    # Fix: express each row's segment length as a fraction of THAT row's
+    # own shoulder width (removing the camera-distance component entirely
+    # — a person's segment-to-shoulder-width ratio doesn't change with
+    # distance from camera), take the 90th percentile of that ratio (same
+    # "bending only ever shortens it" logic as before, now scale-free),
+    # then rescale by the reference shoulder width (the near-BFC scale,
+    # already computed above) to convert back into the SAME absolute
+    # scale the release-adjacent reference frame's raw span uses — making
+    # the two directly, physically comparable instead of silently mixing
+    # scales. Falls back to the old unnormalized 90th-percentile-of-raw-
+    # length approach when no shoulder columns exist at all (a caller/
+    # fixture without shoulder data), same result as before for that case.
     head_lengths, torso_lengths, thigh_lengths, shin_lengths = [], [], [], []
     head_torso_cols = ["NOSE_x", "NOSE_y", "LEFT_SHOULDER_x", "LEFT_SHOULDER_y",
                         "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y", f"{lead_side}_HIP_x", f"{lead_side}_HIP_y"]
     thigh_cols = [f"{lead_side}_HIP_x", f"{lead_side}_HIP_y", f"{lead_side}_KNEE_x", f"{lead_side}_KNEE_y"]
     shin_cols = [f"{lead_side}_KNEE_x", f"{lead_side}_KNEE_y", f"{lead_side}_ANKLE_x", f"{lead_side}_ANKLE_y"]
+    shoulder_cols = ["LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y"]
 
     for _, row in candidates.iterrows():
+        # This row's OWN scale, for normalizing whichever segments it
+        # contributes below — None (no normalization, raw length used
+        # as-is) if this row's own shoulders aren't tracked or the
+        # reference scale couldn't be established at all.
+        _row_scale = None
+        if _reference_scale is not None and not any(pd.isna(row.get(c)) for c in shoulder_cols):
+            _row_sw = abs(float(row["LEFT_SHOULDER_x"]) - float(row["RIGHT_SHOULDER_x"]))
+            if _row_sw > 0:
+                _row_scale = _row_sw
+
         # HEAD + TORSO: need nose + both shoulders + hip — independent of
         # whether the leg chain is visible in this same frame at all.
         if not any(pd.isna(row.get(c)) for c in head_torso_cols):
@@ -337,30 +439,68 @@ def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_
             # chain to be stacked too — see the docstring above for why
             # that broke on real running footage.
             if hip_y > sh_y > nose_y:
-                head_lengths.append(float(np.hypot(sh_x - nose_x, sh_y - nose_y)))
-                torso_lengths.append(float(np.hypot(hip_x - sh_x, hip_y - sh_y)))
+                _head = float(np.hypot(sh_x - nose_x, sh_y - nose_y))
+                _torso = float(np.hypot(hip_x - sh_x, hip_y - sh_y))
+                # Never mix a raw absolute length into an otherwise-
+                # normalized list (or vice versa) — the two are on
+                # incompatible scales. When _reference_scale is set but
+                # THIS row's own shoulders aren't usable (shouldn't
+                # happen post-guard, since the guard already requires
+                # valid shoulder x — defensive only), skip the row
+                # rather than silently corrupt the aggregate.
+                if _reference_scale is None:
+                    head_lengths.append(_head)
+                    torso_lengths.append(_torso)
+                elif _row_scale is not None:
+                    head_lengths.append(_head / _row_scale)
+                    torso_lengths.append(_torso / _row_scale)
 
         # THIGH: hip-to-knee, independent of head/shoulder/ankle visibility.
         if not any(pd.isna(row.get(c)) for c in thigh_cols):
             hip_x, hip_y = float(row[f"{lead_side}_HIP_x"]), float(row[f"{lead_side}_HIP_y"])
             knee_x, knee_y = float(row[f"{lead_side}_KNEE_x"]), float(row[f"{lead_side}_KNEE_y"])
-            thigh_lengths.append(float(np.hypot(knee_x - hip_x, knee_y - hip_y)))
+            _thigh = float(np.hypot(knee_x - hip_x, knee_y - hip_y))
+            if _reference_scale is None:
+                thigh_lengths.append(_thigh)
+            elif _row_scale is not None:
+                thigh_lengths.append(_thigh / _row_scale)
 
         # SHIN: knee-to-ankle, independent of everything else.
         if not any(pd.isna(row.get(c)) for c in shin_cols):
             knee_x, knee_y = float(row[f"{lead_side}_KNEE_x"]), float(row[f"{lead_side}_KNEE_y"])
             ankle_x, ankle_y = float(row[f"{lead_side}_ANKLE_x"]), float(row[f"{lead_side}_ANKLE_y"])
-            shin_lengths.append(float(np.hypot(ankle_x - knee_x, ankle_y - knee_y)))
+            _shin = float(np.hypot(ankle_x - knee_x, ankle_y - knee_y))
+            if _reference_scale is None:
+                shin_lengths.append(_shin)
+            elif _row_scale is not None:
+                shin_lengths.append(_shin / _row_scale)
 
     if (len(head_lengths) < MIN_PLAUSIBLE_SAMPLES or len(torso_lengths) < MIN_PLAUSIBLE_SAMPLES
             or len(thigh_lengths) < MIN_LEG_SEGMENT_SAMPLES or len(shin_lengths) < MIN_LEG_SEGMENT_SAMPLES):
         return None
 
+    # Rescale to the ACTUAL comparison frame's own scale when given (see
+    # target_scale_frame's docstring above) — falls back to the internal
+    # near-BFC reference scale (prior behavior) when no target is given,
+    # or stays unscaled (1.0) if normalization never happened at all
+    # (no shoulder columns anywhere in this df).
+    _rescale = _reference_scale if _reference_scale is not None else 1.0
+    if _reference_scale is not None and target_scale_frame is not None and "LEFT_SHOULDER_x" in df.columns:
+        TARGET_SCALE_WINDOW = 5  # frames either side — median, not one frame's noisy reading
+        _target_window = df[
+            (df["frame"] >= target_scale_frame - TARGET_SCALE_WINDOW)
+            & (df["frame"] <= target_scale_frame + TARGET_SCALE_WINDOW)
+        ]
+        _target_sw_series = (_target_window["LEFT_SHOULDER_x"] - _target_window["RIGHT_SHOULDER_x"]).abs().dropna()
+        if len(_target_sw_series) > 0:
+            _target_sw = float(_target_sw_series.median())
+            if _target_sw > 0:
+                _rescale = _target_sw
     return (
-        float(np.percentile(head_lengths, HEIGHT_PERCENTILE))
-        + float(np.percentile(torso_lengths, HEIGHT_PERCENTILE))
-        + float(np.percentile(thigh_lengths, HEIGHT_PERCENTILE))
-        + float(np.percentile(shin_lengths, HEIGHT_PERCENTILE))
+        float(np.percentile(head_lengths, HEIGHT_PERCENTILE)) * _rescale
+        + float(np.percentile(torso_lengths, HEIGHT_PERCENTILE)) * _rescale
+        + float(np.percentile(thigh_lengths, HEIGHT_PERCENTILE)) * _rescale
+        + float(np.percentile(shin_lengths, HEIGHT_PERCENTILE)) * _rescale
     )
 
 
@@ -990,6 +1130,69 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
     return window
 
 
+_SKELETON_LANDMARK_NAMES = [
+    "NOSE",
+    "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_ELBOW", "RIGHT_ELBOW",
+    "LEFT_WRIST", "RIGHT_WRIST", "LEFT_HIP", "RIGHT_HIP",
+    "LEFT_KNEE", "RIGHT_KNEE", "LEFT_ANKLE", "RIGHT_ANKLE",
+    "LEFT_HEEL", "RIGHT_HEEL", "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX",
+]
+
+
+def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
+                                 start_frame: int, end_frame: int) -> pd.DataFrame:
+    """
+    Re-extracts RAW (unsmoothed) positions for every landmark the video
+    overlay actually draws, across the delivery-swing window, and merges
+    them over the existing smoothed df.
+
+    BUG FOUND (2026-08-10, coach caught it on a real downloaded render):
+    the numeric release_height and head_stability values already get this
+    same raw-re-extraction treatment (see _refine_release_landmarks_raw /
+    _refine_head_stability_window_raw), but the annotated VIDEO — the
+    thing a coach actually watches — was still being drawn from the
+    plain Hampel-filtered + 5-frame-rolling-mean-smoothed df the whole
+    time. The metrics were right; the skeleton drawn on screen during the
+    fastest, most blurred part of the action (the arm swinging through
+    release) still visibly lagged/loosened from the real body position,
+    exactly the same dilution already proven and fixed for the numbers.
+    This closes that gap for the picture itself.
+
+    Window is [FFC, BR + a short follow-through buffer] — the actual
+    delivery-stride-through-release phase this app already labels
+    "STRIDE"/"RELEASE"/early "FOLLOW-THROUGH" elsewhere in this same
+    overlay, not an arbitrary time constant — rather than the tighter
+    ~80ms-either-side window speed_estimation.py uses for peak velocity,
+    since a viewer's impression of "the skeleton looks loose" spans the
+    whole visible swing, not just the single instant of peak wrist speed.
+
+    Returns the FULL df (not just the window) with only that window's
+    landmark columns patched, ready to pass straight into the video
+    renderer. On any failure, returns the original df unchanged — this
+    can only sharpen the render, never break or block it.
+    """
+    try:
+        raw = extract_raw_landmarks_window(
+            video_path, fps, _SKELETON_LANDMARK_NAMES, int(start_frame), int(end_frame),
+        )
+    except Exception as e:
+        monitoring.capture(e)
+        return df
+
+    if not raw:
+        return df
+
+    patched = df.copy()
+    for frame_idx, landmarks in raw.items():
+        mask = patched["frame"] == frame_idx
+        if not mask.any():
+            continue
+        for name, (x, y, _vis) in landmarks.items():
+            patched.loc[mask, f"{name}_x"] = x
+            patched.loc[mask, f"{name}_y"] = y
+    return patched
+
+
 def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "right",
                                          reference_row: pd.Series = None,
                                          wrist_override_norm: tuple = None,
@@ -1099,7 +1302,45 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
             }
 
         raw_span_body_height = abs(float(y_ankle) - float(y_head))
-        using_segment_sum = segment_sum_body_height is not None and segment_sum_body_height > 0
+
+        # PREFER THE RAW SPAN WHEN THE REFERENCE FRAME IS VERIFIABLY
+        # UPRIGHT (2026-08-13, real bug found on the coach's own live-demo
+        # session): segment_sum_body_height is measured from EARLY run-up
+        # frames, at whatever camera distance those happen to be at — using
+        # it always meant rescaling that measurement to match the
+        # reference frame's own distance, and that rescale target turned
+        # out to be unreliable exactly when it matters most: at release,
+        # the bowling action itself has rotated the torso (that's what hip-
+        # shoulder separation measures), so shoulder width — the natural
+        # distance proxy — shrinks from ROTATION, not distance, right at
+        # the one frame this needs to match. Confirmed directly on a real
+        # rear-view clip (M.Rauf.mp4): the release-adjacent reference frame
+        # was visibly, verifiably upright (no trunk bend at all) with a raw
+        # span implying a plausible ~130% release height matching the
+        # video, yet segment_sum (rescaled by shoulder width at/near that
+        # same frame) came out SMALLER than the raw span itself —
+        # mathematically backwards for a 90th-percentile-of-fully-extended-
+        # segments measure, and traced to exactly this rotation confound.
+        # segment_sum_body_height's own reason for existing was ONE
+        # specific failure mode — a BENT reference frame compressing the
+        # raw span (confirmed real case: 0.0531 raw span, 240% false
+        # "OPTIMAL" reading) — so it's only actually needed when that
+        # failure mode is present. When the reference frame is genuinely
+        # upright, the raw span is already correctly scaled (it's measured
+        # AT that exact frame, no rescaling needed at all) and more
+        # trustworthy than segment_sum's own rescale uncertainty.
+        _ref_ls_y, _ref_rs_y = height_row.get("LEFT_SHOULDER_y"), height_row.get("RIGHT_SHOULDER_y")
+        _ref_hip_y = height_row.get(f"{lead_side}_HIP_y")
+        _reference_frame_verified_upright = False
+        if (_ref_ls_y is not None and not pd.isna(_ref_ls_y) and _ref_rs_y is not None and not pd.isna(_ref_rs_y)
+                and _ref_hip_y is not None and not pd.isna(_ref_hip_y)):
+            _ref_shoulder_y = (float(_ref_ls_y) + float(_ref_rs_y)) / 2
+            _reference_frame_verified_upright = float(_ref_hip_y) > _ref_shoulder_y > float(y_head)
+
+        using_segment_sum = (
+            not _reference_frame_verified_upright
+            and segment_sum_body_height is not None and segment_sum_body_height > 0
+        )
         body_height = float(segment_sum_body_height) if using_segment_sum else raw_span_body_height
 
         debug_raw = {
@@ -1108,6 +1349,7 @@ def calculate_release_height_ratio_safe(br_row: pd.Series, bowling_arm: str = "r
             "y_ankle": round(float(y_ankle), 4),
             "body_height": round(float(body_height), 4),
             "body_height_source": "segment_sum" if using_segment_sum else "head_ankle_span",
+            "reference_frame_verified_upright": _reference_frame_verified_upright,
             "raw_head_ankle_span": round(float(raw_span_body_height), 4),
             "bowl_side_used": bowl_side,
             "ankle_side_used": ankle_side,
@@ -1797,7 +2039,10 @@ def run_complete_bowling_analysis(video_path: str,
     # _compute_segment_sum_body_height's docstring for the real 240%
     # false reading this fixes. None (falls back to the old method) if
     # this clip doesn't have enough plausible early frames to trust.
-    segment_sum_body_height = _compute_segment_sum_body_height(df, bowling_arm, events.get("BFC"))
+    segment_sum_body_height = _compute_segment_sum_body_height(
+        df, bowling_arm, events.get("BFC"),
+        target_scale_frame=(int(height_reference_row["frame"]) if height_reference_row is not None else None),
+    )
     # SEPARATE narrow-window (BFC-15..BFC+15) baseline, for the absolute
     # standing-height-in-cm estimate ONLY (roadmap item #1, 2026-08-06) —
     # see _compute_segment_sum_body_height's search_start_frame docstring
@@ -1871,8 +2116,19 @@ def run_complete_bowling_analysis(video_path: str,
         knee_delta_status = "yielding" if knee_delta < -5.0 else ("braced" if knee_delta >= 0 else "minor_yield")
 
     # STAGE 5 — VIDEO GENERATION
+    _skeleton_df = df
+    try:
+        _br_frame_for_video = int(events["BR"])
+        _swing_start = events.get("FFC")
+        _swing_start = int(_swing_start) if _swing_start is not None else max(0, _br_frame_for_video - int(round(fps * 0.3)))
+        _swing_end = min(int(df["frame"].max()), _br_frame_for_video + int(round(fps * 0.3)))
+        if _swing_start < _swing_end:
+            _skeleton_df = _refine_skeleton_window_raw(video_path, fps, df, _swing_start, _swing_end)
+    except Exception as e:
+        monitoring.capture(e)
+
     raw_output_video = os.path.join(output_dir, "annotated_raw.mp4")
-    generate_fail_safe_video(video_path, raw_output_video, df, events, bowling_arm=bowling_arm,
+    generate_fail_safe_video(video_path, raw_output_video, _skeleton_df, events, bowling_arm=bowling_arm,
                               camera_angle=stage12.get("camera_angle", "side_on"),
                               bowler_type=bowler_type)
     web_safe_video_file = transcode_to_h264(raw_output_video)

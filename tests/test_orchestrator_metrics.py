@@ -276,6 +276,51 @@ class TestReleaseHeightClassificationThresholds:
         assert new_result["ratio"] < 1.30
         assert new_result["recalibration_pending"] is True
 
+    def test_real_bug_scenario_upright_reference_frame_ignores_a_bad_segment_sum(self):
+        """Regression test for a real bug found on the coach's own live-
+        demo session (2026-08-13): release_height came back 24%, later
+        traced to segment_sum_body_height being computed from early run-up
+        frames and rescaled to match the release frame's own camera
+        distance via shoulder width — which is an unreliable proxy
+        specifically AT release, because the bowling action rotates the
+        torso (that's what hip-shoulder separation measures), shrinking
+        apparent shoulder width from rotation, not distance. Confirmed on
+        the real clip: the release-adjacent reference frame was visibly,
+        verifiably upright with a raw span implying a plausible ~130%
+        (matching the video), while the rescaled segment_sum came out
+        SMALLER than that raw span — backwards for a measure that's
+        supposed to represent fully-extended standing height.
+
+        Fix: when the reference frame is independently verified upright
+        (the ONLY case segment_sum_body_height's own compression problem
+        doesn't apply — see the bent-frame test above), trust its raw
+        span directly instead of a segment-sum baseline that needs a
+        fragile rescale to be comparable. This is the exact inverse of
+        the bent-frame test above: there, a bad raw span (compressed by a
+        real bend) is corrected by a good segment_sum; here, a bad/
+        mismatched segment_sum must not override a good raw span."""
+        upright_reference_row = pd.Series({
+            "NOSE_y": 0.20, "LEFT_SHOULDER_y": 0.25, "RIGHT_SHOULDER_y": 0.25,
+            "LEFT_HIP_y": 0.55, "LEFT_ANKLE_y": 0.85, "RIGHT_ANKLE_y": 0.87,
+            "LEFT_KNEE_y": 0.70,
+        })
+        br_row = pd.Series({"RIGHT_WRIST_y": 0.05, "LEFT_ANKLE_y": 0.85, "RIGHT_ANKLE_y": 0.87})
+
+        result = o.calculate_release_height_ratio_safe(
+            br_row, bowling_arm="right", reference_row=upright_reference_row,
+            # Deliberately a bad/mismatched baseline (much smaller than the
+            # verified-upright raw span of 0.65) — simulates the real
+            # rescale-mismatch bug. Must be ignored, not used.
+            segment_sum_body_height=0.20,
+        )
+        assert result["status"] == "success"
+        assert result["debug_raw"]["body_height_source"] == "head_ankle_span"
+        assert result["debug_raw"]["reference_frame_verified_upright"] is True
+        assert result["debug_raw"]["body_height"] == pytest.approx(0.65, abs=0.01)
+        assert result["recalibration_pending"] is False
+        # ratio = abs(0.85 - 0.05) / 0.65 ~= 1.23, NOT abs(0.85-0.05)/0.20 = 4.0
+        assert result["ratio"] == pytest.approx(1.2308, abs=0.01)
+
 
 class TestReleaseFrameTrackingUncertain:
     """Regression coverage for a real bug found testing a live clip
@@ -492,6 +537,40 @@ class TestSegmentSumBodyHeight:
         # aggregate over the bowler-era samples would be measurably
         # pulled toward its larger value - confirm it wasn't.
         assert result == pytest.approx(clean_result, abs=0.001)
+
+    def test_real_bug_scenario_close_camera_setup_frames_no_longer_inflate_the_baseline(self):
+        """Regression test for a real bug found from the coach's actual
+        saved session data (2026-08-10): release_height came back 24%
+        ("Low-Sling Action") on a well-tracked clip (M.Rauf.mp4), and the
+        debug_raw showed segment_sum_body_height at 1.012 — over 6x the
+        SAME reference frame's raw head-ankle span (0.164), physically
+        impossible for one real person.
+
+        Traced directly: the scale-consistency guard (added 2026-08-07/08
+        to reject a distant bystander) only ever had a FLOOR
+        (SCALE_MIN_RATIO) — nothing rejected a frame LARGER than the
+        reference. Confirmed on the real clip: frames 25-34, early in the
+        search window, had shoulder width up to 0.60 against a near-BFC
+        reference of 0.115 — a 5.2x jump, almost certainly the camera
+        being held close to someone during setup before the run-up
+        starts, not the bowler at any real filming distance. Those
+        oversized frames' segment lengths dominated 3 of the 4
+        independently-maximized 90th-percentile sums.
+
+        This is that exact scenario, scaled down: a block of oversized
+        early frames (scale=5x the real bowler) before the genuine
+        bowler-era frames near the window end. Without the ceiling, the
+        old floor-only check would have let them straight through
+        (5x is well above the 0.5x floor) and inflated the result well
+        past the true ~0.60 baseline."""
+        oversized_rows = [self._distant_row(f, scale=5.0) for f in range(10)]
+        bowler_rows = [self._upright_row(f) for f in range(20, 35)]
+        df = pd.DataFrame(oversized_rows + bowler_rows)
+        result = o._compute_segment_sum_body_height(df, "right", search_end_frame=35)
+        assert result is not None
+        # Must reflect the real bowler's ~0.60 body height, not a value
+        # inflated by the 10 oversized camera-setup frames.
+        assert result == pytest.approx(0.60, abs=0.03)
 
     def test_real_bug_scenario_scarce_leg_landmarks_no_longer_forces_a_fallback(self):
         """Regression test for the real bug found on a live clip

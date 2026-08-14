@@ -245,6 +245,49 @@ def _hex_to_bgr(hex_color: str) -> tuple:
 TIER_COLORS_BGR = {tier: _hex_to_bgr(hexval) for tier, hexval in mr.TIER_COLORS.items()}
 
 
+_EVENT_BADGE_LABELS = [("BFC", "CONTACT", (60, 225, 90)),
+                        ("FFC", "CONTACT", (60, 225, 90)),
+                        ("BR", "RELEASE", (0, 0, 0))]  # BR's real color (JOINT_CORE) filled in by the caller
+
+
+def _select_active_badge(f_idx: int, events: dict, window: int, event_labels=None):
+    """
+    Which event badge (BFC/FFC "CONTACT", BR "RELEASE") should be showing
+    on this frame, if any — extracted out of the render loop so this
+    exact decision can be unit-tested without rendering a video.
+
+    Picks whichever event is actually CLOSEST to this frame, not just the
+    first one in the list within range — BFC/FFC/BR often land within a
+    few frames of each other for a real delivery, so "first match wins"
+    was showing the earlier event's badge (CONTACT) even on the exact BR
+    frame itself, hiding the RELEASE badge and the release-height
+    line/text that only draw when the RELEASE badge is showing.
+
+    BUG FOUND (2026-08-10, coach caught it on a real downloaded render):
+    the window used to be symmetric (abs(f_idx - ev_frame) <= window),
+    which shows "RELEASE HEIGHT: X%" (a readout of something that has
+    already happened) for up to `window` frames BEFORE the release frame
+    too — directly contradicting the separate top-left phase pill, which
+    correctly still says RUN-UP/DELIVERY STRIDE for those same frames. A
+    badge reporting a completed event should only ever appear at or
+    after that event, never before it, so this only looks FORWARD from
+    each event frame now.
+
+    Returns (label, color, event_frame) or None.
+    """
+    active_badge = None
+    best_distance = None
+    for key, label, color in (event_labels or _EVENT_BADGE_LABELS):
+        ev_frame = events.get(key)
+        if ev_frame is None:
+            continue
+        distance = f_idx - ev_frame
+        if 0 <= distance <= window and (best_distance is None or distance < best_distance):
+            active_badge = (label, color, ev_frame)
+            best_distance = distance
+    return active_badge
+
+
 def render_annotated_video(video_path: str, output_path: str,
                             df: pd.DataFrame, events: dict,
                             slow_motion_factor: float = 4.0,
@@ -638,7 +681,26 @@ def render_annotated_video(video_path: str, output_path: str,
     # orchestrator.py itself uses (same bowling_arm, same BFC-anchored
     # search window) so both numbers are guaranteed to come from the same
     # formula again.
-    segment_sum_body_height_for_video = _compute_segment_sum_body_height(df, bowling_arm, events.get("BFC"))
+    # Reference frame computed BEFORE the segment-sum call below (not
+    # after, as it used to be) — it must rescale to THIS frame's own
+    # camera-distance scale, not an unrelated internal reference. See
+    # _compute_segment_sum_body_height's target_scale_frame docstring: a
+    # rear-view clip where the bowler runs away from camera can be
+    # meaningfully smaller at release than during run-up, and rescaling
+    # to the wrong frame silently produced a body-height baseline ~2.5x
+    # too large for the release frame it was actually divided into.
+    _br_frame_for_scale = events.get("BR")
+    _height_ref_for_scale = None
+    if _br_frame_for_scale is not None:
+        _height_ref_for_scale = _find_grounded_reference_near(df, _br_frame_for_scale, bowling_arm)
+        if _height_ref_for_scale is None:
+            _height_ref_for_scale = _nearest_complete_row(
+                df, events.get("FFC"), ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
+            )
+    segment_sum_body_height_for_video = _compute_segment_sum_body_height(
+        df, bowling_arm, events.get("BFC"),
+        target_scale_frame=(int(_height_ref_for_scale["frame"]) if _height_ref_for_scale is not None else None)
+    )
     release_height_pct = None
     # Normalized (0-1) points for the release-height line drawn on the BR
     # frame: from the bowling-arm wrist straight down to ground level (the
@@ -652,11 +714,10 @@ def render_annotated_video(video_path: str, output_path: str,
         br_rows = df[df["frame"] == br_frame]
         if not br_rows.empty:
             br_row_for_release = br_rows.iloc[0]
-            height_ref_for_release = _find_grounded_reference_near(df, br_frame, bowling_arm)
-            if height_ref_for_release is None:
-                height_ref_for_release = _nearest_complete_row(
-                    df, events.get("FFC"), ["NOSE_y", "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
-                )
+            # Same reference frame already computed above (for the
+            # segment-sum rescale target) — reused here rather than
+            # recomputed, so the two calls can never disagree.
+            height_ref_for_release = _height_ref_for_scale
             # Coach-confirmed wrist/ball position, when given, overrides the
             # tracked landmark entirely — see calculate_release_height_ratio_safe's
             # docstring for why (verified real MediaPipe mistracking during
@@ -1191,26 +1252,12 @@ def render_annotated_video(video_path: str, output_path: str,
             cv2.putText(frame, ANGLE_TAG, (tag_x1 + 12, 12 + tag_h + 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (190, 190, 190), 1, cv2.LINE_AA)
 
-        event_labels = [("BFC", "CONTACT", (60, 225, 90)),
-                         ("FFC", "CONTACT", (60, 225, 90)),
-                         ("BR", "RELEASE", JOINT_CORE)]
-        # Pick whichever event is actually CLOSEST to this frame, not just
-        # the first one in the list that's within range. BFC/FFC/BR often
-        # land within a few frames of each other for a real delivery, so
-        # "first match wins" was showing the earlier event's badge
-        # (CONTACT) even on the exact BR frame itself, hiding the RELEASE
-        # badge and the release-height line/text that only draw when the
-        # RELEASE badge is showing.
-        active_badge = None
-        best_distance = None
-        for key, label, color in event_labels:
-            ev_frame = events.get(key)
-            if ev_frame is None:
-                continue
-            distance = abs(f_idx - ev_frame)
-            if distance <= PHASE_BADGE_WINDOW and (best_distance is None or distance < best_distance):
-                active_badge = (label, color, ev_frame)
-                best_distance = distance
+        active_badge = _select_active_badge(
+            f_idx, events, PHASE_BADGE_WINDOW,
+            event_labels=[("BFC", "CONTACT", (60, 225, 90)),
+                          ("FFC", "CONTACT", (60, 225, 90)),
+                          ("BR", "RELEASE", JOINT_CORE)],
+        )
 
         if active_badge is not None:
             label, color, ev_frame = active_badge

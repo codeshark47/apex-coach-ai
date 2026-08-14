@@ -224,3 +224,51 @@ class TestImplausibleArmNodes:
                              side="RIGHT", torso_h=0.2)
         flagged = vo.implausible_arm_nodes(row, torso_h=0.2)
         assert flagged == set()
+
+
+class TestSelectActiveBadge:
+    """Regression test for a real bug a coach caught on a real downloaded
+    render: the RELEASE event badge (and its "RELEASE HEIGHT: X%"
+    readout) used a SYMMETRIC time window around the BR frame, so it
+    started appearing up to PHASE_BADGE_WINDOW frames BEFORE release
+    actually happened — directly contradicting the separate top-left
+    phase pill, which correctly still said RUN-UP/DELIVERY STRIDE for
+    those same frames. A badge reporting a completed event must only
+    ever appear at or after that event."""
+
+    def test_badge_never_shows_before_its_event_frame(self):
+        events = {"BFC": 110, "FFC": 115, "BR": 121}
+        # Frame 108 is before BFC (still genuinely RUN-UP) but within the
+        # old symmetric window of BR (abs(108-121)=13 <= 15) — the old
+        # bug would have shown RELEASE here.
+        assert vo._select_active_badge(108, events, window=15) is None
+
+    def test_badge_shows_exactly_at_the_event_frame(self):
+        events = {"BFC": 110, "FFC": 115, "BR": 121}
+        badge = vo._select_active_badge(121, events, window=15)
+        assert badge is not None
+        assert badge[0] == "RELEASE"
+        assert badge[2] == 121
+
+    def test_badge_keeps_showing_for_the_window_after_the_event(self):
+        events = {"BFC": 110, "FFC": 115, "BR": 121}
+        badge = vo._select_active_badge(130, events, window=15)  # BR + 9
+        assert badge is not None
+        assert badge[0] == "RELEASE"
+
+    def test_badge_disappears_once_past_the_window(self):
+        events = {"BFC": 110, "FFC": 115, "BR": 121}
+        assert vo._select_active_badge(140, events, window=15) is None  # BR + 19
+
+    def test_closest_event_wins_when_multiple_are_in_range(self):
+        """BFC/FFC/BR often land within a few frames of each other — the
+        RELEASE badge (and its release-height line/text) must still win
+        on the exact BR frame, not get hidden by an earlier CONTACT
+        badge whose own window also reaches this far forward."""
+        events = {"BFC": 100, "FFC": 118, "BR": 121}
+        badge = vo._select_active_badge(121, events, window=15)
+        assert badge[0] == "RELEASE"
+
+    def test_no_badge_when_no_events_are_in_range(self):
+        events = {"BFC": 10, "FFC": 20, "BR": 30}
+        assert vo._select_active_badge(200, events, window=15) is None

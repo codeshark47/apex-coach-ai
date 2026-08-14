@@ -1,3 +1,4 @@
+import collections
 import cv2
 import pandas as pd
 import numpy as np
@@ -54,7 +55,52 @@ def _centroid_xy(landmarks_list):
     return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
 
 
-def _walk_from_seed(seed_idx, seed_xy, frame_candidates, fps, lo_bound, hi_bound):
+def _bbox_from_landmarks(landmarks, width, height, margin=0.04):
+    xs = [landmarks[i].x for i in _TORSO_INDICES]
+    ys = [landmarks[i].y for i in _TORSO_INDICES]
+    min_x, max_x = max(0.0, min(xs) - margin), min(1.0, max(xs) + margin)
+    min_y, max_y = max(0.0, min(ys) - margin), min(1.0, max(ys) + margin)
+    return int(min_x * width), int(min_y * height), int(max_x * width), int(max_y * height)
+
+
+def _compute_appearance_histogram(frame_bgr, landmarks):
+    """
+    HSV color-histogram "appearance fingerprint" of the torso region
+    around a candidate — clothing/skin-tone signature, tolerant of the
+    exact pose/frame lighting. Verified directly on real footage
+    (2026-08-10): mean similarity to a seed crop was 0.71 for the true
+    bowler's own later frames vs. 0.25 for a different real person
+    (batsman) visible earlier in the same clip — a real, usable signal,
+    not assumed.
+
+    An earlier attempt at this (commit b8ff3cd, reverted the next day)
+    used cv2.HISTCMP_CORRELATION, which does not exist in this OpenCV
+    version (it's HISTCMP_CORREL) — that bug was silently swallowed by
+    a broad try/except, so the appearance signal never actually ran and
+    could not have been responsible for that revert. No broad except
+    here for exactly that reason — a real failure should surface in
+    testing, not vanish into a default score.
+    """
+    height, width = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = _bbox_from_landmarks(landmarks, width, height)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    return hist
+
+
+def _hist_similarity(hist_a, hist_b) -> float:
+    if hist_a is None or hist_b is None:
+        return 0.0
+    return float(cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL))
+
+
+def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bound, hi_bound):
     """
     Anchors at seed_idx (matching seed_xy within SEED_MATCH_TOLERANCE),
     then walks forward to hi_bound and backward to lo_bound using
@@ -63,6 +109,27 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, fps, lo_bound, hi_bound
     direction (see extract_video_landmarks for why this ceiling exists
     — a long-unconfirmed anchor position stops being a trustworthy
     reference for "who's nearby").
+
+    APPEARANCE GATE: position alone is the known weak point here — the
+    longer a gap runs, the more the acceptance radius grows (up to
+    MAX_DIST_CAP), which is exactly when a different, merely-nearby
+    person becomes acceptable on position alone. Once we have enough
+    confirmed history to know what this specific person actually looks
+    like (APPEARANCE_MIN_PROFILE frames), every candidate must also
+    clear an appearance-similarity floor — calibrated to THIS clip's own
+    footage (a fraction of how similar this person's own confirmed
+    frames are to each other), not a fixed number tuned to one video,
+    since lighting/distance/camera quality varies a lot across real
+    coach-submitted clips. The floor is low right after a fresh match
+    and escalates the longer the current gap runs, since that's exactly
+    when position is least trustworthy. It is never fully skipped,
+    including for fresh matches — an earlier version of this skipped the
+    check whenever the gap since the last successful match was small,
+    which real-footage testing caught as a real bug: a CHAIN of
+    individually-tiny, individually-plausible position steps kept
+    resetting that gap back to 1 on every step, so cumulative drift onto
+    a completely different (tiny, spurious) detection never looked like
+    "a long gap" to the old check at all.
 
     Only touches frames within [lo_bound, hi_bound] — this is what lets
     multiple seeds coexist: each one only walks within its own assigned
@@ -76,54 +143,89 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, fps, lo_bound, hi_bound
     MAX_DIST_PER_SECOND = 0.6
     MAX_DIST_CAP = 0.25
     MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
+    APPEARANCE_PROFILE_LEN = 8
+    APPEARANCE_MIN_PROFILE = 3
 
-    def pick_closest(cands, anchor_xy, max_dist):
-        best, best_dist = None, None
-        for cand in cands:
+    def pick_closest(cands, hists, anchor_xy, max_dist, profile, gap_frames):
+        in_range = []
+        for cand, hist in zip(cands, hists):
             cx, cy = _centroid_xy(cand)
             dist = ((cx - anchor_xy[0]) ** 2 + (cy - anchor_xy[1]) ** 2) ** 0.5
-            if best_dist is None or dist < best_dist:
-                best, best_dist = cand, dist
-        if best is None or best_dist > max_dist:
-            return None
-        return best
+            if dist <= max_dist:
+                in_range.append((dist, cand, hist))
+        if not in_range:
+            return None, None
+        in_range.sort(key=lambda t: t[0])
+
+        if len(profile) < APPEARANCE_MIN_PROFILE:
+            _, best_cand, best_hist = in_range[0]
+            return best_cand, best_hist
+
+        # BUG FOUND during real-footage validation (2026-08-10): gating
+        # this on gap_frames <= APPEARANCE_GRACE_FRAMES let a CHAIN of
+        # individually-tiny, individually-plausible position steps skip
+        # the appearance check forever, because each successful match
+        # resets gap_frames back to 1 — cumulative drift across many
+        # small steps never looked like "a long gap" to this check even
+        # once it had walked onto a completely different, tiny/spurious
+        # detection. Confirmed directly: 3 frames right at the real
+        # batsman/bowler boundary leaked this way, each with a near-zero
+        # shoulder width (0.005-0.016 vs ~0.045 for the real bowler) that
+        # never got appearance-checked because every step "just confirmed
+        # a moment ago". Fix: the appearance floor is now always live
+        # once the profile has enough data, not skipped for fresh
+        # matches — kept LOW at gap_frames==1 (0.2x self-similarity) so
+        # normal noisy-but-correct frames still pass, and escalates for
+        # longer gaps exactly as before.
+        profile_list = list(profile)
+        pairwise = [
+            _hist_similarity(profile_list[i], profile_list[j])
+            for i in range(len(profile_list)) for j in range(i + 1, len(profile_list))
+        ]
+        self_similarity = sum(pairwise) / len(pairwise) if pairwise else 0.5
+        gap_fraction = min(1.0, gap_frames / MAX_GAP_FRAMES)
+        required_sim = self_similarity * (0.2 + 0.6 * gap_fraction)
+
+        for dist, cand, hist in in_range:
+            sim = max((_hist_similarity(hist, p) for p in profile_list), default=0.0)
+            if sim >= required_sim:
+                return cand, hist
+        return None, None
 
     result = {}
-    chosen = pick_closest(frame_candidates[seed_idx], seed_xy, SEED_MATCH_TOLERANCE) if frame_candidates[seed_idx] else None
+    seed_cands = frame_candidates[seed_idx]
+    seed_hists = frame_hists[seed_idx]
+    chosen, chosen_hist = pick_closest(seed_cands, seed_hists, seed_xy, SEED_MATCH_TOLERANCE,
+                                        collections.deque(), 0) if seed_cands else (None, None)
     result[seed_idx] = chosen
     seed_anchor = _centroid_xy(chosen) if chosen is not None else seed_xy
 
-    anchor = seed_anchor
-    frames_since_confirmed = 1
-    for i in range(seed_idx + 1, hi_bound + 1):
-        if frames_since_confirmed > MAX_GAP_FRAMES:
-            result[i] = None
-            frames_since_confirmed += 1
-            continue
-        max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
-        chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
-        result[i] = chosen
-        if chosen is not None:
-            anchor = _centroid_xy(chosen)
-            frames_since_confirmed = 1
-        else:
-            frames_since_confirmed += 1
+    def walk_direction(frame_range):
+        anchor = seed_anchor
+        frames_since_confirmed = 1
+        profile = collections.deque(maxlen=APPEARANCE_PROFILE_LEN)
+        if chosen_hist is not None:
+            profile.append(chosen_hist)
+        for i in frame_range:
+            if frames_since_confirmed > MAX_GAP_FRAMES:
+                result[i] = None
+                frames_since_confirmed += 1
+                continue
+            max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
+            picked, picked_hist = pick_closest(
+                frame_candidates[i], frame_hists[i], anchor, max_dist, profile, frames_since_confirmed
+            ) if frame_candidates[i] else (None, None)
+            result[i] = picked
+            if picked is not None:
+                anchor = _centroid_xy(picked)
+                frames_since_confirmed = 1
+                if picked_hist is not None:
+                    profile.append(picked_hist)
+            else:
+                frames_since_confirmed += 1
 
-    anchor = seed_anchor
-    frames_since_confirmed = 1
-    for i in range(seed_idx - 1, lo_bound - 1, -1):
-        if frames_since_confirmed > MAX_GAP_FRAMES:
-            result[i] = None
-            frames_since_confirmed += 1
-            continue
-        max_dist = min((MAX_DIST_PER_SECOND / fps) * frames_since_confirmed, MAX_DIST_CAP)
-        chosen = pick_closest(frame_candidates[i], anchor, max_dist) if frame_candidates[i] else None
-        result[i] = chosen
-        if chosen is not None:
-            anchor = _centroid_xy(chosen)
-            frames_since_confirmed = 1
-        else:
-            frames_since_confirmed += 1
+    walk_direction(range(seed_idx + 1, hi_bound + 1))
+    walk_direction(range(seed_idx - 1, lo_bound - 1, -1))
 
     return result
 
@@ -214,7 +316,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
     for name in LANDMARK_NAMES:
         columns.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
 
-    def run_detection_pass(num_poses):
+    def run_detection_pass(num_poses, compute_appearance=False):
         base_options_local = python.BaseOptions(model_asset_path=model_path)
         options = vision.PoseLandmarkerOptions(
             base_options=base_options_local,
@@ -238,6 +340,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         cap_local = cv2.VideoCapture(video_path)
         ms_per_frame_local = 1000.0 / fps
         candidates = []
+        hists = []
         idx = 0
         last_ts = -1
         while True:
@@ -251,11 +354,20 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
                 ts = last_ts + 1
             last_ts = ts
             detection_result = landmarker_local.detect_for_video(mp_image_frame, ts)
-            candidates.append(list(detection_result.pose_landmarks) if detection_result.pose_landmarks else [])
+            cands = list(detection_result.pose_landmarks) if detection_result.pose_landmarks else []
+            candidates.append(cands)
+            # Computed here (not in a later pass) so the appearance
+            # fingerprint uses the exact same frame pixels the candidate
+            # was detected from, at no extra video-decode cost — the
+            # frame is already in memory for this iteration either way.
+            if compute_appearance and cands:
+                hists.append([_compute_appearance_histogram(frame, cand) for cand in cands])
+            else:
+                hists.append([None] * len(cands))
             idx += 1
         cap_local.release()
         landmarker_local.close()
-        return candidates
+        return candidates, hists
 
     # ALWAYS run the fast, reliable single-person pass — multi-pose
     # detection (needed to disambiguate between several people) measurably
@@ -265,7 +377,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
     # (multi-pose) for several frames. When a seed is given, this result
     # is used as a preferred data SOURCE, not authoritative on its own —
     # see the merge logic below for why.
-    single_pass_candidates = run_detection_pass(1)
+    single_pass_candidates, _ = run_detection_pass(1)
     total_frames = len(single_pass_candidates)
     single_pose_chosen = [cands[0] if cands else None for cands in single_pass_candidates]
 
@@ -290,7 +402,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         # match there either). This gets single-pose's better quality on
         # the frames it can be trusted, without ever silently trusting a
         # phantom detection just because it happened to be smooth.
-        frame_candidates = run_detection_pass(3)
+        frame_candidates, frame_hists = run_detection_pass(3, compute_appearance=True)
         # A frame where only ONE candidate is detected still needs a
         # plausibility check, not just an automatic accept — otherwise a
         # different, more-consistently-detected bystander (e.g. a coach
@@ -328,7 +440,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
             lo_bound = 0 if k == 0 else (seeds[k - 1][0] + s_idx) // 2 + 1
             hi_bound = (total_frames - 1) if k == len(seeds) - 1 else (s_idx + seeds[k + 1][0]) // 2
             s_xy = (s_pt[0] / frame_width, s_pt[1] / frame_height)
-            walk_result = _walk_from_seed(s_idx, s_xy, frame_candidates, fps, lo_bound, hi_bound)
+            walk_result = _walk_from_seed(s_idx, s_xy, frame_candidates, frame_hists, fps, lo_bound, hi_bound)
             for i, v in walk_result.items():
                 seeded_chosen[i] = v
 

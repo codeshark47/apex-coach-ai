@@ -129,7 +129,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
     # _compute_segment_sum_body_height's docstring for the real 240%
     # false reading a raw head-to-ankle span produced on a bent reference
     # frame.
-    side_segment_sum_body_height = _compute_segment_sum_body_height(side_df, bowling_arm, side_events.get("BFC"))
+    side_segment_sum_body_height = _compute_segment_sum_body_height(
+        side_df, bowling_arm, side_events.get("BFC"),
+        target_scale_frame=(int(side_height_ref["frame"]) if side_height_ref is not None else None),
+    )
     release_height    = calculate_release_height_ratio_safe(side_br_rows.iloc[0], bowling_arm=bowling_arm,
                                                               reference_row=side_height_ref,
                                                               wrist_override_norm=side_wrist_override_norm,
@@ -193,7 +196,10 @@ def run_dual_camera_analysis(side_on_path: str, rear_view_path: str, output_dir:
         rear_wrist_x = rear_events.get("wrist_override_x")
         rear_wrist_y = rear_events.get("wrist_override_y")
         rear_wrist_override_norm = (rear_wrist_x, rear_wrist_y) if rear_wrist_x is not None and rear_wrist_y is not None else None
-        rear_segment_sum_body_height = _compute_segment_sum_body_height(rear_df, bowling_arm, rear_events.get("BFC"))
+        rear_segment_sum_body_height = _compute_segment_sum_body_height(
+            rear_df, bowling_arm, rear_events.get("BFC"),
+            target_scale_frame=(int(rear_height_ref["frame"]) if rear_height_ref is not None else None),
+        )
         rear_release_height = calculate_release_height_ratio_safe(rear_br_rows.iloc[0], bowling_arm=bowling_arm,
                                                                     reference_row=rear_height_ref,
                                                                     wrist_override_norm=rear_wrist_override_norm,
