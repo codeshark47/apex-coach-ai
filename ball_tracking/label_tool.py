@@ -64,6 +64,7 @@ def _log(msg: str):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import profile_store as store
+from ball_tracking.track_ball_from_seed import track_ball_from_seed
 
 st.set_page_config(page_title="Ball Labeling Tool", layout="wide")
 
@@ -116,6 +117,13 @@ DEFAULT_RADIUS_FRACTION = 0.02  # of frame width — first-frame starting guess 
 # just above generic noise — trades fewer assisted frames for fewer
 # confidently-wrong ones. Still a starting point, not a final constant.
 AI_PREFILL_CONF_THRESHOLD = 0.5
+
+# How many frames ahead of the last coach-confirmed position the tracked
+# pre-fill (see below) will follow before giving up and falling back to
+# the blind whole-frame scan — matches track_ball_from_seed's own
+# default, generous enough to cover this tool's max frame-sampling
+# interval (10) with real margin.
+TRACK_MAX_GAP_FRAMES = 30
 
 # HARD-NEGATIVE MINING (2026-08-04): real evaluation of ball_v1-6/v1-7
 # found the model's false positives cluster on specific lookalike
@@ -528,59 +536,104 @@ def main():
         pending_source_key = f"label_tool_pending_source_{video_name}_{frame_idx}"
         ai_radius_key = f"label_tool_ai_radius_{video_name}_{frame_idx}"
 
-        # AI PRE-FILL: only runs the FIRST time this frame is shown this
+        # PRE-FILL: only runs the FIRST time this frame is shown this
         # session (pending_point_key not set yet) — never overwrites a
         # coach's own click or a prior visit to this same frame (e.g. after
-        # "Undo last" stepping back to it). A confident detection pre-fills
-        # both the position and a starting radius guess (from the box size);
-        # the coach still reviews and confirms every single frame, same as
-        # before — this only removes the "click from nothing" step when the
-        # model already found it.
+        # "Undo last" stepping back to it). The coach still reviews and
+        # confirms every single frame either way — this only removes the
+        # "click from nothing" step when a guess is already available.
+        #
+        # TRACKED PRE-FILL, tried FIRST (2026-08-14, real coach ask: "the
+        # AI should learn from human clicks"): the whole-frame AI scan
+        # below treats every frame as independent — no memory of the
+        # frame before it, which is exactly why it kept latching onto
+        # unrelated things (a crease marking, an umpire's hat) once the
+        # confidence threshold was low enough to fire at all. If the
+        # coach already confirmed a REAL position earlier in this same
+        # clip, that's a far stronger starting point: track_ball_from_
+        # seed follows forward from that confirmed (frame, x, y, size)
+        # using a small search crop plus the size-trend check validated
+        # against real ground truth earlier today, instead of scanning
+        # the whole frame blind. Shown in a THIRD color (teal) distinct
+        # from the AI orange and the coach's own red, so it's clear at a
+        # glance this suggestion came from following the ball, not a
+        # fresh per-frame guess.
+        last_confirmed_key = f"label_tool_last_confirmed_{video_name}"
         if pending_point_key not in st.session_state:
-            yolo_model = _load_yolo_model()
-            if yolo_model is not None:
-                # BUG FOUND (2026-08-04, real coach report of near-total
-                # non-detection even on a clearly-visible ball): frame_rgb
-                # is RGB (converted for on-screen display). train_yolo.py
-                # trains on raw BGR frames (prepare_dataset.py writes
-                # cv2.imwrite(..., frame) with no color conversion), and
-                # ultralytics treats a raw numpy array the same way cv2
-                # itself does — BGR. Feeding it frame_rgb silently swapped
-                # red/blue for every prediction. Confirmed directly
-                # against 71 real labeled frames from a genuine training
-                # clip: BGR input hit the true ball position on 69/71
-                # frames (avg conf 0.467) vs only 59/71 for RGB (avg conf
-                # 0.476, but several frames lost enough confidence to fall
-                # below AI_PREFILL_CONF_THRESHOLD entirely, e.g. 0.41->0.14
-                # on one frame). Convert back to BGR for inference only —
-                # frame_rgb still drives the on-screen display, unchanged.
-                frame_bgr_for_model = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                results = yolo_model.predict(frame_bgr_for_model, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
-                boxes = results[0].boxes
-                if len(boxes) > 0:
-                    confs = boxes.conf.tolist()
-                    best_i = confs.index(max(confs))
-                    x1, y1, x2, y2 = boxes.xyxy[best_i].tolist()
-                    st.session_state[pending_point_key] = ((x1 + x2) / 2, (y1 + y2) / 2)
-                    st.session_state[pending_source_key] = "ai"
-                    st.session_state[ai_radius_key] = max(x2 - x1, y2 - y1) / 2
+            last_confirmed = st.session_state.get(last_confirmed_key)
+            tracked_this_frame = False
+            if last_confirmed is not None:
+                lc_frame, lc_x, lc_y, lc_size = last_confirmed
+                gap = frame_idx - lc_frame
+                if 0 < gap <= TRACK_MAX_GAP_FRAMES:
+                    yolo_model = _load_yolo_model()
+                    if yolo_model is not None:
+                        track_result = track_ball_from_seed(
+                            video_path, lc_frame, (lc_x, lc_y), yolo_model,
+                            seed_size=lc_size, max_frames_forward=gap,
+                        )
+                        if track_result["status"] == "success":
+                            _tp = track_result["points"]
+                            if _tp and _tp[-1][0] == frame_idx:
+                                _, tx, ty, tconf, tsize = _tp[-1]
+                                st.session_state[pending_point_key] = (tx, ty)
+                                st.session_state[pending_source_key] = "tracked"
+                                if tsize:
+                                    st.session_state[ai_radius_key] = tsize / 2
+                                tracked_this_frame = True
+
+            # WHOLE-FRAME AI FALLBACK: no prior confirmed position to
+            # track from yet (first labeled frame of this clip, or the
+            # tracker's gap ran out without finding the ball) — same
+            # blind per-frame scan as before.
+            if not tracked_this_frame:
+                yolo_model = _load_yolo_model()
+                if yolo_model is not None:
+                    # BUG FOUND (2026-08-04, real coach report of near-total
+                    # non-detection even on a clearly-visible ball): frame_rgb
+                    # is RGB (converted for on-screen display). train_yolo.py
+                    # trains on raw BGR frames (prepare_dataset.py writes
+                    # cv2.imwrite(..., frame) with no color conversion), and
+                    # ultralytics treats a raw numpy array the same way cv2
+                    # itself does — BGR. Feeding it frame_rgb silently swapped
+                    # red/blue for every prediction. Confirmed directly
+                    # against 71 real labeled frames from a genuine training
+                    # clip: BGR input hit the true ball position on 69/71
+                    # frames (avg conf 0.467) vs only 59/71 for RGB (avg conf
+                    # 0.476, but several frames lost enough confidence to fall
+                    # below AI_PREFILL_CONF_THRESHOLD entirely, e.g. 0.41->0.14
+                    # on one frame). Convert back to BGR for inference only —
+                    # frame_rgb still drives the on-screen display, unchanged.
+                    frame_bgr_for_model = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    results = yolo_model.predict(frame_bgr_for_model, conf=AI_PREFILL_CONF_THRESHOLD, verbose=False)
+                    boxes = results[0].boxes
+                    if len(boxes) > 0:
+                        confs = boxes.conf.tolist()
+                        best_i = confs.index(max(confs))
+                        x1, y1, x2, y2 = boxes.xyxy[best_i].tolist()
+                        st.session_state[pending_point_key] = ((x1 + x2) / 2, (y1 + y2) / 2)
+                        st.session_state[pending_source_key] = "ai"
+                        st.session_state[ai_radius_key] = max(x2 - x1, y2 - y1) / 2
 
     pending_point = st.session_state.get(pending_point_key)
     pending_source = st.session_state.get(pending_source_key)
 
     if st.session_state.label_tool_radius is not None:
         radius = st.session_state.label_tool_radius
-    elif pending_source == "ai" and ai_radius_key in st.session_state:
+    elif pending_source in ("ai", "tracked") and ai_radius_key in st.session_state:
         radius = st.session_state[ai_radius_key]
     else:
         radius = orig_w * DEFAULT_RADIUS_FRACTION
 
-    marker_color = (255, 165, 0) if pending_source == "ai" else (255, 60, 60)
+    marker_color = {"ai": (255, 165, 0), "tracked": (200, 180, 60)}.get(pending_source, (255, 60, 60))
     if pending_point is None:
         st.caption("Click the ball's center.")
     elif pending_source == "ai":
         st.caption("🤖 AI-suggested position (orange) — correct if it looks right, "
                    "or click elsewhere to fix it before confirming.")
+    elif pending_source == "tracked":
+        st.caption("🎯 Followed from your last confirmed click (teal) — correct if it "
+                   "looks right, or click elsewhere to fix it before confirming.")
     else:
         st.caption("📍 Your click (red).")
 
@@ -667,6 +720,10 @@ def main():
             if pending_source == "ai":
                 notes = ("AI-suggested position (V1 model pre-fill) accepted by the coach "
                          "without adjustment — no drawn marker ever existed on this video's pixels.")
+            elif pending_source == "tracked":
+                notes = ("Followed forward from the coach's last confirmed click on this clip "
+                         "(track_ball_from_seed) and accepted without adjustment — no drawn "
+                         "marker ever existed on this video's pixels.")
             else:
                 notes = ("Directly clicked by the coach on the original, unmarked frame — "
                          "no drawn marker ever existed on this video's pixels.")
@@ -679,6 +736,11 @@ def main():
                 "notes": notes,
             }, on_conflict="source_video_filename,frame_index").execute()
             _upsert_run(client, video_name, fps, orig_w, frame_rgb.shape[0], total_frames, frame_idx, x, y, radius)
+            # Remembered so the NEXT frame's pre-fill can follow forward
+            # from here instead of scanning blind — see the tracked
+            # pre-fill block above. Diameter (2x radius) matches
+            # track_ball_from_seed's own seed_size convention.
+            st.session_state[last_confirmed_key] = (frame_idx, x, y, radius * 2)
             st.session_state.label_tool_history.append(("confirm", frame_idx))
             st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             del st.session_state[pending_point_key]
