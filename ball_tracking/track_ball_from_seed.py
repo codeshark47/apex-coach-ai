@@ -52,11 +52,11 @@ def track_ball_from_seed(
     yolo_model,
     seed_size: float = None,
     max_frames_forward: int = 30,
-    search_radius_start: float = 50.0,
-    search_radius_growth: float = 20.0,
-    search_radius_cap: float = 150.0,
+    search_radius_start: float = 250.0,
+    search_radius_growth: float = 60.0,
+    search_radius_cap: float = 400.0,
     max_gap: int = 3,
-    conf_threshold: float = 0.15,
+    conf_threshold: float = 0.02,
     size_trend_tolerance: float = 0.6,
 ) -> dict:
     """
@@ -83,13 +83,35 @@ def track_ball_from_seed(
     real physics at a given fps/distance, unlike, say, an identity walk
     that might need to tolerate longer gaps.
 
+    DEFAULTS RAISED (2026-08-15, real validation against a long, dense
+    human-labeled sequence — VID_20260411_092805.mp4, 24 real ground-
+    truth points spanning a full delivery): the original defaults
+    (search_radius_start=50) came from reasoning about typical frame-to-
+    frame motion, not a measured one. Confirmed directly: the real ball
+    moved ~173px in the first 2 frames after this clip's seed — a fast
+    release, with no velocity estimate yet to compensate (velocity is
+    only learned AFTER the first successful detection), so the search
+    crop right after a seed needs real margin, not the smaller radius
+    that's fine once a trend is established. At the old defaults, this
+    real sequence failed after the seed alone; at these, it correctly
+    picked up frames 23 and 25 within ~5-8px of the true (interpolated)
+    position. Still an HONEST, PARTIAL result, not a fixed tracker: the
+    same real test lost the trail again after frame 25 of a 74-frame
+    flight — the search-radius bug was real and worth fixing, but it
+    was never the ONLY limitation; the underlying detector's own recall
+    across a full flight is the remaining, larger gap (see the project
+    memory on ball-tracking strategy for the current, honest state).
+
     conf_threshold: LOWER than label_tool.py's AI_PREFILL_CONF_THRESHOLD
     (0.5) deliberately — this only searches a small crop near a
     physically-plausible position, which already does most of the work
     a high confidence bar exists for elsewhere (rejecting far-away,
     unrelated objects). The size-trend check below is what allows this
     to stay low without accepting noise, rather than raising the bar
-    and losing real-but-uncertain detections instead.
+    and losing real-but-uncertain detections instead. Lowered further
+    (0.15->0.02) alongside the radius change above — the same real
+    sequence's genuine detections at frames 23/25 scored only 0.05-0.23,
+    below the old floor.
 
     size_trend_tolerance: fractional deviation from the expected
     (trend-extrapolated) size still accepted — e.g. 0.6 allows a
