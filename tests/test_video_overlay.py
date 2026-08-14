@@ -24,6 +24,7 @@ with distance instead of hitting the old floor's wall.
 """
 
 import pandas as pd
+import pytest
 
 import video_overlay as vo
 
@@ -272,3 +273,59 @@ class TestSelectActiveBadge:
     def test_no_badge_when_no_events_are_in_range(self):
         events = {"BFC": 10, "FFC": 20, "BR": 30}
         assert vo._select_active_badge(200, events, window=15) is None
+
+
+class TestPositionIsContinuous:
+    """Regression test for a real bug found from a coach-downloaded
+    annotated video (2026-08-14): at a follow-through frame (bowler
+    small and distant, walking back down the pitch), MediaPipe produced
+    a reasonably-proportioned, reasonably-sized pose reading — passing
+    both torso_shape_is_plausible and body_size_is_plausible — but
+    positioned next to a printed photo on a red boundary-wall banner,
+    nowhere near the real tracked bowler visible elsewhere in the same
+    actual frame. Neither existing check judges WHERE a pose is, only
+    whether its own proportions look human in isolation."""
+
+    def test_real_bug_scenario_a_coherent_pose_in_the_wrong_place_is_rejected(self):
+        """The exact failure shape: a normal-looking, normal-sized pose
+        that simply isn't where the bowler was a moment ago."""
+        last_trusted = (0.50, 0.45)  # bowler's torso centroid, previous trusted frame
+        wrong_place = (0.20, 0.45)   # same distance away, but off to the side (the banner)
+        torso_h = 0.03  # a small/distant figure's own torso height
+        assert vo.position_is_continuous(wrong_place, last_trusted, torso_h) is False
+
+    def test_normal_frame_to_frame_movement_is_accepted(self):
+        """A real bowler walking during follow-through moves some real
+        distance frame to frame — must not be mistaken for a jump."""
+        last_trusted = (0.50, 0.45)
+        small_real_move = (0.51, 0.46)
+        torso_h = 0.03
+        assert vo.position_is_continuous(small_real_move, last_trusted, torso_h) is True
+
+    def test_first_tracked_frame_has_nothing_to_compare_against(self):
+        """No prior trusted position yet — must default to plausible,
+        same 'don't become a new reason frames go missing' rule as the
+        other two plausibility checks."""
+        assert vo.position_is_continuous((0.5, 0.5), None, 0.03) is True
+
+    def test_unusable_torso_height_defaults_to_plausible(self):
+        assert vo.position_is_continuous((0.5, 0.5), (0.1, 0.1), 0.0) is True
+        assert vo.position_is_continuous((0.5, 0.5), (0.1, 0.1), None) is True
+
+
+class TestTorsoCentroid:
+    def test_averages_available_landmarks(self):
+        row = pd.Series({
+            "NOSE_x": 0.50, "NOSE_y": 0.20,
+            "LEFT_HIP_x": 0.48, "LEFT_HIP_y": 0.55,
+            "RIGHT_HIP_x": 0.52, "RIGHT_HIP_y": 0.55,
+        })
+        cx, cy = vo.torso_centroid(row)
+        assert cx == pytest.approx(0.5, abs=0.01)
+        assert cy == pytest.approx(0.433, abs=0.01)
+
+    def test_returns_none_when_nothing_is_available(self):
+        row = pd.Series({"NOSE_x": float("nan"), "NOSE_y": float("nan"),
+                          "LEFT_HIP_x": float("nan"), "LEFT_HIP_y": float("nan"),
+                          "RIGHT_HIP_x": float("nan"), "RIGHT_HIP_y": float("nan")})
+        assert vo.torso_centroid(row) is None

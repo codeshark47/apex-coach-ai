@@ -183,6 +183,61 @@ def body_size_is_plausible(body_height_px, min_height_px: float = 30.0) -> bool:
     return body_height_px >= min_height_px
 
 
+def torso_centroid(row):
+    """Average (x, y) of whichever of NOSE/LEFT_HIP/RIGHT_HIP are present
+    on this row, in the row's own units (normalized 0-1) — the shared
+    position reference for position_is_continuous below. Returns None
+    if none of the three are available."""
+    cols = ["NOSE", "LEFT_HIP", "RIGHT_HIP"]
+    xs, ys = [], []
+    for c in cols:
+        x, y = row.get(f"{c}_x"), row.get(f"{c}_y")
+        if x is not None and not pd.isna(x) and y is not None and not pd.isna(y):
+            xs.append(float(x))
+            ys.append(float(y))
+    if not xs:
+        return None
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def position_is_continuous(centroid, last_trusted_centroid, torso_h: float,
+                            max_jump_to_torso_ratio: float = 3.0) -> bool:
+    """
+    Sanity-checks ONE frame's overall body position against the last
+    frame the skeleton was actually trusted enough to draw — a THIRD,
+    different failure mode than torso_shape_is_plausible and
+    body_size_is_plausible above catch. Real bug found on a real coach-
+    downloaded clip (2026-08-14): at a follow-through frame (bowler
+    small and distant, walking back down the pitch after his delivery),
+    a MediaPipe reading landed on a reasonably-proportioned, reasonably-
+    sized pose — passing both checks above — but positioned next to a
+    printed photo on a red boundary-wall banner, nowhere near the real
+    tracked bowler visible elsewhere in the same actual frame. Neither
+    existing check judges WHERE a pose is, only whether its own internal
+    proportions look human on their own; this one does, using the one
+    thing a coherent-but-wrong detection can't fake: a real person can't
+    teleport between two adjacent real-time frames.
+
+    torso_h: THIS frame's own torso height, same units and denominator
+    as limb_segment_is_plausible's — the bound is relative to the
+    person's own on-screen size, not a fixed pixel/coordinate value,
+    since real frame-to-frame displacement during normal movement scales
+    with how big the person is on screen, not their absolute position.
+
+    Returns True (assume plausible) when there's no prior trusted
+    position yet to compare against (the very first tracked frame, or
+    after a long genuine gap) or torso_h/centroid is unusable — same
+    "don't become a new reason frames go missing" rule as the checks
+    above.
+    """
+    if last_trusted_centroid is None or centroid is None or not torso_h or torso_h <= 0:
+        return True
+    dx = centroid[0] - last_trusted_centroid[0]
+    dy = centroid[1] - last_trusted_centroid[1]
+    jump = (dx ** 2 + dy ** 2) ** 0.5
+    return jump <= max_jump_to_torso_ratio * torso_h
+
+
 def torso_shape_is_plausible(row, max_width_to_height_ratio: float = 1.8) -> bool:
     """
     Sanity-checks ONE frame's shoulder/hip landmarks before a skeleton is
@@ -854,6 +909,14 @@ def render_annotated_video(video_path: str, output_path: str,
     # so the badge doesn't flicker sides during a brief gap.
     last_known_bowler_x = None
 
+    # Last frame's torso centroid the skeleton was actually TRUSTED
+    # enough to draw (not just any tracked frame) — see
+    # position_is_continuous's docstring for the real bug this guards
+    # against. Only updated after a frame passes every plausibility gate
+    # below, so a suppressed frame's own (wrong) position can never
+    # poison the trend a later frame gets compared against.
+    last_trusted_centroid = None
+
     # Coach-confirmed wrist/ball position (from "Correct Release Point")
     # already fixes the Release Height NUMBER, but was never fed into the
     # drawn skeleton — the visual overlay kept showing the original
@@ -948,7 +1011,21 @@ def render_annotated_video(video_path: str, output_path: str,
             # both are specific tracking-failure signatures, not ordinary
             # noise) is an honest gap; drawing it anyway is a wrong-looking
             # graphic presented as real.
-            if torso_shape_is_plausible(row) and body_size_is_plausible(_frame_body_height_px):
+            #
+            # THIRD failure mode found later (2026-08-14): a reading that
+            # passes BOTH checks above (reasonable proportions, reasonable
+            # size) but is positioned nowhere near the real tracked
+            # bowler — see position_is_continuous's docstring for the
+            # real coach-reported case (a photo on a boundary-wall banner
+            # mistaken for the bowler during a small/distant follow-
+            # through moment). This is the only one of the three that
+            # needs a PRIOR frame to compare against, so it can't catch
+            # anything on the very first tracked frame — the other two
+            # still apply there.
+            _current_centroid = torso_centroid(row)
+            _current_torso_h_for_continuity = _torso_height(row)
+            if (torso_shape_is_plausible(row) and body_size_is_plausible(_frame_body_height_px)
+                    and position_is_continuous(_current_centroid, last_trusted_centroid, _current_torso_h_for_continuity)):
                 # PER-LIMB PLAUSIBILITY: separate from torso_shape_is_plausible
                 # above (which only judges shoulder/hip WIDTH). Verified on a
                 # real coach-downloaded rear-view clip: during a fast, motion-
@@ -1120,6 +1197,13 @@ def render_annotated_video(video_path: str, output_path: str,
                             cv2.circle(frame, (nx, ny), _core_r + node_extra, node_color, -1, cv2.LINE_AA)
                     except Exception:
                         continue
+
+                # Only reached when the skeleton actually drew — a
+                # suppressed frame's own centroid must never become the
+                # new "trusted" reference, or a genuine tracking failure
+                # could silently promote itself into the trend the NEXT
+                # frame gets checked against.
+                last_trusted_centroid = _current_centroid
 
         # Composited BEFORE the chart panel overwrites the bottom of the
         # frame, and anchored bottom-right of the VIDEO area specifically
