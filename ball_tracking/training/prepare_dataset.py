@@ -35,6 +35,29 @@ format for "this image has zero objects," which is what teaches the
 model these lookalikes are confirmed not-a-ball rather than merely
 unseen.
 
+TRAIN/INFERENCE CONSISTENCY (2026-08-15, real coach-driven finding):
+source videos here were read at whatever native format they happened to
+be in, while every live coach upload always gets forced through
+orchestrator.compress_video_file (resolution capped, re-encoded to
+H.264) before the app ever looks at it. Confirmed directly via ffprobe
+on two of the coach's own clips: a raw native .MOV capture (HEVC,
+1920x1080, ~8Mbps) and the SAME footage after WhatsApp's own
+compression (H.264, roughly a third the resolution, a third the
+bitrate) are measurably, drastically different files — independent of
+which physical phone captured either one. Training on the raw regime
+while every real inference happens on the compressed regime is a real
+train/inference mismatch, not a device problem — this is what actually
+explained a big chunk of the "iPhone clips score worse" pattern from
+the 2026-08-14 device-bucket analysis, corrected here. Every source
+video now gets run through the SAME compressor before frames are
+extracted for training, cached under _compressed_cache/ so repeated
+runs don't re-encode unchanged files. Label coordinates were captured
+in the ORIGINAL video's pixel space (label_tool.py reads frames at
+native resolution) — normalizing by the ORIGINAL frame's own width/
+height (not the compressed video's) keeps the resulting fraction
+correct regardless of resolution, since aspect ratio is preserved
+end to end.
+
 SPLIT: by CLIP, not by random frame. Frames within one clip share the
 same background/lighting, so a random-frame split would let the model
 "see" near-duplicate scenes in both train and val and look like it
@@ -63,8 +86,16 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import profile_store as store
+from orchestrator import compress_video_file
 
 VALID_LABELED_BY = "direct_click_v1"
+
+# Where normalized copies of source videos are cached — see the module
+# docstring's TRAIN/INFERENCE CONSISTENCY section. Keyed by filename;
+# reused across runs since a source video's own content never changes
+# once shot, so re-compressing it every single time this script runs
+# would just be wasted ffmpeg time.
+COMPRESSED_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_compressed_cache")
 
 # Set once a clip (ideally a different scene) has been labeled with the
 # new tool — see module docstring.
@@ -111,6 +142,30 @@ def _find_video(filename):
     return None
 
 
+def _normalized_video_path(original_path: str, filename: str) -> str:
+    """
+    Returns a path to a compressed, cached copy of original_path — see
+    the module docstring's TRAIN/INFERENCE CONSISTENCY section for why
+    training images must go through the SAME compressor real coach
+    uploads do. Reuses an existing cached copy rather than
+    re-compressing every run; only re-encodes if this exact source
+    video hasn't been normalized before.
+    """
+    os.makedirs(COMPRESSED_CACHE_DIR, exist_ok=True)
+    clip_slug = "".join(c if c.isalnum() else "_" for c in filename.rsplit(".", 1)[0])
+    cached_path = os.path.join(COMPRESSED_CACHE_DIR, f"{clip_slug}.mp4")
+    if not os.path.exists(cached_path):
+        print(f"  Compressing (first time only, cached for future runs): {filename}")
+        # max_fps=None: stored labels' frame_index values were captured
+        # against the ORIGINAL video's own frame numbering (label_tool.py
+        # reads native frame rate, no compression step). Resampling fps
+        # here would shift which frame lands at which index — confirmed a
+        # real risk, not theoretical: at least one currently-labeled clip
+        # (Rauf Khan.mp4) is a genuine ~120fps recording.
+        compress_video_file(original_path, cached_path, max_fps=None)
+    return cached_path
+
+
 def main():
     client = store.get_client()
 
@@ -143,9 +198,24 @@ def main():
             print(f"SKIP (video file not found): {filename}")
             continue
 
-        cap = cv2.VideoCapture(video_path)
-        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Label coordinates were captured against THIS (original) video's
+        # own pixel dimensions — label_tool.py reads frames at native
+        # resolution, before any compression. Must be probed BEFORE
+        # swapping to the normalized copy below, or the fraction math
+        # further down would silently use the wrong denominator.
+        orig_cap = cv2.VideoCapture(video_path)
+        orig_frame_w = int(orig_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_frame_h = int(orig_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        orig_cap.release()
+
+        # TRAIN/INFERENCE CONSISTENCY — see module docstring. The actual
+        # training IMAGES come from the compressed copy, matching what a
+        # live coach upload always looks like by the time the app (or
+        # this same pipeline's own labeling tool, at click time) sees
+        # it; only the LABEL fraction still needs the original's own
+        # dimensions (see above).
+        normalized_path = _normalized_video_path(video_path, filename)
+        cap = cv2.VideoCapture(normalized_path)
 
         rows_by_frame = {r["frame_index"]: r for r in rows}
         clip_slug = "".join(c if c.isalnum() else "_" for c in filename.rsplit(".", 1)[0])
@@ -173,10 +243,16 @@ def main():
                     if radius is not None:
                         x, y = row["ball_x_px"], row["ball_y_px"]
                         box_w, box_h = radius * 2, radius * 2
-                        x_center_n = x / frame_w
-                        y_center_n = y / frame_h
-                        w_n = box_w / frame_w
-                        h_n = box_h / frame_h
+                        # Normalized against the ORIGINAL video's own
+                        # dimensions (not the compressed copy cap read
+                        # from) — see the orig_frame_w/h comment above.
+                        # Aspect ratio is preserved end to end, so this
+                        # fraction stays correct regardless of the
+                        # training image's actual resolution.
+                        x_center_n = x / orig_frame_w
+                        y_center_n = y / orig_frame_h
+                        w_n = box_w / orig_frame_w
+                        h_n = box_h / orig_frame_h
 
                         img_name = f"{clip_slug}_{idx}.jpg"
                         cv2.imwrite(os.path.join(OUT_ROOT, "images", split, img_name), frame)

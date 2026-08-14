@@ -1576,7 +1576,6 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     pipeline — raises RuntimeError instead of silently proceeding with an
     even-more-demanding original (see the 2026-08-02 note below).
     """
-    import shutil
     import tempfile
 
     # BUG FOUND (2026-08-02, same iPhone 17 Pro Max incident as above): the
@@ -1608,68 +1607,98 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     with open(raw_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
+    try:
+        compress_video_file(raw_path, dest_path, max_width=max_width, max_height=max_height)
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+
+def compress_video_file(src_path: str, dest_path: str, max_width: int = 1920,
+                         max_height: int = 1080, max_fps: int = 60, timeout: int = 180) -> None:
+    """
+    Re-encodes src_path to dest_path via ffmpeg: downscaled to fit within
+    max_width x max_height (preserving aspect ratio, never upscaling a
+    smaller source), frame rate capped at max_fps, re-encoded to H.264.
+
+    EXTRACTED (2026-08-15) from save_uploaded_video_capped so the SAME
+    normalization applies to ball-tracking training data
+    (prepare_dataset.py), not just live coach uploads. Real, confirmed
+    finding: a raw native .MOV capture (HEVC, 1920x1080, ~8Mbps) and the
+    SAME footage after WhatsApp's own compression (H.264, a fraction of
+    that resolution/bitrate) are measurably, drastically different files
+    — verified directly via ffprobe on two of the coach's own clips, not
+    assumed. Training images were being extracted from whichever of
+    those two regimes a source file happened to already be in, while
+    every live upload always gets forced into the compressed one by
+    save_uploaded_video_capped — a real train/inference mismatch
+    independent of which physical phone captured either video. Training
+    and inference must see the same visual regime, or the model is
+    learning from one distribution and being scored on another.
+
+    max_fps: pass None to disable the frame-rate cap entirely instead of
+    just raising the number — needed by any caller where frame INDICES
+    in the output must stay aligned with indices computed against the
+    original (e.g. prepare_dataset.py's stored ball_tracking_labels
+    rows): resampling to a lower fps changes which frame ends up at
+    which index, not just how many frames exist, silently misaligning
+    a label with the wrong image. save_uploaded_video_capped (live
+    uploads) keeps the numeric default — nothing there depends on frame
+    numbering surviving compression, since the whole extraction pass
+    runs fresh, after compression, on the file this function produces.
+
+    Falls back to copying src_path unchanged if ffmpeg isn't on PATH at
+    all (a deployment issue, not a per-video one). Raises RuntimeError
+    if ffmpeg fails or times out on this specific file — see the
+    2026-08-02 real-incident comment history on save_uploaded_video_
+    capped for why silently falling back to the untouched original on a
+    per-file failure is the wrong default (it only delays the same
+    crash to a later, harder-to-diagnose step).
+    """
+    import shutil
+
     ffmpeg_bin = shutil.which("ffmpeg")
     if ffmpeg_bin is None:
         print(
-            "WARNING: ffmpeg not found on PATH. Uploaded video will be used at "
-            "its original resolution, which may be slow or memory-heavy for "
+            "WARNING: ffmpeg not found on PATH. Video will be used at its "
+            "original resolution, which may be slow or memory-heavy for "
             "large 4K+ recordings. Install ffmpeg and ensure it's on PATH to fix this."
         )
-        os.replace(raw_path, dest_path)
+        shutil.copy(src_path, dest_path)
         return
 
-    # FRAME-RATE CAP (2026-08-14, real bug the coach caught): this
-    # function has only ever capped RESOLUTION — nothing here touched
-    # frame rate. A native slow-mo recording captures far more frames
-    # per second of real time (120/240fps+) than a normal video, so
-    # "compressed" here still meant the SAME frame count handed to
-    # MediaPipe afterward, just resized. A 10-second clip at 240fps is
-    # 2400 frames to run pose detection on (and TWICE, when seeded —
-    # single-pass plus multi-pass) versus ~300 for a normal 30fps clip
-    # of the same length — a real, plausible memory/timeout crash on a
-    # constrained cloud server even for a file well under the 300MB
-    # cap above. Confirmed directly: the coach's own crashing clip was
-    # only ~100MB, comfortably under that cap, so size alone wasn't
-    # the mechanism. Re-compressing the SAME clip through WhatsApp
-    # "fixed" it — WhatsApp flattens to a standard playback frame rate
-    # as part of its own re-encode, not just resolution/bitrate, which
-    # is almost certainly the real reason that worked. Capping here
-    # reproduces that same effect deliberately instead of by accident.
-    # Only touches genuinely excessive frame rates — a normal 24-60fps
-    # recording (including the legitimate slow-mo-adjacent 60fps clips
-    # already verified working in this pipeline) passes through with
-    # no -r flag added at all, so this doesn't touch the common case.
-    MAX_OUTPUT_FPS = 60
-    probe_cap = cv2.VideoCapture(raw_path)
+    # FRAME-RATE CAP (2026-08-14, real bug the coach caught): a native
+    # slow-mo recording captures far more frames per second of real
+    # time (120/240fps+) than a normal video — "compressed" without
+    # this still meant the SAME frame count handed downstream, just
+    # resized. Re-compressing through WhatsApp "fixed" a real crash
+    # because WhatsApp flattens to a standard playback frame rate as
+    # part of its own re-encode, not just resolution/bitrate. Only
+    # touches genuinely excessive frame rates — normal 24-60fps passes
+    # through with no -r flag added, so this doesn't touch the common case.
+    probe_cap = cv2.VideoCapture(src_path)
     source_fps = probe_cap.get(cv2.CAP_PROP_FPS) or 0
     probe_cap.release()
 
     cmd = [
-        ffmpeg_bin, "-y", "-i", raw_path,
+        ffmpeg_bin, "-y", "-i", src_path,
         "-vf", f"scale={max_width}:{max_height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
         "-crf", "23", "-preset", "fast",
     ]
-    if source_fps > MAX_OUTPUT_FPS:
-        cmd += ["-r", str(MAX_OUTPUT_FPS)]
+    if max_fps is not None and source_fps > max_fps:
+        cmd += ["-r", str(max_fps)]
     cmd += ["-an", dest_path]
 
     # BUG FOUND (2026-08-02): an iPhone 17 Pro native recording crashed the
     # whole shared Streamlit Cloud process (server died outright — "Oh no",
     # no Python traceback in the logs, just silence — not something caught
-    # here). The fallback below used to treat ANY downscale failure the
-    # same as "ffmpeg isn't installed" and proceed with the untouched
-    # original file. That's backwards when ffmpeg fails or times out WHILE
-    # actively trying to decode this specific file: it means the source is
-    # too demanding for this decode step (resolution, bitrate, HDR/10-bit,
-    # framerate — newer phones keep raising this bar), and handing the
-    # even-more-demanding original to the rest of the pipeline (MediaPipe,
-    # OpenCV) just delays the same crash by a few steps, for every other
-    # coach sharing this same free-tier process. Only "ffmpeg missing from
-    # PATH entirely" (a deployment issue, not a per-video one) still falls
-    # back to the original — an actual failure/timeout on this file now
-    # raises a clear, catchable error instead, so Streamlit shows a normal
-    # red error box and the server survives instead of dying outright.
+    # here). Silently falling back to the untouched original on a decode
+    # failure just delays the same crash a few steps later, for every
+    # other coach sharing this same free-tier process — an actual
+    # failure/timeout on this file now raises a clear, catchable error
+    # instead, so Streamlit shows a normal red error box and the server
+    # survives instead of dying outright.
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
@@ -1678,10 +1707,9 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            startupinfo=startupinfo, timeout=180,
+            startupinfo=startupinfo, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        os.remove(raw_path)
         raise RuntimeError(
             "This video took too long to process (over 3 minutes) — it's likely "
             "too high-resolution or high-bitrate for this server. Try trimming the "
@@ -1690,7 +1718,6 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
         )
     except Exception as e:
         monitoring.capture(e)
-        os.remove(raw_path)
         raise RuntimeError(
             f"This video couldn't be processed due to an unexpected error ({e}). "
             "Try trimming the clip or recording at a standard (non-Pro/non-HDR) "
@@ -1699,14 +1726,12 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
 
     if result.returncode != 0 or not os.path.exists(dest_path):
         stderr_tail = result.stderr.decode(errors='ignore')[:300]
-        os.remove(raw_path)
         raise RuntimeError(
             "This video couldn't be processed — it may be too high-resolution, "
             "high-bitrate, or long for this server. Try trimming the clip or "
             "recording at a standard (non-Pro/non-HDR) quality setting, then "
             f"re-upload. (ffmpeg exit {result.returncode}: {stderr_tail})"
         )
-    os.remove(raw_path)
 
 
 def _find_ffmpeg() -> str:
