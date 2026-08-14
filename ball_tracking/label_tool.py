@@ -103,13 +103,19 @@ SAMPLE_EVERY_N_FRAMES = 3
 MAX_DISPLAY_WIDTH = 960
 DEFAULT_RADIUS_FRACTION = 0.02  # of frame width — first-frame starting guess only
 
-# Chosen from today's real evidence: genuine ball detections from this
-# model landed at 0.5-0.8 confidence; the false-positive noise it also
-# produces (a tree branch, a patch of grass) sat at 0.03-0.19. 0.35 sits
-# clearly above the noise band without being so strict it discards real
-# but less-certain detections — a starting point, not a tuned constant;
-# revisit once more of these pre-fills have been accepted/corrected.
-AI_PREFILL_CONF_THRESHOLD = 0.35
+# RAISED from 0.35 (2026-08-14, real coach report): that value was
+# calibrated against generic background noise (a tree branch, a patch of
+# grass) sitting at 0.03-0.19 confidence — comfortably below 0.35. But a
+# front-on clip surfaced a DIFFERENT, harder class of false positive the
+# original calibration never saw: round, ball-colored lookalikes (a
+# crease marking, an umpire's hat, a batter's thumb) score meaningfully
+# higher than generic noise precisely because they share real visual
+# similarity with a ball, not because the model is confused at random.
+# Raised to sit at the floor of this model's own documented genuine-
+# detection band (0.5-0.8, same real evidence as before) instead of
+# just above generic noise — trades fewer assisted frames for fewer
+# confidently-wrong ones. Still a starting point, not a final constant.
+AI_PREFILL_CONF_THRESHOLD = 0.5
 
 # HARD-NEGATIVE MINING (2026-08-04): real evaluation of ball_v1-6/v1-7
 # found the model's false positives cluster on specific lookalike

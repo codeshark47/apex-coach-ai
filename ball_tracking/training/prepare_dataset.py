@@ -68,7 +68,15 @@ VALID_LABELED_BY = "direct_click_v1"
 
 # Set once a clip (ideally a different scene) has been labeled with the
 # new tool — see module docstring.
-VAL_CLIPS = {"PXL_20260801_040327130.mp4"}
+#
+# ADDED IMG_3082.MOV (2026-08-14): the previous single-clip, 12-image
+# validation set was too small to trust a metric swing of even one
+# frame (each miss/hit moved recall by 8+ points) — v1-7's own log
+# metrics bounced around based on essentially a coin flip's worth of
+# samples. IMG_3082.MOV is a genuinely different device (iPhone .MOV vs
+# the Pixel PXL_ clip already here), giving 46 total val images instead
+# of 12 — same "different conditions" reasoning as the original pick.
+VAL_CLIPS = {"PXL_20260801_040327130.mp4", "IMG_3082.MOV"}
 
 SEARCH_DIRS = [
     "C:/Users/Shoaib/Downloads",
