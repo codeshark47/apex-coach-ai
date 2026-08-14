@@ -831,3 +831,81 @@ class TestSaveUploadedVideoCapped:
             o.save_uploaded_video_capped(fake_file, dest)
 
         assert not os.path.exists(dest)
+
+    @staticmethod
+    def _mock_source_fps(monkeypatch, fps):
+        """cv2.VideoCapture is used here just to read the raw upload's own
+        fps before deciding whether to cap it — stub it so the test
+        controls that reading without needing a real video file."""
+        import cv2 as _cv2
+
+        class _FakeCapture:
+            def get(self, prop):
+                return fps
+            def release(self):
+                pass
+
+        monkeypatch.setattr(_cv2, "VideoCapture", lambda path: _FakeCapture())
+
+    def test_caps_frame_rate_for_a_genuine_slow_mo_recording(self, tmp_path, monkeypatch):
+        """Regression test for a real bug the coach reported: a native
+        slow-mo recording (100MB, comfortably under the size cap) crashed
+        the app, while the SAME clip re-compressed through WhatsApp first
+        worked fine. Traced directly: this function only ever capped
+        RESOLUTION — a slow-mo capture at 120-240fps+ still handed the
+        SAME frame count to MediaPipe afterward (just resized), several
+        times the frames of a normal video of the same real-world
+        duration. WhatsApp's own re-encode happens to flatten frame rate
+        too, not just resolution, which is almost certainly the real
+        reason that "fixed" it. The ffmpeg command must now include an
+        explicit -r cap when the source exceeds it."""
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/ffmpeg")
+        self._mock_source_fps(monkeypatch, 240.0)
+
+        captured_cmd = []
+
+        def _fake_run(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            with open(cmd[-1], "wb") as f:
+                f.write(b"fake encoded output")
+            class _Result:
+                returncode = 0
+                stderr = b""
+            return _Result()
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        fake_file = _FakeUploadedFile("slowmo.mp4", b"pretend this is a 240fps slow-mo recording")
+        dest = str(tmp_path / "saved.mp4")
+        o.save_uploaded_video_capped(fake_file, dest)
+
+        assert "-r" in captured_cmd
+        assert captured_cmd[captured_cmd.index("-r") + 1] == "60"
+
+    def test_does_not_cap_frame_rate_for_a_normal_recording(self, tmp_path, monkeypatch):
+        """A normal 30fps recording must pass through with no -r flag at
+        all — this cap exists for genuine slow-mo, not the common case,
+        and an unnecessary -r flag risks its own re-encode artifacts."""
+        import shutil as _shutil
+        monkeypatch.setattr(_shutil, "which", lambda name: "/usr/bin/ffmpeg")
+        self._mock_source_fps(monkeypatch, 30.0)
+
+        captured_cmd = []
+
+        def _fake_run(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            with open(cmd[-1], "wb") as f:
+                f.write(b"fake encoded output")
+            class _Result:
+                returncode = 0
+                stderr = b""
+            return _Result()
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        fake_file = _FakeUploadedFile("normal.mp4", b"pretend this is a normal 30fps recording")
+        dest = str(tmp_path / "saved.mp4")
+        o.save_uploaded_video_capped(fake_file, dest)
+
+        assert "-r" not in captured_cmd

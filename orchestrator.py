@@ -1618,13 +1618,41 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
         os.replace(raw_path, dest_path)
         return
 
+    # FRAME-RATE CAP (2026-08-14, real bug the coach caught): this
+    # function has only ever capped RESOLUTION — nothing here touched
+    # frame rate. A native slow-mo recording captures far more frames
+    # per second of real time (120/240fps+) than a normal video, so
+    # "compressed" here still meant the SAME frame count handed to
+    # MediaPipe afterward, just resized. A 10-second clip at 240fps is
+    # 2400 frames to run pose detection on (and TWICE, when seeded —
+    # single-pass plus multi-pass) versus ~300 for a normal 30fps clip
+    # of the same length — a real, plausible memory/timeout crash on a
+    # constrained cloud server even for a file well under the 300MB
+    # cap above. Confirmed directly: the coach's own crashing clip was
+    # only ~100MB, comfortably under that cap, so size alone wasn't
+    # the mechanism. Re-compressing the SAME clip through WhatsApp
+    # "fixed" it — WhatsApp flattens to a standard playback frame rate
+    # as part of its own re-encode, not just resolution/bitrate, which
+    # is almost certainly the real reason that worked. Capping here
+    # reproduces that same effect deliberately instead of by accident.
+    # Only touches genuinely excessive frame rates — a normal 24-60fps
+    # recording (including the legitimate slow-mo-adjacent 60fps clips
+    # already verified working in this pipeline) passes through with
+    # no -r flag added at all, so this doesn't touch the common case.
+    MAX_OUTPUT_FPS = 60
+    probe_cap = cv2.VideoCapture(raw_path)
+    source_fps = probe_cap.get(cv2.CAP_PROP_FPS) or 0
+    probe_cap.release()
+
     cmd = [
         ffmpeg_bin, "-y", "-i", raw_path,
         "-vf", f"scale={max_width}:{max_height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
         "-vcodec", "libx264", "-pix_fmt", "yuv420p",
         "-crf", "23", "-preset", "fast",
-        "-an", dest_path,
     ]
+    if source_fps > MAX_OUTPUT_FPS:
+        cmd += ["-r", str(MAX_OUTPUT_FPS)]
+    cmd += ["-an", dest_path]
 
     # BUG FOUND (2026-08-02): an iPhone 17 Pro native recording crashed the
     # whole shared Streamlit Cloud process (server died outright — "Oh no",
