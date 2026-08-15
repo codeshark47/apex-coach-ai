@@ -1186,6 +1186,28 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
             return
 
         metrics = result_payload["biomechanical_metrics"]
+
+        # --- TRACKING QUALITY GUARD (2026-08-15) --- same principle as
+        # bowling's own guard: if tracking degraded badly enough to lose
+        # several metrics, the ones that "succeeded" numerically came from
+        # the same degraded landmark stream and aren't trustworthy either.
+        # front_foot_alignment reading "Not Applicable For This Shot" is a
+        # deliberate design choice (see batting_kinematics.NOT_APPLICABLE_
+        # SHOTS), not a tracking failure — excluded here the same way
+        # coaching_agent.py's own narrative gate already excludes it.
+        _batting_quality = dq.assess_quality(
+            metrics, metric_keys=mr.all_batting_metric_keys(),
+            value_extractor=mr.extract_batting_metric_value,
+            threshold=dq.BATTING_LOW_CONFIDENCE_THRESHOLD,
+        )
+        _foot_tier = metrics.get("front_foot_alignment", {}).get("tier")
+        if _foot_tier == "Not Applicable For This Shot" and "batting_front_foot_alignment" in _batting_quality["missing_metrics"]:
+            _batting_quality["missing_metrics"].remove("batting_front_foot_alignment")
+            _batting_quality["missing_count"] -= 1
+            _batting_quality["confidence"] = (
+                "low" if _batting_quality["missing_count"] >= dq.BATTING_LOW_CONFIDENCE_THRESHOLD else "high"
+            )
+
         hand_val = metrics.get("batting_hand_detected", "Unknown")
         _angle_label = {"side_on": "Side-on", "front_or_rear": "Front-on / Rear-on",
                          "uncertain": "Uncertain", "unavailable": "Unavailable"}.get(
@@ -1215,6 +1237,18 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
       </div>
     </div>
     """)
+
+        if _batting_quality["confidence"] == "low":
+            _missing_labels = [mr.RANGES[k].label for k in _batting_quality["missing_metrics"]]
+            st.error(
+                f"⚠️ Low tracking confidence on this clip — "
+                f"{_batting_quality['missing_count']} of 7 metrics failed to compute "
+                f"({', '.join(_missing_labels)}). This usually means motion blur, "
+                f"occlusion, or the batter leaving frame during this shot. Any "
+                f"remaining numeric values below came from the same degraded "
+                f"tracking and should not be trusted — **we recommend re-shooting "
+                f"this shot** rather than acting on these results."
+            )
 
         falling_over = result_payload.get("falling_over_risk", {})
         _fo_status = falling_over.get("status")

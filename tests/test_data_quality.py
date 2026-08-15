@@ -90,3 +90,77 @@ class TestAssessQuality:
         result = dq.assess_quality({})
         assert result["missing_count"] == len(mr.all_metric_keys())
         assert result["confidence"] == "low"
+
+
+def _all_batting_metrics_present():
+    """A batting metrics dict where all 7 metrics genuinely computed."""
+    return {
+        "head_movement": {"value": 0.01, "status": "success"},
+        "front_foot_alignment": {"deviation_degrees": 5.0, "tier": "Optimal", "status": "success"},
+        "weight_transfer": {"percent": 80.0, "status": "success"},
+        "downswing_plane": {"degrees": 10.0, "status": "success"},
+        "top_elbow_angle": {"degrees": 100.0, "status": "success"},
+        "front_knee_flexion": {"degrees": 150.0, "status": "success"},
+        "xfactor_separation": {"degrees": 30.0, "status": "success"},
+    }
+
+
+class TestAssessQualityForBatting:
+    """assess_quality() gained metric_keys/value_extractor/threshold
+    parameters (2026-08-15) specifically so this same guard could run for
+    batting's 7 metrics too — added after finding batting shipped
+    2026-08-03 with NO equivalent of bowling's low-confidence banner at
+    all. These tests use the real batting key set/extractor/threshold the
+    app actually wires in, not a synthetic stand-in, so a mismatch there
+    would be caught here."""
+
+    def _assess(self, metrics):
+        return dq.assess_quality(
+            metrics, metric_keys=mr.all_batting_metric_keys(),
+            value_extractor=mr.extract_batting_metric_value,
+            threshold=dq.BATTING_LOW_CONFIDENCE_THRESHOLD,
+        )
+
+    def test_all_seven_present_is_high_confidence(self):
+        result = self._assess(_all_batting_metrics_present())
+        assert result["confidence"] == "high"
+        assert result["missing_count"] == 0
+
+    def test_three_missing_stays_high_confidence(self):
+        """BATTING_LOW_CONFIDENCE_THRESHOLD is 4 — exactly 3 missing must
+        NOT trip low confidence (boundary test, one below threshold)."""
+        metrics = _all_batting_metrics_present()
+        metrics["head_movement"]["value"] = None
+        metrics["weight_transfer"]["percent"] = None
+        metrics["downswing_plane"]["degrees"] = None
+        result = self._assess(metrics)
+        assert result["missing_count"] == 3
+        assert result["confidence"] == "high"
+
+    def test_four_missing_is_low_confidence(self):
+        metrics = _all_batting_metrics_present()
+        metrics["head_movement"]["value"] = None
+        metrics["weight_transfer"]["percent"] = None
+        metrics["downswing_plane"]["degrees"] = None
+        metrics["top_elbow_angle"]["degrees"] = None
+        result = self._assess(metrics)
+        assert result["missing_count"] == 4
+        assert result["confidence"] == "low"
+        assert "batting_head_movement" in result["missing_metrics"]
+
+    def test_genuine_zero_head_movement_is_not_missing(self):
+        """Same real-bug guard as bowling's equivalent test: a REAL 0.0
+        head-movement reading must not be confused with a None failure."""
+        metrics = _all_batting_metrics_present()
+        metrics["head_movement"]["value"] = 0.0
+        result = self._assess(metrics)
+        assert "batting_head_movement" not in result["missing_metrics"]
+        assert result["confidence"] == "high"
+
+    def test_bowling_default_call_is_unaffected_by_batting_params(self):
+        """The new parameters must be fully backward-compatible — an
+        existing bowling call site with no arguments should behave
+        identically to before this change."""
+        result = dq.assess_quality(_all_metrics_present())
+        assert result["confidence"] == "high"
+        assert result["missing_count"] == 0
