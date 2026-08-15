@@ -28,14 +28,15 @@ st.divider()
 st.markdown("""
 <div class="story-card">
 
-Apex Coach AI is a biomechanical analysis tool for cricket fast bowling. It turns a
-bowling video into measurable, trackable data — so coaching feedback can be grounded
-in real numbers, not just the naked eye.
+Apex Coach AI is a biomechanical analysis platform for cricket, covering both fast
+bowling and batting technique. It turns a single phone video into measurable,
+trackable data — so coaching feedback can be grounded in real numbers, not just the
+naked eye.
 
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("### How It Actually Works")
+st.markdown("### How Bowling Analysis Works")
 
 steps = [
     ("Pose extraction", "Every frame of the uploaded video is processed with MediaPipe's "
@@ -68,14 +69,52 @@ for i, (title, desc) in enumerate(steps, start=1):
     </div>
     """, unsafe_allow_html=True)
 
+st.markdown("### How Batting Analysis Works")
+
+batting_steps = [
+    ("Any filming angle", "Side-on or front-on/rear-on — the camera angle is auto-detected "
+     "from the footage itself, so a coach filming in the nets isn't locked into one position."),
+    ("Seven core batting metrics", "Head movement, front-foot alignment, weight transfer, "
+     "downswing plane, top-elbow control, front-knee flexion, and X-factor separation — "
+     "calculated from the same pose-tracking engine as bowling analysis."),
+    ("Shot-relative foot alignment", "Front-foot direction is scored against the actual shot "
+     "played — a cover drive and a straight drive have different correct foot positions, and "
+     "the system knows the difference."),
+    ("Falling-over alert", "A dedicated check flags when a batter's head and front foot are "
+     "both drifting toward the danger side of the delivery line — a named, recognizable "
+     "coaching fault, not just two numbers in isolation."),
+    ("Same coaching engine", "An AI-generated technical assessment and prescribed drills, "
+     "built on the same classification system and the same honesty standard as bowling "
+     "analysis."),
+]
+
+for i, (title, desc) in enumerate(batting_steps, start=1):
+    st.markdown(f"""
+    <div class="story-card">
+    <span class="step-num">{i}</span><b>{title}</b><br>
+    <span style="margin-left:36px; display:inline-block; margin-top:6px;">{desc}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.markdown("""
+<div class="story-card">
+
+### Coming Soon: Ball Tracking & Pitch Map
+
+We're actively building automated ball tracking — a real trajectory overlay and pitch
+map, captured straight from match or nets footage. Watch this space.
+
+</div>
+""", unsafe_allow_html=True)
+
 st.markdown("""
 <div class="story-card">
 
 ### What It's For
 
-Apex Coach AI is built for coaches, academies, and bowlers who want a repeatable,
-data-backed way to look at technique — as a complement to expert coaching judgment,
-not a replacement for it.
+Apex Coach AI is built for coaches, academies, and players — bowlers and batters alike
+— who want a repeatable, data-backed way to look at technique — as a complement to
+expert coaching judgment, not a replacement for it.
 
 </div>
 """, unsafe_allow_html=True)
