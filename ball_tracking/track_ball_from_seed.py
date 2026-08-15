@@ -41,6 +41,8 @@ most motion-blurred moment), independent of this tracker's own logic.
 Re-validate this same way every time the underlying model changes.
 """
 
+import math
+
 import cv2
 import numpy as np
 
@@ -134,7 +136,27 @@ def track_ball_from_seed(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     points = [(seed_frame, float(seed_xy[0]), float(seed_xy[1]), 1.0, seed_size)]
-    last_xy = (float(seed_xy[0]), float(seed_xy[1]))
+    # ANCHOR + PER-FRAME VELOCITY (2026-08-15, two real bugs found by
+    # tracing an exact failure on the full-trajectory benchmark): anchor_xy/
+    # anchor_frame are the position/frame of the LAST REAL detection (never
+    # a coasted guess), and velocity is always a true per-frame rate.
+    #
+    # BUG 1 — velocity wasn't scaled by elapsed frames: the old code did
+    # `velocity = (fx - last_xy[0], fy - last_xy[1])` where last_xy could
+    # be several frames stale (after a multi-frame gap), so a real 3-frame
+    # displacement got used AS a 1-frame velocity — a 3x overshoot fed
+    # straight into the next frame's prediction. Traced directly on real
+    # ground truth: after a gap from frame 20 to 23, this alone was enough
+    # to send the next frame's search crop centered on the wrong spot.
+    #
+    # BUG 2 — coasting mutated the anchor itself: the old `last_xy = last_xy
+    # + velocity` on every miss meant a run of misses compounded prediction
+    # error into the position used to compute the NEXT real velocity too,
+    # not just that frame's search center. Fixed by always predicting from
+    # the fixed anchor + velocity * elapsed, never from a walked/mutated
+    # running position — one clean extrapolation, not N accumulated ones.
+    anchor_xy = (float(seed_xy[0]), float(seed_xy[1]))
+    anchor_frame = seed_frame
     velocity = (0.0, 0.0)  # (dx, dy) per frame, updated once 2+ points are confirmed
     last_size = seed_size
     size_velocity = None  # per-frame size delta once 2+ real size samples exist
@@ -148,8 +170,9 @@ def track_ball_from_seed(
         if not ok:
             break
 
-        pred_x = last_xy[0] + velocity[0]
-        pred_y = last_xy[1] + velocity[1]
+        elapsed = frame_idx - anchor_frame
+        pred_x = anchor_xy[0] + velocity[0] * elapsed
+        pred_y = anchor_xy[1] + velocity[1] * elapsed
         # BUG FOUND (2026-08-14, real validation against ground truth): a
         # trend-extrapolated expected_size requires size_velocity, which
         # doesn't exist until the SECOND real detection — meaning the
@@ -188,19 +211,41 @@ def track_ball_from_seed(
                     deviation = abs(cand_size - expected_size) / expected_size
                     if deviation > size_trend_tolerance:
                         continue  # fails the physical size-trend check — not the ball
-                candidates.append((x1 + (bx1 + bx2) / 2, y1 + (by1 + by2) / 2, cand_conf, cand_size))
+                cand_x = x1 + (bx1 + bx2) / 2
+                cand_y = y1 + (by1 + by2) / 2
+                candidates.append((cand_x, cand_y, cand_conf, cand_size))
             if candidates:
-                # Among candidates that passed the size-trend gate (or all
-                # of them, if no trend exists yet to check against), the
-                # most CONFIDENT one is still the best available signal.
-                found = max(candidates, key=lambda c: c[2])
+                # DISTANCE-WEIGHTED SELECTION (2026-08-15, real bug found by
+                # tracing frame 28 of the benchmark): the physics prediction
+                # was actually close to the true ball there, but the OLD
+                # code picked whichever candidate had the highest raw
+                # confidence, full stop — so a higher-confidence false
+                # positive 195px away won over the real ball sitting near
+                # the prediction. A real ball's position is constrained by
+                # physical continuity; a false positive's isn't, so
+                # proximity to the prediction is itself real evidence, not
+                # just a tiebreaker. combined_score multiplies confidence by
+                # a proximity factor (1.0 at the predicted point, falling to
+                # a 0.05 floor at the edge of the search radius and beyond)
+                # so spatial continuity can outweigh a raw confidence edge,
+                # without letting one lucky-but-wrong high-confidence pixel
+                # blob win just because nothing else fired as strongly.
+                def _combined_score(c):
+                    cx, cy, cconf, _ = c
+                    dist = math.hypot(cx - pred_x, cy - pred_y)
+                    proximity = max(0.05, 1.0 - dist / radius)
+                    return cconf * proximity
+
+                found = max(candidates, key=_combined_score)
 
         if found is not None:
             fx, fy, fconf, fsize = found
-            velocity = (fx - last_xy[0], fy - last_xy[1])
+            elapsed_at_hit = frame_idx - anchor_frame
+            velocity = ((fx - anchor_xy[0]) / elapsed_at_hit, (fy - anchor_xy[1]) / elapsed_at_hit)
             if last_size is not None:
                 size_velocity = fsize - last_size
-            last_xy = (fx, fy)
+            anchor_xy = (fx, fy)
+            anchor_frame = frame_idx
             last_size = fsize
             points.append((frame_idx, fx, fy, fconf, fsize))
             gap = 0
@@ -210,11 +255,9 @@ def track_ball_from_seed(
             radius = min(search_radius_cap, radius + search_radius_growth)
             if gap > max_gap:
                 break
-            # Coast forward on the last known velocity while within the
-            # gap tolerance, so a brief miss doesn't reset the predicted
-            # position back to a stale point — same idea as main.py's
-            # identity walk carrying its anchor through a short gap.
-            last_xy = (last_xy[0] + velocity[0], last_xy[1] + velocity[1])
+            # No coasting mutation needed — next iteration's pred_x/pred_y
+            # already extrapolate from the fixed anchor over the growing
+            # elapsed count, see above.
             if last_size is not None and size_velocity is not None:
                 last_size = last_size + size_velocity
 
