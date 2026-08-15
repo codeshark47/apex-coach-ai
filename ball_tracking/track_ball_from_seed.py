@@ -205,8 +205,23 @@ def track_ball_from_seed(
             # trusting it further just searches deeper into the wrong
             # area. Re-anchor on the last CONFIRMED real position instead
             # of a compounding guess about where the ball's gone.
+            #
+            # RADIUS ALSO GROWS PROGRESSIVELY IN RECOVERY (2026-08-15, real
+            # regression found immediately after adding the outlier-reject
+            # filter above): jumping straight to the full recovery_radius
+            # the moment recovery mode starts let a confident false
+            # positive 393px from the last real position win on just the
+            # THIRD frame since that anchor — physically implausible for
+            # this clip's real per-frame speed even accounting for a
+            # bounce (a bounce changes direction, it doesn't teleport the
+            # ball). `radius` already grows on every miss regardless of
+            # mode; reusing it here (capped at recovery_radius) means early
+            # recovery attempts stay appropriately tight and only widen
+            # toward the full recovery radius the longer the ball stays
+            # lost — same principle as the outlier-reject filter, just
+            # applied to recovery mode's own search too.
             pred_x, pred_y = anchor_xy
-            current_radius = recovery_radius
+            current_radius = min(recovery_radius, radius)
         else:
             elapsed = frame_idx - anchor_frame
             pred_x = anchor_xy[0] + velocity[0] * elapsed
@@ -252,6 +267,35 @@ def track_ball_from_seed(
                         continue  # fails the physical size-trend check — not the ball
                 cand_x = x1 + (bx1 + bx2) / 2
                 cand_y = y1 + (by1 + by2) / 2
+                # HARD DISTANCE OUTLIER REJECT (2026-08-15, real gap found
+                # tracing frame 28 on the benchmark, Gemini-prompted): the
+                # distance-weighted scoring below only helps when there's
+                # an ALTERNATIVE candidate to prefer over a far-off one —
+                # frame 28 had exactly ONE candidate in the whole crop
+                # (356px from the prediction, near a corner of the search
+                # square), so max() over a single-element list picked it
+                # regardless of how implausible the distance was. A candidate
+                # outside the search radius's own INSCRIBED CIRCLE (square
+                # crop corners are up to radius*sqrt(2) away, but the crop
+                # was only ever meant to mean "within radius px") is
+                # rejected outright here, not just down-weighted — never
+                # accepted as a real detection even with nothing else to
+                # compare it to. NOT a fixed pixel constant (Gemini's first
+                # draft proposed 30px) — that would have broken the
+                # already-validated 173px real jump documented above right
+                # after the seed; scaling with current_radius (which
+                # already reflects how much uncertainty this frame has) is
+                # what makes this work at every stage of the walk, in
+                # recovery mode too now that its own radius also grows
+                # progressively instead of jumping straight to the max
+                # (see the recovery-mode radius comment above — without
+                # this, a confident false positive 393px from the last
+                # real position won on the third frame of a real recovery
+                # attempt, physically implausible for this clip's actual
+                # per-frame speed).
+                dist_from_pred = math.hypot(cand_x - pred_x, cand_y - pred_y)
+                if dist_from_pred > current_radius:
+                    continue
                 candidates.append((cand_x, cand_y, cand_conf, cand_size))
             if candidates:
                 # DISTANCE-WEIGHTED SELECTION (2026-08-15, real bug found by
