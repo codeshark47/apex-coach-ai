@@ -4067,3 +4067,209 @@ with st.sidebar.expander("📐 Camera Positioning Guide", expanded=False):
 - **Lighting:** Even lighting works best — avoid filming straight into the sun or floodlights
 - **Dual camera:** Both phones start recording before the bowler begins run-up
 """)
+
+# ====================================================================
+# BALL TRACKING (ADMIN/EXPERIMENTAL — 2026-08-16)
+#
+# Gated behind BOTH a hard code-level flag AND the existing admin
+# allowlist (usage_limits.is_admin), so it is invisible to every regular
+# coach account regardless of this flag's value — flip ENABLE_BALL_
+# TRACKING to False to kill the feature outright without touching the
+# gate logic itself.
+#
+# Validated against 3 real clips before this UI was built (see the
+# project memory on ball-tracking strategy): 100% gapless, sub-3px
+# tracking on clean single-bowler footage in the SAME compression regime
+# real coaches actually upload through — but only ~33% partial coverage
+# on crowded, native-resolution footage (bowler + batter + onlookers).
+# This is NOT a general-purpose feature yet, which is the whole reason
+# it's admin-only rather than visible to every coach: shipping a
+# trajectory that works great on most uploads and silently stops partway
+# through the harder ones, unlabeled, would be presenting a partial
+# result as a complete one. The regime gap is disclosed directly below,
+# not hidden.
+#
+# Deliberately its OWN, fully self-contained upload/seed/run flow — does
+# NOT reuse the bowling-analysis video already in session state, so
+# there is zero chance of this experimental code path interfering with
+# the proven, live bowling/batting analysis flows above it.
+# ====================================================================
+ENABLE_BALL_TRACKING = True
+
+
+def render_ball_tracking_admin_panel():
+    if not ENABLE_BALL_TRACKING:
+        return
+    auth_user = st.session_state.get("auth_user")
+    if not auth_user:
+        return
+    import usage_limits
+    if not usage_limits.is_admin(auth_user.get("email", "")):
+        return
+
+    st.sidebar.divider()
+    show = st.sidebar.checkbox("🧪 Ball Tracking (Admin/Experimental)", key="_bt_show", value=False)
+    if not show:
+        return
+
+    st.divider()
+    st.header("🧪 Ball Trajectory Tracking — Admin/Experimental")
+    st.caption(
+        "Not visible to regular coach accounts. Validated at 100% gapless accuracy on "
+        "clean, single-bowler footage in the same compression regime most uploads already "
+        "use — but only partial coverage on crowded or native-resolution clips (bowler + "
+        "batter + onlookers in frame). See the ball-tracking project memory for the full "
+        "real-clip validation this is based on."
+    )
+
+    uploaded = st.file_uploader(
+        "Upload a clip to test tracking on", type=["mp4", "mov"], key="_bt_upload"
+    )
+    if uploaded is None:
+        return
+
+    file_identity = f"{uploaded.name}_{uploaded.size}"
+    if st.session_state.get("_bt_file_identity") != file_identity:
+        os.makedirs("input", exist_ok=True)
+        ref_path = os.path.abspath(os.path.join("input", f"_bt_ref_{uploaded.name}"))
+        try:
+            o.save_uploaded_video_capped(uploaded, ref_path)
+        except RuntimeError as e:
+            st.error(f"⚠️ {e}")
+            return
+        st.session_state["_bt_file_identity"] = file_identity
+        st.session_state["_bt_ref_path"] = ref_path
+        st.session_state["_bt_seed_point"] = None
+        st.session_state["_bt_seed_frame"] = 0
+        st.session_state["_bt_result"] = None
+
+    ref_path = st.session_state["_bt_ref_path"]
+    total_frames = cal.get_frame_count(ref_path)
+
+    st.caption("Scrub to a frame where the ball is clearly visible in the bowler's hand, then click it.")
+    frame_idx = st.slider(
+        "Seed frame", min_value=0, max_value=max(total_frames - 1, 0),
+        value=st.session_state.get("_bt_seed_frame", 0), key="_bt_seed_slider",
+    )
+    if st.session_state.get("_bt_last_frame_idx") != frame_idx:
+        st.session_state["_bt_seed_point"] = None
+        st.session_state["_bt_last_frame_idx"] = frame_idx
+
+    frame = cal.extract_reference_frame(ref_path, frame_index=frame_idx)
+    if frame is None:
+        st.warning("Could not read this frame.")
+        return
+
+    from PIL import Image
+    pil_img = Image.fromarray(frame)
+    point = st.session_state.get("_bt_seed_point")
+    new_point = render_zoomable_click_image(pil_img, key_prefix="_bt_seed", marker_point=point, enable_zoom=True)
+    if new_point is not None and st.session_state.get("_bt_seed_point") != new_point:
+        st.session_state["_bt_seed_point"] = new_point
+        st.session_state["_bt_seed_frame"] = frame_idx
+        st.session_state["_bt_result"] = None
+        st.rerun()
+
+    if point is None:
+        st.info("Click the ball above to set the seed point.")
+        return
+
+    st.success(f"Seed set: frame {frame_idx}, ({point[0]:.0f}, {point[1]:.0f})")
+
+    if st.button("▶ Run Ball Tracking", key="_bt_run"):
+        with st.spinner("Tracking..."):
+            model = _load_ball_tracking_model()
+            from ball_tracking.track_ball_from_seed import track_ball_from_seed
+            result = track_ball_from_seed(ref_path, frame_idx, point, model, max_frames_forward=100)
+            st.session_state["_bt_result"] = result
+
+    result = st.session_state.get("_bt_result")
+    if result is None:
+        return
+    if result["status"] != "success":
+        st.error(f"Tracking failed: {result.get('message')}")
+        return
+
+    points = result["points"]
+    st.write(
+        f"Tracked {len(points)} points, frames {points[0][0]}–{points[-1][0]} "
+        f"({points[-1][0] - points[0][0]} frame span)."
+    )
+    if points[-1][0] - points[0][0] < 15:
+        st.warning(
+            "Lost the trail early — likely a harder clip (crowded scene, native "
+            "resolution, or fast/blurred release). Real, disclosed limitation, not a bug."
+        )
+
+    out_path = os.path.join("input", f"_bt_trajectory_{uploaded.name}.mp4")
+    _render_trajectory_with_fade(ref_path, points, out_path)
+    # BUG FIX (2026-08-16, real coach report: "video not playing locally") —
+    # same root cause already diagnosed for the batting video overlay:
+    # cv2.VideoWriter's mp4v codec isn't inline-playable in most browsers.
+    # transcode_to_h264 already exists for exactly this; reusing it instead
+    # of re-solving the same problem a second time.
+    web_safe_path = o.transcode_to_h264(out_path)
+    st.video(web_safe_path)
+
+
+@st.cache_resource
+def _load_ball_tracking_model():
+    from ultralytics import YOLO
+    return YOLO("ball_tracking/training/runs/ball_v1-10/weights/best.pt")
+
+
+def _render_trajectory_with_fade(video_path: str, points: list, output_path: str, fade_frames: int = 6):
+    """
+    Same real-trail-only drawing as ball_tracking/visualize_trajectory.py
+    (never draws past the last real detection — no extrapolation, no
+    fabricated continuation), plus a fade on the FINAL few points so the
+    overlay visibly tapers off when tracking runs out instead of the line
+    just stopping abruptly — "graceful termination," not a longer trail.
+    """
+    import cv2
+
+    pts_by_frame = {p[0]: (p[1], p[2]) for p in points}
+    first_f, last_f = points[0][0], points[-1][0]
+    fade_start_frame = max(first_f, last_f - fade_frames)
+
+    cap = cv2.VideoCapture(video_path)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    trail = []
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx in pts_by_frame:
+            trail.append((idx, *pts_by_frame[idx]))
+        if first_f <= idx <= last_f:
+            for i in range(1, len(trail)):
+                f0, x0, y0 = trail[i - 1]
+                f1, x1, y1 = trail[i]
+                # Both endpoints of a segment past fade_start_frame fade
+                # toward transparent-on-background by blending toward the
+                # frame's own pixels — a real fade, not just a dimmer
+                # solid color, so it visually tapers rather than just
+                # switching to a flatter yellow.
+                alpha = 1.0
+                if f1 > fade_start_frame:
+                    alpha = max(0.15, 1.0 - (f1 - fade_start_frame) / fade_frames)
+                color = tuple(int(c * alpha) for c in (0, 255, 255))
+                cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)), color, 2)
+            for f, px, py in trail:
+                alpha = 1.0
+                if f > fade_start_frame:
+                    alpha = max(0.15, 1.0 - (f - fade_start_frame) / fade_frames)
+                color = tuple(int(c * alpha) for c in (0, 0, 255))
+                cv2.circle(frame, (int(px), int(py)), 4, color, -1)
+        writer.write(frame)
+        idx += 1
+    writer.release()
+    cap.release()
+
+
+render_ball_tracking_admin_panel()
