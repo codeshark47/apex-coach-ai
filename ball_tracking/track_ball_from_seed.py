@@ -57,9 +57,11 @@ def track_ball_from_seed(
     search_radius_start: float = 250.0,
     search_radius_growth: float = 60.0,
     search_radius_cap: float = 400.0,
-    max_gap: int = 3,
+    max_gap: int = 8,
     conf_threshold: float = 0.02,
     size_trend_tolerance: float = 0.6,
+    recovery_gap_threshold: int = 2,
+    recovery_radius: float = 500.0,
 ) -> dict:
     """
     Tracks forward from (seed_frame, seed_xy) — a coach's confirmed
@@ -123,6 +125,32 @@ def track_ball_from_seed(
     candidate that's obviously a different, larger/smaller object, not
     police normal measurement noise.
 
+    RECOVERY MODE (2026-08-15, real bounce found by tracing frames 43-50
+    of the same benchmark sequence after the anchor/velocity fix above):
+    the ball's trajectory reverses direction in image-Y right around
+    frame 40-42 in this real clip — a bounce, physically impossible for
+    any constant-velocity model to represent. Confirmed directly: once
+    the linear extrapolation starts missing, the predicted search center
+    drifts 50-190px from the true position within a handful of frames,
+    since it keeps assuming the ball continues in its PRE-bounce
+    direction. Once `gap >= recovery_gap_threshold` consecutive misses
+    happen, this stops trusting that drifting prediction: the search
+    crop re-centers on the last CONFIRMED real position (anchor_xy, not
+    an extrapolated guess) with a wide fixed `recovery_radius`, and
+    candidate selection drops the proximity-to-prediction weighting
+    (meaningless once the "prediction" is just an anchor point, not a
+    real guess) in favor of confidence + the size-trend check alone.
+    `max_gap` raised 3->8 to give recovery mode enough attempts to
+    actually re-acquire — the real bounce here took 4 consecutive misses
+    (frames 43/45/46/47 all found nothing) before a real candidate
+    reappeared.
+
+    Still an HONEST, PARTIAL fix, not a solved tracker: this recovers
+    from the DRIFT recovery mode is built for, but a real bounce also
+    changes the ball's on-screen size/motion character in ways this
+    hasn't been separately validated against — re-run the full-
+    trajectory benchmark after any change here, same as always.
+
     Returns {"status": "success", "points": [(frame, x, y, conf, size), ...]}
     (points[0] is the seed itself, conf=1.0, size=seed_size or None)
     or {"status": "error", "message": ...}.
@@ -170,9 +198,20 @@ def track_ball_from_seed(
         if not ok:
             break
 
-        elapsed = frame_idx - anchor_frame
-        pred_x = anchor_xy[0] + velocity[0] * elapsed
-        pred_y = anchor_xy[1] + velocity[1] * elapsed
+        in_recovery = gap >= recovery_gap_threshold
+        if in_recovery:
+            # See this function's RECOVERY MODE docstring section — the
+            # linear extrapolation has already missed enough times that
+            # trusting it further just searches deeper into the wrong
+            # area. Re-anchor on the last CONFIRMED real position instead
+            # of a compounding guess about where the ball's gone.
+            pred_x, pred_y = anchor_xy
+            current_radius = recovery_radius
+        else:
+            elapsed = frame_idx - anchor_frame
+            pred_x = anchor_xy[0] + velocity[0] * elapsed
+            pred_y = anchor_xy[1] + velocity[1] * elapsed
+            current_radius = radius
         # BUG FOUND (2026-08-14, real validation against ground truth): a
         # trend-extrapolated expected_size requires size_velocity, which
         # doesn't exist until the SECOND real detection — meaning the
@@ -187,10 +226,10 @@ def track_ball_from_seed(
         else:
             expected_size = None
         h, w = frame_bgr.shape[:2]
-        x1 = int(max(0, pred_x - radius))
-        y1 = int(max(0, pred_y - radius))
-        x2 = int(min(w, pred_x + radius))
-        y2 = int(min(h, pred_y + radius))
+        x1 = int(max(0, pred_x - current_radius))
+        y1 = int(max(0, pred_y - current_radius))
+        x2 = int(min(w, pred_x + current_radius))
+        y2 = int(min(h, pred_y + current_radius))
 
         found = None
         if x2 > x1 and y2 > y1:
@@ -230,10 +269,18 @@ def track_ball_from_seed(
                 # so spatial continuity can outweigh a raw confidence edge,
                 # without letting one lucky-but-wrong high-confidence pixel
                 # blob win just because nothing else fired as strongly.
+                # In recovery mode, pred_x/pred_y is just the last known
+                # real anchor, not a real guess about the current frame —
+                # weighting by distance to it would penalize exactly the
+                # post-bounce candidates recovery mode exists to find.
+                # Confidence + the size-trend check (already applied
+                # above) are the only trustworthy signals here.
                 def _combined_score(c):
                     cx, cy, cconf, _ = c
+                    if in_recovery:
+                        return cconf
                     dist = math.hypot(cx - pred_x, cy - pred_y)
-                    proximity = max(0.05, 1.0 - dist / radius)
+                    proximity = max(0.05, 1.0 - dist / current_radius)
                     return cconf * proximity
 
                 found = max(candidates, key=_combined_score)
