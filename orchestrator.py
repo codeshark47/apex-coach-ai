@@ -1552,7 +1552,7 @@ def generate_fail_safe_video(video_path: str, output_path: str,
     )
 
 
-def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1920, max_height: int = 1080) -> None:
+def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1280, max_height: int = 720) -> None:
     """
     Writes an uploaded video to dest_path, downscaled to fit within
     max_width x max_height (preserving aspect ratio, never upscaling a
@@ -1568,6 +1568,25 @@ def save_uploaded_video_capped(uploaded_file, dest_path: str, max_width: int = 1
     1080p, ~16x of 720p), and nothing capped that anywhere. Downscaling
     once, upfront, fixes every downstream step at once instead of
     patching each one individually.
+
+    LOWERED 1920x1080 -> 1280x720 (2026-08-15, second real crash, same
+    root cause): the coach hit an app crash specifically on ~100MB native
+    (non-WhatsApp) clips — the 1080p cap wasn't actually protecting
+    anything for a portrait 1080x1920 source, since fitting inside a
+    1920x1080 box only constrains the long edge to 1080, landing around
+    608x1080 (verified: 1.6x more pixels than a typical WhatsApp-
+    compressed upload, ~478x850) — and every frame gets decoded AND run
+    through MediaPipe pose estimation TWICE (single-pose pass, then a
+    seeded multi-pose pass) AND drawn again for the overlay video, so
+    that multiplier applies three times over across the whole analysis,
+    on a deployment with a hard 1GB memory ceiling. 720p fits a portrait
+    source to roughly 405x720 — BELOW the WhatsApp-regime pixel count
+    that's already been running safely in production — while still being
+    generous for a pose-landmark task that doesn't need fine pixel
+    detail. The higher-resolution 1920x1080 default stays intact in
+    compress_video_file() itself for the ball-tracking training pipeline,
+    which calls that function directly (not this one) and genuinely
+    benefits from more pixels per ball at this size.
 
     Falls back to writing the original file untouched only if ffmpeg isn't
     installed at all (a deployment issue, not a per-video one). If ffmpeg
