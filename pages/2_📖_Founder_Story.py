@@ -1,6 +1,6 @@
 import streamlit as st
 
-st.set_page_config(page_title="Coach Story - Apex Coach AI", page_icon="📖", layout="wide")
+st.set_page_config(page_title="Founder Story - Apex Coach AI", page_icon="📖", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>

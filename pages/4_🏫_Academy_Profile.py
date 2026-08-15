@@ -17,7 +17,7 @@ monitoring.init_sentry()
 
 import profile_store as store
 
-st.set_page_config(page_title="Academy Profile - Apex Coach AI", page_icon="🏫", layout="wide")
+st.set_page_config(page_title="Academy Profile - Apex Coach AI", page_icon="🏫", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>

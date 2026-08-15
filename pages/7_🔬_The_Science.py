@@ -17,7 +17,7 @@ import streamlit as st
 
 import metric_ranges as mr
 
-st.set_page_config(page_title="The Science - Apex Coach AI", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="The Science - Apex Coach AI", page_icon="🔬", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>

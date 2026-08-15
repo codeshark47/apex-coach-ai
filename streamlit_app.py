@@ -1645,7 +1645,7 @@ def stream_confirmation_resolved(key_prefix: str) -> bool:
 # ====================================================================
 # PAGE CONFIG & ELITE DARK UI  (unchanged from Phase 1)
 # ====================================================================
-st.set_page_config(page_title="Apex Coach AI", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Apex Coach AI", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
 .stApp { background-color: #0B0E14; }

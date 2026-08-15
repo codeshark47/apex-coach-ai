@@ -8,7 +8,7 @@ a first analysis. Purely informational — no dynamic data needed.
 
 import streamlit as st
 
-st.set_page_config(page_title="How To Set Up - Apex Coach AI", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="How To Set Up - Apex Coach AI", page_icon="🛠️", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>

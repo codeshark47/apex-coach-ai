@@ -1,0 +1,16 @@
+[theme]
+# ROOT CAUSE FIX (2026-08-15): every page painted .stApp dark via custom
+# CSS, but Streamlit itself was never told this is a dark app - it still
+# ran its default LIGHT theme underneath. That's why the native chrome
+# (top toolbar, sidebar-collapse arrow, menu) stayed light/white while
+# only the page content looked dark: those native elements are rendered
+# by the framework itself, before any per-page custom CSS runs, and they
+# take their colors from this config, not from .stApp overrides. Setting
+# base="dark" here makes Streamlit's own chrome consistent with the rest
+# of the app everywhere, automatically - not just one more page-level
+# CSS patch that the next new page would need copying into again.
+base = "dark"
+primaryColor = "#00B4D8"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#121824"
+textColor = "#E2E8F0"
