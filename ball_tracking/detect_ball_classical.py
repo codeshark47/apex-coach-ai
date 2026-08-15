@@ -62,6 +62,7 @@ def detect_ball_candidates(
     history: int = 120,
     var_threshold: float = 40.0,
     roi: Optional[tuple] = None,
+    roi_polygon: Optional[list] = None,
     debug_output_path: Optional[str] = None,
 ) -> dict:
     """
@@ -79,16 +80,26 @@ def detect_ball_candidates(
     tuning once real footage is available, same as calibration.py
     already requires for real-world distance.
 
-    roi: optional (x1, y1, x2, y2) in pixels — restricts detection to
-    this region. Verified directly on real footage: with no ROI, the
-    dominant source of false positives wasn't the players at all, it was
-    wind-moved trees and background clutter far behind the pitch, which
-    a fixed camera still picks up as "foreground motion" just like a real
-    moving ball. Since the ball physically cannot leave the pitch
-    corridor in a fixed behind-the-stumps or side-on shot, restricting
-    to that region removes this category of false positive entirely
-    instead of trying to filter it out after the fact. Per-camera-setup,
-    not a universal constant — must be set per video framing.
+    roi: optional (x1, y1, x2, y2) rectangle in pixels — restricts
+    detection to this region.
+
+    roi_polygon: optional list of (x, y) points — restricts detection to
+    an arbitrary polygon instead of a rectangle, and takes priority over
+    roi when both are given. Added 2026-08-15 for the behind-the-stumps
+    fixed-tripod framing specifically: the pitch corridor is a TRAPEZOID
+    in this view (wide near the camera/bowler's stumps, narrow toward
+    the distant batsman's stumps due to perspective), not a rectangle —
+    a rectangle wide enough to cover the near end still lets in the
+    background clutter flanking the far end. Verified directly on real
+    footage that a rectangle ROI would NOT have excluded: with no ROI,
+    the dominant source of false positives was wind-moved trees and
+    background clutter far behind the pitch, but one specific noisy
+    chain sat on net/building texture roughly centered in the corridor
+    at mid-depth — a rectangle can't cut that out without also cutting
+    out real mid-flight ball positions at the same depth; a trapezoid
+    matching the pitch's actual perspective can. Per-camera-setup
+    coordinates, not a universal constant — must be re-measured (e.g.
+    from a grid-overlaid reference frame) for each new camera position.
 
     debug_output_path: if given, writes an annotated video with every
     surviving candidate circled — the actual way to evaluate this
@@ -133,7 +144,12 @@ def detect_ball_candidates(
         _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
-        if roi is not None:
+        if roi_polygon is not None:
+            roi_mask = np.zeros_like(fg_mask)
+            pts = np.array(roi_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(roi_mask, [pts], 255)
+            fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
+        elif roi is not None:
             x1, y1, x2, y2 = roi
             roi_mask = np.zeros_like(fg_mask)
             roi_mask[y1:y2, x1:x2] = 255
