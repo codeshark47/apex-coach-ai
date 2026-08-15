@@ -62,6 +62,7 @@ def track_ball_from_seed(
     size_trend_tolerance: float = 0.6,
     recovery_gap_threshold: int = 2,
     recovery_radius: float = 500.0,
+    recovery_max_speed_ratio: float = 3.0,
 ) -> dict:
     """
     Tracks forward from (seed_frame, seed_xy) — a coach's confirmed
@@ -150,6 +151,29 @@ def track_ball_from_seed(
     changes the ball's on-screen size/motion character in ways this
     hasn't been separately validated against — re-run the full-
     trajectory benchmark after any change here, same as always.
+
+    recovery_max_speed_ratio (2026-08-15, real bug found by tracing
+    frames 46/66 on the same benchmark, Gemini-prompted): recovery
+    mode's wide radius fixed the bounce but opened a narrower new hole —
+    a candidate can sit well within recovery_radius (336px, under the
+    400px cap by then) while still being a persistent STATIC false
+    positive (confirmed directly: frames 46 and 66 landed within 6px of
+    each other, and of a third bad candidate rejected earlier at frame
+    62 — the same fixed background feature, not the ball, getting
+    detected repeatedly whenever the wide crop includes it). Distance
+    alone can't tell that apart from a real, fast post-bounce ball. What
+    can: reaching a static point implies a sudden, large SPEED relative
+    to the ball's own last established rate — frame 46's implied speed
+    was ~6x the real rate measured just 4 frames earlier, while the
+    genuine bounce-recovery at frame 29 only implied ~0.7x (comfortably
+    within normal variation). Rejecting recovery candidates whose
+    implied speed exceeds `recovery_max_speed_ratio` times the last real
+    velocity's magnitude catches the former without the latter — a
+    physical continuity check, not a fixed pixel constant (same reason
+    the distance-reject above uses current_radius instead of Gemini's
+    original fixed 30px). Only applies once a real velocity exists
+    (skipped for the first tracked point after the seed, same reasoning
+    as expected_size above) — there's nothing yet to compare against.
 
     Returns {"status": "success", "points": [(frame, x, y, conf, size), ...]}
     (points[0] is the seed itself, conf=1.0, size=seed_size or None)
@@ -296,6 +320,27 @@ def track_ball_from_seed(
                 dist_from_pred = math.hypot(cand_x - pred_x, cand_y - pred_y)
                 if dist_from_pred > current_radius:
                     continue
+                # SPEED-RATIO REJECT (2026-08-15, real bug found tracing
+                # frames 46/66, then WIDENED after tracing frame 59 —
+                # see this function's docstring). Originally recovery-mode
+                # only, but frame 59 proved a normal-mode candidate can
+                # ALSO be an implausible-velocity false positive (a small
+                # dark blob on the background gate, confirmed by eye) that
+                # then corrupts the velocity baseline the NEXT recovery
+                # check compares against — the static tree/net object at
+                # frame 62/66 slipped through specifically because its
+                # ratio was computed against that already-inflated
+                # baseline. Applying this check universally (not just in
+                # recovery) closes that hole at the source instead of
+                # letting a bad normal-mode hit poison every check after
+                # it. Only fires once a real velocity exists (nothing to
+                # compare against on the very first tracked point).
+                if velocity[0] != 0.0 or velocity[1] != 0.0:
+                    elapsed_here = frame_idx - anchor_frame
+                    implied_speed = math.hypot(cand_x - anchor_xy[0], cand_y - anchor_xy[1]) / elapsed_here
+                    last_speed = math.hypot(velocity[0], velocity[1])
+                    if last_speed > 1e-3 and implied_speed > last_speed * recovery_max_speed_ratio:
+                        continue
                 candidates.append((cand_x, cand_y, cand_conf, cand_size))
             if candidates:
                 # DISTANCE-WEIGHTED SELECTION (2026-08-15, real bug found by
