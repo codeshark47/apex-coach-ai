@@ -63,6 +63,8 @@ def track_ball_from_seed(
     recovery_gap_threshold: int = 2,
     recovery_radius: float = 500.0,
     recovery_max_speed_ratio: float = 3.0,
+    stagnation_radius: float = 5.0,
+    stagnation_window: int = 4,
 ) -> dict:
     """
     Tracks forward from (seed_frame, seed_xy) — a coach's confirmed
@@ -152,6 +154,45 @@ def track_ball_from_seed(
     hasn't been separately validated against — re-run the full-
     trajectory benchmark after any change here, same as always.
 
+    stagnation_radius / stagnation_window (2026-08-16, real bug found
+    from a coach's first live admin-panel test, on a clip outside the
+    original benchmark): a NEW static-lock-on shape the speed-ratio
+    check above doesn't cover. Traced the exact raw sequence — frames
+    107-110 were genuine (smooth, 0.3-0.5 confidence), then frame 111
+    jumped onto a background object and the tracker sat there for 29
+    STRAIGHT frames (112-139), oscillating within 1-2px, confidence
+    collapsed to 0.02-0.11. The speed-ratio filter didn't catch entry
+    into it (the jump itself wasn't fast enough relative to the recent
+    trend to look implausible — the problem wasn't speed, it was
+    direction). But nothing catches what happens AFTER: a real ball in
+    flight is never in the same few square pixels for several
+    consecutive real frames — this checks exactly that, terminating the
+    trail (not coasting through it) once it fires.
+
+    FIRST VERSION USED A SINGLE-STEP THRESHOLD AND REGRESSED A REAL
+    CLIP: comparing each new point only to the immediately-previous one
+    looked right on the stuck clip, but broke a DIFFERENT, already-
+    validated clip — a real ball naturally decelerating near an apex in
+    that delivery had individual steps shrink to 3.5-6px, which a
+    single-step 5px cutoff couldn't tell apart from genuine stagnation.
+    Fixed by checking NET displacement across a short WINDOW of
+    consecutive real detections instead of one step at a time: the truly
+    stuck case still barely moves at all across 4 real frames (~1px net,
+    confirmed on the same raw data), while the decelerating-but-real
+    case covers real net distance across the same span (~13-31px,
+    confirmed on the regression clip) even as its individual steps
+    shrink. Net-over-a-window is what actually separates "slowing down"
+    from "stopped," not any single frame-to-frame distance.
+
+    Deliberately NOT paired with a hard directional/angle constraint
+    (Gemini's other proposed check, "reject any candidate inconsistent
+    with downward flight toward the pitch") — the PRIMARY benchmark's
+    own verified ground truth includes the ball genuinely moving UP in
+    image-space early in flight (already confirmed accurate against
+    real labels), so a rigid down-and-forward rule would have rejected
+    real, already-proven motion. Windowed stagnation alone explains and
+    catches this specific failure without that risk.
+
     recovery_max_speed_ratio (2026-08-15, real bug found by tracing
     frames 46/66 on the same benchmark, Gemini-prompted): recovery
     mode's wide radius fixed the bounce but opened a narrower new hole —
@@ -214,6 +255,7 @@ def track_ball_from_seed(
     size_velocity = None  # per-frame size delta once 2+ real size samples exist
     gap = 0
     radius = search_radius_start
+    recent_real_positions = [(seed_frame, float(seed_xy[0]), float(seed_xy[1]))]  # rolling window, see stagnation docstring
 
     end_frame = min(total_frames - 1, seed_frame + max_frames_forward)
     for frame_idx in range(seed_frame + 1, end_frame + 1):
@@ -376,6 +418,22 @@ def track_ball_from_seed(
 
         if found is not None:
             fx, fy, fconf, fsize = found
+            # STAGNATION REJECT (2026-08-16) — see this function's
+            # docstring. NET displacement across a short WINDOW of
+            # consecutive real detections, not a single-step distance —
+            # a single-step threshold regressed a real clip where the
+            # ball genuinely decelerates near an apex (individual steps
+            # shrink to a few px even though real net motion continues).
+            # A truly stuck static object barely moves at all across the
+            # whole window; real deceleration still covers real distance
+            # over the same span even as it slows down.
+            recent_real_positions.append((frame_idx, fx, fy))
+            if len(recent_real_positions) > stagnation_window:
+                recent_real_positions.pop(0)
+            if len(recent_real_positions) == stagnation_window:
+                _, ox, oy = recent_real_positions[0]
+                if math.hypot(fx - ox, fy - oy) < stagnation_radius:
+                    break
             elapsed_at_hit = frame_idx - anchor_frame
             velocity = ((fx - anchor_xy[0]) / elapsed_at_hit, (fy - anchor_xy[1]) / elapsed_at_hit)
             if last_size is not None:
