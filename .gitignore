@@ -53,3 +53,14 @@ models/
 ball_tracking/training/dataset/
 ball_tracking/training/runs/
 ball_tracking/training/*.pt
+
+# Pretrained COCO checkpoint — auto-downloaded by ultralytics on first
+# YOLO('yolov8n.pt') call into whatever the cwd happened to be; same
+# reasoning as models/ above, doesn't need to live in git
+/yolov8n.pt
+
+# Raw stdout/stderr captures from background train_yolo.py runs —
+# regeneratable by re-running training, real content already distilled
+# into project memory once each run is validated
+ball_tracking/training/*.log
+ball_tracking/training/_*.txt
