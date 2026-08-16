@@ -63,7 +63,8 @@ def track_ball_from_seed(
     recovery_gap_threshold: int = 2,
     recovery_radius: float = 500.0,
     recovery_max_speed_ratio: float = 3.0,
-    stagnation_radius: float = 5.0,
+    min_baseline_speed: float = 5.0,
+    stagnation_radius: float = 0.0,
     stagnation_window: int = 4,
     proximity_scale: float = 60.0,
 ) -> dict:
@@ -194,6 +195,41 @@ def track_ball_from_seed(
     real, already-proven motion. Windowed stagnation alone explains and
     catches this specific failure without that risk.
 
+    DISABLED BY DEFAULT (stagnation_radius=0.0) AS OF 2026-08-16, SAME
+    DAY — proven wrong on real ground truth, not just a hunch. THIS
+    SAME CLIP (VID_20260815_075824.mp4) turned out to already have 16
+    real coach-labeled frames in the database — never checked before
+    building or defending this filter. Converting them to this frame's
+    pixel scale: frames 120-144 (24 real frames) sit in a tight
+    (198-210, 288-308) cluster — the EXACT region this filter had been
+    rejecting as "the static object" through two rounds of Gemini
+    exchanges. Confirmed directly (whole-frame scan, sorted by distance
+    to the real label): the closest candidate to the true position at
+    every one of those frames is within 3.8-21.7px and matches the same
+    size/confidence profile as what was being called a false positive —
+    there is no separate, different real-ball candidate being missed.
+    It's the same detection. The filter's core assumption — a real ball
+    is never in the same few pixels for several consecutive frames — is
+    simply FALSE for this camera framing: a ball traveling nearly along
+    the camera's own optical axis (toward/away from it, not laterally
+    across frame) has real, fast 3D motion but can legitimately show
+    almost no lateral image-space displacement for an extended real
+    stretch. Position alone cannot tell that apart from a truly static
+    background object (confirmed separately, by direct visual pixel
+    inspection, for the primary benchmark's frames 46/66 — that case
+    really was static background, so this isn't "the whole idea was
+    wrong," it's "position alone isn't sufficient evidence, camera-angle-
+    dependent, and this project doesn't have a reliable second signal
+    for it yet"). Tried size-trend (a real ball approaching camera
+    should show real growth) as a second signal on this same real data —
+    too noisy at this scale (5.6-7.4px, so +/-1px is a large relative
+    swing) to safely threshold on. Left the mechanism in the code
+    (calling it with a real stagnation_radius still works) rather than
+    deleting it, since it may still be useful once a more reliable
+    depth/size signal exists — just not trustworthy enough to ship
+    enabled by default when the cost of being wrong is silently
+    discarding real, correct tracking.
+
     recovery_max_speed_ratio (2026-08-15, real bug found by tracing
     frames 46/66 on the same benchmark, Gemini-prompted): recovery
     mode's wide radius fixed the bounce but opened a narrower new hole —
@@ -216,6 +252,25 @@ def track_ball_from_seed(
     original fixed 30px). Only applies once a real velocity exists
     (skipped for the first tracked point after the seed, same reasoning
     as expected_size above) — there's nothing yet to compare against.
+
+    min_baseline_speed (2026-08-16, real bug found tracing clip3 — a
+    clip outside the frame-46/66 benchmark above, where the ball travels
+    almost straight along the camera's own optical axis): the ratio
+    above divides by the ball's LAST established speed, which is fine
+    when that speed is a normal in-flight rate but breaks down when it's
+    near-zero. On this clip the ball legitimately had near-zero LATERAL
+    velocity for a real physical reason (same effect documented for the
+    disabled stagnation filter above — motion toward the camera doesn't
+    show up as image-plane displacement), so the established rate right
+    before the gap was 0.32px/frame. Every real subsequent detection —
+    genuinely only ~4px/frame away — then measured as a 96x-124x "speed
+    spike" against that near-zero baseline and was rejected, even though
+    nothing about it was actually implausible. Flooring last_speed at
+    min_baseline_speed (default 5px/frame, roughly one ball-width on
+    this clip's scale) before computing the ratio fixes the near-zero
+    blowup while leaving the original frame-46/66 rejections untouched —
+    those had real established speeds well above this floor already, so
+    max(last_speed, floor) there just returns last_speed unchanged.
 
     proximity_scale (2026-08-16, real bug found tracing frame 111 on a
     clip outside prior testing — see the stagnation notes above for the
@@ -274,7 +329,22 @@ def track_ball_from_seed(
     anchor_xy = (float(seed_xy[0]), float(seed_xy[1]))
     anchor_frame = seed_frame
     velocity = (0.0, 0.0)  # (dx, dy) per frame, updated once 2+ points are confirmed
-    last_size = seed_size
+    # SAME ANCHOR PRINCIPLE AS POSITION, APPLIED TO SIZE (2026-08-16, real
+    # bug found tracing why clip3 stops at frame 111 even with stagnation
+    # disabled and max_gap raised): expected_size used to compound
+    # size_velocity once per MISSED frame (`last_size = last_size +
+    # size_velocity` in the miss branch), the exact same per-miss-
+    # mutation bug already fixed for position earlier tonight, just never
+    # applied here. Confirmed directly: a real -0.38px/frame size trend,
+    # compounded over the real 9-frame gap to frame 120, decayed the
+    # expected size from 4.9px to 1.46px — so the real ball's actual
+    # 7.19px size failed the size-trend tolerance check by 6x, rejected
+    # before distance/speed checks even mattered. Fixed the same way as
+    # position: anchor_size/anchor_size_frame only update on real
+    # detections; expected size is always anchor_size + size_velocity *
+    # elapsed, computed fresh each frame, never an accumulated value.
+    anchor_size = seed_size
+    anchor_size_frame = seed_frame
     size_velocity = None  # per-frame size delta once 2+ real size samples exist
     gap = 0
     radius = search_radius_start
@@ -322,11 +392,31 @@ def track_ball_from_seed(
         # very first tracked frame after the seed had no size check at
         # all, even when seed_size was given, and that's exactly the
         # frame a real test caught accepting an 87%-too-small candidate.
-        # Falls back to last_size alone (a flat "still roughly this
+        # Falls back to anchor_size alone (a flat "still roughly this
         # size" check) until a real trend exists, instead of skipping
         # the check entirely for that one critical frame.
-        if last_size is not None:
-            expected_size = last_size + size_velocity if size_velocity is not None else last_size
+        # RECOVERY MODE STOPS TREND-EXTRAPOLATING SIZE TOO (2026-08-16, real
+        # bug found tracing clip3 past frame 111 even AFTER the anchor_size
+        # fix above eliminated per-miss compounding): a size trend is
+        # estimated from a SINGLE interval between two real detections — one
+        # noisy sample, not an averaged rate. Extrapolating that one sample
+        # forward is fine for a frame or two, but over a real 9-frame gap it
+        # drove expected_size from 4.9px to 1.46px on this clip while the
+        # ball's actual real size stayed ~7px, rejecting the true candidate
+        # at frame 120 by a ~4x deviation — same shape of bug as the
+        # position predictor already fixed for recovery mode above ("the
+        # linear extrapolation has already missed enough times that trusting
+        # it further just searches deeper into the wrong area"), just never
+        # applied to size. Once in recovery, fall back to anchor_size flat
+        # (a "still roughly this size" check, same reasoning as the
+        # no-second-sample-yet fallback below) instead of riding a
+        # one-sample trend further and further from anything real.
+        if anchor_size is not None:
+            if in_recovery:
+                expected_size = anchor_size
+            else:
+                size_elapsed = frame_idx - anchor_size_frame
+                expected_size = anchor_size + size_velocity * size_elapsed if size_velocity is not None else anchor_size
         else:
             expected_size = None
         h, w = frame_bgr.shape[:2]
@@ -404,7 +494,27 @@ def track_ball_from_seed(
                     elapsed_here = frame_idx - anchor_frame
                     implied_speed = math.hypot(cand_x - anchor_xy[0], cand_y - anchor_xy[1]) / elapsed_here
                     last_speed = math.hypot(velocity[0], velocity[1])
-                    if last_speed > 1e-3 and implied_speed > last_speed * recovery_max_speed_ratio:
+                    # MIN_BASELINE_SPEED FLOOR (2026-08-16, real bug found
+                    # tracing clip3 past frame 111 — see docstring): this
+                    # ratio divides by last_speed, so when the ball's last
+                    # established rate is itself near-zero the check
+                    # collapses — ANY subsequent real motion reads as a huge
+                    # multiple of ~nothing. That's exactly what happened
+                    # here: a ball travelling nearly along the camera's own
+                    # optical axis has near-zero LATERAL velocity for real,
+                    # physical reasons (same effect already documented for
+                    # the disabled stagnation filter above), so the "last
+                    # real velocity" anchor at frame 111 was 0.32px/frame —
+                    # and the real ball's next genuine detection, ~4px/frame
+                    # away, was rejected as a 96x-124x "speed spike" that
+                    # was never actually implausible. Flooring last_speed at
+                    # min_baseline_speed before dividing keeps this check
+                    # doing its real job (catching a jump to a static
+                    # object, still ~30-40x over any reasonable per-frame
+                    # rate) without letting a legitimately-near-zero
+                    # baseline make every subsequent frame look impossible.
+                    effective_last_speed = max(last_speed, min_baseline_speed)
+                    if implied_speed > effective_last_speed * recovery_max_speed_ratio:
                         continue
                 candidates.append((cand_x, cand_y, cand_conf, cand_size))
             if candidates:
@@ -465,11 +575,13 @@ def track_ball_from_seed(
                     break
             elapsed_at_hit = frame_idx - anchor_frame
             velocity = ((fx - anchor_xy[0]) / elapsed_at_hit, (fy - anchor_xy[1]) / elapsed_at_hit)
-            if last_size is not None:
-                size_velocity = fsize - last_size
+            if anchor_size is not None:
+                size_elapsed_at_hit = frame_idx - anchor_size_frame
+                size_velocity = (fsize - anchor_size) / size_elapsed_at_hit
             anchor_xy = (fx, fy)
             anchor_frame = frame_idx
-            last_size = fsize
+            anchor_size = fsize
+            anchor_size_frame = frame_idx
             points.append((frame_idx, fx, fy, fconf, fsize))
             gap = 0
             radius = search_radius_start
@@ -478,11 +590,10 @@ def track_ball_from_seed(
             radius = min(search_radius_cap, radius + search_radius_growth)
             if gap > max_gap:
                 break
-            # No coasting mutation needed — next iteration's pred_x/pred_y
-            # already extrapolate from the fixed anchor over the growing
-            # elapsed count, see above.
-            if last_size is not None and size_velocity is not None:
-                last_size = last_size + size_velocity
+            # No coasting mutation needed for position OR size — next
+            # iteration's pred_x/pred_y and expected_size both extrapolate
+            # fresh from their fixed anchors over the growing elapsed
+            # count, see above (same principle applied to both now).
 
     cap.release()
     return {"status": "success", "points": points}
