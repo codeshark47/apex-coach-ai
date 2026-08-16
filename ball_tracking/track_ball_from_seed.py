@@ -65,6 +65,7 @@ def track_ball_from_seed(
     recovery_max_speed_ratio: float = 3.0,
     stagnation_radius: float = 5.0,
     stagnation_window: int = 4,
+    proximity_scale: float = 60.0,
 ) -> dict:
     """
     Tracks forward from (seed_frame, seed_xy) — a coach's confirmed
@@ -215,6 +216,28 @@ def track_ball_from_seed(
     original fixed 30px). Only applies once a real velocity exists
     (skipped for the first tracked point after the seed, same reasoning
     as expected_size above) — there's nothing yet to compare against.
+
+    proximity_scale (2026-08-16, real bug found tracing frame 111 on a
+    clip outside prior testing — see the stagnation notes above for the
+    same clip): the OLD proximity weighting divided distance by
+    current_radius (250-400px), a linear falloff so gentle that a real
+    ball candidate 14.8px from the prediction (conf 0.025) still LOST to
+    a static false positive 26.9px away (conf 0.041) — the confidence
+    gap alone was enough to win even though the real ball was clearly
+    the closer, more physically plausible candidate. Confirmed directly:
+    the real ball WAS in the candidate list at frame 111, low confidence
+    but present — this was a scoring-formula bug, not a detector recall
+    failure the way it first looked. Fixed with a smaller, QUADRATIC
+    falloff (proximity_scale=60px, squared instead of linear) so nearby
+    candidates are preferred much more strongly at exactly the pixel
+    distances that separate a real ball from a nearby false positive,
+    without needing a hard cutoff — a dramatically more confident but
+    farther candidate can still win, same as before, just not from a
+    small, noisy confidence edge alone. Deliberately its own parameter,
+    not reusing current_radius (250-500px) — that stays the outer hard-
+    reject boundary (see the distance-reject note above), a completely
+    different question ("could this possibly be real at all") from this
+    one ("which of several plausible candidates is most likely real").
 
     Returns {"status": "success", "points": [(frame, x, y, conf, size), ...]}
     (points[0] is the seed itself, conf=1.0, size=seed_size or None)
@@ -411,7 +434,13 @@ def track_ball_from_seed(
                     if in_recovery:
                         return cconf
                     dist = math.hypot(cx - pred_x, cy - pred_y)
-                    proximity = max(0.05, 1.0 - dist / current_radius)
+                    # QUADRATIC, TIGHTER-SCALE proximity (2026-08-16) —
+                    # see proximity_scale in this function's docstring.
+                    # current_radius (250-500px) is still the hard-reject
+                    # boundary elsewhere; this is a separate, much
+                    # smaller scale specifically for RANKING candidates
+                    # that already passed that boundary.
+                    proximity = max(0.05, 1.0 - dist / proximity_scale) ** 2
                     return cconf * proximity
 
                 found = max(candidates, key=_combined_score)
