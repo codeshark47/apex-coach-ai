@@ -2,8 +2,9 @@
 tests/test_payments.py
 
 Regression tests for payments.py's manual-verification subscription
-flow (2026-08-17) — a fake Supabase client so no real network/Supabase
-project is needed to run them, same pattern as test_usage_limits.py.
+flow (2026-08-17, updated same day for real per-month pricing) — a
+fake Supabase client so no real network/Supabase project is needed to
+run them, same pattern as test_usage_limits.py.
 """
 
 from contextlib import contextmanager
@@ -94,15 +95,15 @@ class TestGetSubscription:
 
     def test_active_paid_tier_is_returned(self):
         future = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
-        subs = {"user-1": {"user_id": "user-1", "tier": "pro", "status": "active", "expires_at": future}}
+        subs = {"user-1": {"user_id": "user-1", "tier": "professional", "status": "active", "expires_at": future}}
         with _patched(subs_store=subs):
             result = pm.get_subscription("user-1")
-        assert result["tier"] == "pro"
+        assert result["tier"] == "professional"
         assert result["status"] == "active"
 
     def test_expired_subscription_reports_and_persists_as_free(self):
         past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        subs = {"user-1": {"user_id": "user-1", "tier": "pro", "status": "active", "expires_at": past}}
+        subs = {"user-1": {"user_id": "user-1", "tier": "professional", "status": "active", "expires_at": past}}
         with _patched(subs_store=subs) as client:
             result = pm.get_subscription("user-1")
         # Reported back as free (expired paid tier grants no paid limit)...
@@ -125,43 +126,89 @@ class TestGetSubscription:
         assert result == {"tier": "free", "status": "active", "expires_at": None}
 
 
-class TestEffectiveLimit:
-    def test_free_user_gets_free_tier_limit(self):
+class TestGetMonthlyUsage:
+    def test_no_row_falls_back_to_free_daily_limit_number(self):
         with _patched():
-            assert pm.effective_limit("user-1") == pm.TIER_LIMITS["free"]
+            result = pm.get_monthly_usage("user-1")
+        assert result == {"used": 0, "limit": pm.TIER_MONTHLY_LIMITS["free"], "remaining": pm.TIER_MONTHLY_LIMITS["free"]}
 
-    def test_active_pro_user_gets_pro_limit(self):
-        future = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
-        subs = {"user-1": {"user_id": "user-1", "tier": "pro", "status": "active", "expires_at": future}}
+    def test_active_professional_tier_uses_monthly_limit(self):
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "professional", "used_this_period": 3, "period_start": recent}}
         with _patched(subs_store=subs):
-            assert pm.effective_limit("user-1") == pm.TIER_LIMITS["pro"]
+            result = pm.get_monthly_usage("user-1")
+        assert result == {"used": 3, "limit": pm.TIER_MONTHLY_LIMITS["professional"], "remaining": pm.TIER_MONTHLY_LIMITS["professional"] - 3}
+
+    def test_window_past_30_days_resets_used_to_zero(self):
+        stale = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "starter", "used_this_period": 9, "period_start": stale}}
+        with _patched(subs_store=subs) as client:
+            result = pm.get_monthly_usage("user-1")
+        assert result["used"] == 0
+        assert result["remaining"] == pm.TIER_MONTHLY_LIMITS["starter"]
+        # persisted, not just returned
+        assert client.subs_store["user-1"]["used_this_period"] == 0
+
+    def test_within_30_day_window_does_not_reset(self):
+        recent = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "starter", "used_this_period": 4, "period_start": recent}}
+        with _patched(subs_store=subs):
+            result = pm.get_monthly_usage("user-1")
+        assert result["used"] == 4
+
+    def test_institutional_tier_has_a_very_high_practical_limit(self):
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "institutional", "used_this_period": 500, "period_start": recent}}
+        with _patched(subs_store=subs):
+            result = pm.get_monthly_usage("user-1")
+        assert result["limit"] >= pm.UNLIMITED_DISPLAY_THRESHOLD
+        assert result["remaining"] > 0
+
+
+class TestRecordMonthlyUsage:
+    def test_increments_used_this_period(self):
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "starter", "used_this_period": 2, "period_start": recent}}
+        with _patched(subs_store=subs) as client:
+            result = pm.record_monthly_usage("user-1")
+        assert result["used"] == 3
+        assert client.subs_store["user-1"]["used_this_period"] == 3
 
 
 class TestSubmitPayment:
     def test_rejects_unknown_tier(self):
         with _patched(), pytest.raises(ValueError):
-            pm.submit_payment("user-1", "a@b.com", "ultra", "monthly", "jazzcash", "TXN123")
+            pm.submit_payment("user-1", "a@b.com", "ultra", "monthly", "pkr", "jazzcash", "TXN123")
+
+    def test_rejects_unknown_currency(self):
+        with _patched(), pytest.raises(ValueError):
+            pm.submit_payment("user-1", "a@b.com", "starter", "monthly", "eur", "jazzcash", "TXN123")
 
     def test_rejects_blank_reference(self):
         with _patched(), pytest.raises(ValueError):
-            pm.submit_payment("user-1", "a@b.com", "pro", "monthly", "jazzcash", "   ")
+            pm.submit_payment("user-1", "a@b.com", "starter", "monthly", "pkr", "jazzcash", "   ")
 
-    def test_records_pending_submission_with_correct_amount(self):
+    def test_records_pending_submission_with_correct_pkr_amount(self):
         with _patched() as client:
-            row = pm.submit_payment("user-1", "a@b.com", "pro", "monthly", "jazzcash", "TXN123")
+            row = pm.submit_payment("user-1", "a@b.com", "professional", "monthly", "pkr", "jazzcash", "TXN123")
         assert row["status"] == "pending"
-        assert row["amount_pkr"] == pm.TIER_PRICING_PKR["pro"]["monthly"]
+        assert row["amount"] == pm.TIER_PRICING["professional"]["pkr"]["monthly"] == 13_000
         assert row["transaction_reference"] == "TXN123"
         assert len(client.payments_store) == 1
 
+    def test_records_pending_submission_with_correct_usd_annual_amount(self):
+        with _patched() as client:
+            row = pm.submit_payment("user-1", "a@b.com", "elite", "annual", "usd", "bank_transfer", "TXN456")
+        assert row["amount"] == pm.TIER_PRICING["elite"]["usd"]["annual"] == 790
+
 
 class TestApprovePayment:
-    def test_approve_activates_subscription_with_correct_expiry(self):
+    def test_approve_activates_subscription_with_correct_expiry_and_fresh_period(self):
         payments_store = {
             "sub-1": {
                 "id": "sub-1", "user_id": "user-1", "user_email": "a@b.com",
-                "tier_requested": "pro", "billing_period": "monthly",
-                "amount_pkr": pm.TIER_PRICING_PKR["pro"]["monthly"],
+                "tier_requested": "professional", "billing_period": "monthly", "currency": "pkr",
+                "amount": pm.TIER_PRICING["professional"]["pkr"]["monthly"],
                 "payment_method": "jazzcash", "transaction_reference": "TXN123",
                 "status": "pending",
             }
@@ -169,13 +216,14 @@ class TestApprovePayment:
         with _patched(payments_store=payments_store) as client:
             result = pm.approve_payment("sub-1", "admin@apexcoach.ai")
 
-        assert result["tier"] == "pro"
+        assert result["tier"] == "professional"
         assert client.payments_store["sub-1"]["status"] == "approved"
         assert client.payments_store["sub-1"]["reviewed_by"] == "admin@apexcoach.ai"
 
         new_sub = client.subs_store["user-1"]
-        assert new_sub["tier"] == "pro"
+        assert new_sub["tier"] == "professional"
         assert new_sub["status"] == "active"
+        assert new_sub["used_this_period"] == 0
         expires = datetime.fromisoformat(new_sub["expires_at"])
         # ~30 days out (monthly), starting from approval time, not
         # submission time — allow a wide tolerance, this just guards
@@ -192,7 +240,7 @@ class TestRejectPayment:
         payments_store = {
             "sub-1": {
                 "id": "sub-1", "user_id": "user-1", "user_email": "a@b.com",
-                "tier_requested": "pro", "billing_period": "monthly",
+                "tier_requested": "starter", "billing_period": "monthly", "currency": "pkr",
                 "status": "pending",
             }
         }

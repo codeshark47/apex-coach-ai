@@ -11,6 +11,13 @@
 -- (Safepay or similar) later without changing the tier/usage-gating
 -- logic that reads from `subscriptions`, only how it gets written to.
 --
+-- period_start/used_this_period (2026-08-17, real pricing sheet):
+-- every paid tier is priced as "N analyses PER MONTH," not per day —
+-- a rolling 30-day usage-allowance window, tracked independently of
+-- the free tier's own daily demo_usage table (unchanged, still daily).
+-- An annual subscriber still gets a FRESH allowance every 30 days
+-- within their year, not one lump sum for the whole 12 months.
+--
 -- Same security model as every other user-scoped table in this app:
 -- profile_store.py's service key bypasses RLS for the app's own writes;
 -- RLS here is defense-in-depth (see add_rls_policies.sql's own note),
@@ -19,9 +26,12 @@
 create table if not exists subscriptions (
     id uuid primary key default gen_random_uuid(),
     user_id uuid not null unique,
-    tier text not null default 'free',          -- 'free' | 'pro' | 'academy'
-    status text not null default 'active',       -- 'active' | 'expired' | 'cancelled'
-    expires_at timestamptz,                       -- null for free tier (never expires)
+    tier text not null default 'free',      -- 'free' | 'starter' | 'professional' | 'elite' | 'institutional'
+    status text not null default 'active',   -- 'active' | 'expired' | 'cancelled'
+    currency text,                            -- 'pkr' | 'usd' — null for free tier
+    expires_at timestamptz,                   -- null for free tier (never expires)
+    period_start timestamptz,                 -- start of the CURRENT 30-day usage-allowance window
+    used_this_period integer not null default 0,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -32,9 +42,10 @@ create table if not exists payment_submissions (
     id uuid primary key default gen_random_uuid(),
     user_id uuid not null,
     user_email text not null,              -- denormalized for admin review without a join
-    tier_requested text not null,          -- 'pro' | 'academy'
+    tier_requested text not null,          -- 'starter' | 'professional' | 'elite' | 'institutional'
     billing_period text not null,          -- 'monthly' | 'annual'
-    amount_pkr numeric not null,
+    currency text not null,                -- 'pkr' | 'usd'
+    amount numeric not null,               -- in the submission's own currency
     payment_method text not null,          -- 'jazzcash' | 'easypaisa' | 'bank_transfer'
     transaction_reference text not null,
     submitted_at timestamptz not null default now(),

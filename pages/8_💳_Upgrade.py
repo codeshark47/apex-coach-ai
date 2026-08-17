@@ -4,7 +4,13 @@ pages/8_💳_Upgrade.py
 Manual-verification subscription flow (2026-08-17) — see payments.py's
 module docstring for why this is manual review rather than an automated
 checkout (no merchant/API payment account exists yet, personal
-JazzCash/Easypaisa/bank accounts only).
+JazzCash/Easypaisa/bank accounts only). Real pricing (four tiers, PKR +
+USD, monthly/annual) from the founder's own pricing deck, added same day.
+
+USD/international coaches have no self-serve payment method yet (all
+three PKR methods are Pakistan-domestic) — shown pricing for reference,
+directed to contact support instead of a submission form that has
+nowhere real to send money.
 
 Streamlit does NOT share the main script's auth gate across pages/
 files — each page runs as its own script — so this page re-checks
@@ -30,9 +36,10 @@ section[data-testid="stSidebar"] { background-color: #0F1524 !important; border-
 section[data-testid="stSidebar"] * { color: #E2E8F0 !important; }
 .tier-card {
     background: linear-gradient(145deg, #121824, #1A2333);
-    border: 1px solid #1E3A5F; border-radius: 12px; padding: 24px 28px; margin-bottom: 18px;
+    border: 1px solid #1E3A5F; border-radius: 12px; padding: 20px 22px; margin-bottom: 18px;
 }
 .tier-card.current { border: 1px solid #00B4D8; }
+.tier-card.popular { border: 1px solid #F5A623; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -51,11 +58,13 @@ st.divider()
 
 sub = payments.get_subscription(user_id)
 current_tier = sub["tier"]
+usage = payments.get_monthly_usage(user_id) if current_tier != "free" else None
 
+expiry_note = f" — renews/expires {sub['expires_at'][:10]}" if sub.get("expires_at") else ""
+usage_note = f" — {usage['used']}/{usage['limit']} analyses used this month" if usage else ""
 st.markdown(f"""
 <div class="tier-card current">
-<b>Current plan:</b> {current_tier.upper()}
-{"— expires " + sub["expires_at"][:10] if sub.get("expires_at") else ""}
+<b>Current plan:</b> {current_tier.title()}{expiry_note}{usage_note}
 </div>
 """, unsafe_allow_html=True)
 
@@ -66,60 +75,76 @@ st.info(
     "within a day. Your plan activates as soon as we approve it."
 )
 
+TIER_LABELS = {"starter": "Starter", "professional": "Professional", "elite": "Elite", "institutional": "Institutional"}
+POPULAR_TIER = "professional"
+
+currency = st.radio("Currency", ["pkr", "usd"], format_func=lambda c: c.upper(), horizontal=True, key="_pay_currency")
+period_choice = st.radio("Billing period", ["monthly", "annual"], format_func=lambda p: p.title() + (" (2 months free)" if p == "annual" else ""), horizontal=True, key="_pay_period")
+
 st.markdown("### Plans")
-cols = st.columns(2)
-tier_labels = {"pro": "Pro", "academy": "Academy"}
-for col, tier in zip(cols, ["pro", "academy"]):
+cols = st.columns(4)
+symbol = "PKR " if currency == "pkr" else "$"
+for col, tier in zip(cols, payments.TIER_ORDER):
     with col:
-        pricing = payments.TIER_PRICING_PKR[tier]
-        limit = payments.TIER_LIMITS[tier]
+        price = payments.TIER_PRICING[tier][currency][period_choice]
+        limit = payments.TIER_MONTHLY_LIMITS[tier]
+        limit_label = "Unlimited" if limit >= payments.UNLIMITED_DISPLAY_THRESHOLD else f"{limit}"
+        card_class = "tier-card popular" if tier == POPULAR_TIER else "tier-card"
         st.markdown(f"""
-        <div class="tier-card">
-        <h3>{tier_labels[tier]}</h3>
-        <p>{limit} analyses/day</p>
-        <p><b>PKR {pricing['monthly']:,}</b>/month or <b>PKR {pricing['annual']:,}</b>/year</p>
+        <div class="{card_class}">
+        <h3>{TIER_LABELS[tier]}{" ⭐" if tier == POPULAR_TIER else ""}</h3>
+        <p><b>{symbol}{price:,}</b>/{"month" if period_choice == "monthly" else "year"}</p>
+        <p>{limit_label} analyses/month</p>
         </div>
         """, unsafe_allow_html=True)
 
 st.divider()
-st.markdown("### Submit a payment")
 
-tier_choice = st.selectbox("Plan", ["pro", "academy"], format_func=lambda t: tier_labels[t], key="_pay_tier")
-period_choice = st.radio("Billing period", ["monthly", "annual"], horizontal=True, key="_pay_period")
-amount = payments.TIER_PRICING_PKR[tier_choice][period_choice]
-st.write(f"**Amount to send: PKR {amount:,}**")
-
-method_choice = st.radio(
-    "Payment method", list(payments.PAYMENT_INSTRUCTIONS.keys()),
-    format_func=lambda m: payments.PAYMENT_INSTRUCTIONS[m]["label"], horizontal=True, key="_pay_method",
-)
-instr = payments.PAYMENT_INSTRUCTIONS[method_choice]
-if method_choice == "bank_transfer":
-    st.markdown(
-        f"Send to: **{instr['bank_name']}**, account **{instr['account_number']}**, "
-        f"name **{instr['account_name']}**"
+if currency == "usd":
+    st.markdown("### International / USD payment")
+    st.warning(
+        "We don't have a self-serve international payment method set up yet. If you'd like "
+        "to subscribe from outside Pakistan, please email us and we'll coordinate payment "
+        "directly."
     )
 else:
-    st.markdown(f"Send to: **{instr['number']}** ({instr['account_name']})")
+    st.markdown("### Submit a payment (PKR)")
 
-reference = st.text_input(
-    "Transaction ID / reference number",
-    help="The reference number from your JazzCash/Easypaisa/bank confirmation, so we can match your payment.",
-    key="_pay_reference",
-)
+    tier_choice = st.selectbox("Plan", payments.TIER_ORDER, format_func=lambda t: TIER_LABELS[t], key="_pay_tier")
+    amount = payments.TIER_PRICING[tier_choice]["pkr"][period_choice]
+    st.write(f"**Amount to send: PKR {amount:,}**")
 
-if st.button("Submit for review", key="_pay_submit"):
-    if not reference.strip():
-        st.error("Enter the transaction reference from your payment confirmation first.")
+    method_choice = st.radio(
+        "Payment method", list(payments.PAYMENT_INSTRUCTIONS.keys()),
+        format_func=lambda m: payments.PAYMENT_INSTRUCTIONS[m]["label"], horizontal=True, key="_pay_method",
+    )
+    instr = payments.PAYMENT_INSTRUCTIONS[method_choice]
+    if method_choice == "bank_transfer":
+        st.markdown(
+            f"Send to: **{instr['bank_name']}**, account **{instr['account_number']}**, "
+            f"name **{instr['account_name']}**"
+        )
     else:
-        try:
-            payments.submit_payment(
-                user_id, user_email, tier_choice, period_choice, method_choice, reference,
-            )
-            st.success(
-                "✅ Submitted — we'll confirm your payment and activate your plan, usually "
-                "within a day."
-            )
-        except Exception as e:
-            monitoring.capture(e)
-            st.error(f"Something went wrong submitting this: {e}")
+        st.markdown(f"Send to: **{instr['number']}** ({instr['account_name']})")
+
+    reference = st.text_input(
+        "Transaction ID / reference number",
+        help="The reference number from your JazzCash/Easypaisa/bank confirmation, so we can match your payment.",
+        key="_pay_reference",
+    )
+
+    if st.button("Submit for review", key="_pay_submit"):
+        if not reference.strip():
+            st.error("Enter the transaction reference from your payment confirmation first.")
+        else:
+            try:
+                payments.submit_payment(
+                    user_id, user_email, tier_choice, period_choice, "pkr", method_choice, reference,
+                )
+                st.success(
+                    "✅ Submitted — we'll confirm your payment and activate your plan, usually "
+                    "within a day."
+                )
+            except Exception as e:
+                monitoring.capture(e)
+                st.error(f"Something went wrong submitting this: {e}")

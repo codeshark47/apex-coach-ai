@@ -58,10 +58,11 @@ else:
     )
     for sub in pending:
         with st.container():
+            currency_symbol = "PKR " if sub["currency"] == "pkr" else "$"
             st.markdown(f"""
             <div class="submission-card">
             <b>{sub['user_email']}</b><br>
-            Plan: <b>{sub['tier_requested']}</b> ({sub['billing_period']}) — PKR {sub['amount_pkr']:,}<br>
+            Plan: <b>{sub['tier_requested'].title()}</b> ({sub['billing_period']}) — {currency_symbol}{sub['amount']:,}<br>
             Method: {sub['payment_method']}<br>
             Reference: <code>{sub['transaction_reference']}</code><br>
             Submitted: {sub['submitted_at'][:16].replace('T', ' ')}

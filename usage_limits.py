@@ -53,31 +53,33 @@ def _write_usage(client, user_id: str, used_count: int, today: str, extra: dict 
 
 def get_usage(user_id: str) -> dict:
     """
-    Returns {"used": int, "limit": int, "remaining": int} for this user,
-    for TODAY specifically. Creates a row with used=0 on first-ever call
-    for a given user, and resets used_count to 0 (persisted immediately,
-    not just returned) the first time this is called on a new day.
+    Returns {"used": int, "limit": int, "remaining": int} for this user.
 
-    limit is the GREATER of the row's stored free_limit (a manual
-    per-user override — e.g. the two demo-coach accounts set to 10, see
-    tests) and payments.effective_limit() (2026-08-17, a real
-    subscription tier). Two different override mechanisms, both real:
-    a manual grant should never be clawed back by a coach's tier being
-    "free," and a genuine paid subscription should never be capped by
-    whatever free_limit happened to be written when the row was first
-    created (that column predates paid tiers, written once at row-
-    creation time — without this max(), a coach who upgrades after
-    their row already exists would stay capped at day-one's limit).
+    BRANCHES ON SUBSCRIPTION TIER (2026-08-17): an ACTIVE PAID subscriber
+    is delegated entirely to payments.get_monthly_usage() — real pricing
+    is "N analyses PER MONTH," not per day, tracked on its own rolling
+    30-day window on the `subscriptions` table. Everything below this
+    check is the ORIGINAL free-tier daily-reset logic, unchanged from
+    before paid tiers existed — it only ever runs for free-tier coaches
+    now, so the per-user free_limit override (the two demo-coach
+    accounts, see tests) still works exactly as it always did.
+
+    For the free tier: creates a row with used=0 on first-ever call for
+    a given user, and resets used_count to 0 (persisted immediately, not
+    just returned) the first time this is called on a new day.
     """
     import payments
+    sub = payments.get_subscription(user_id)
+    if sub["tier"] != "free":
+        return payments.get_monthly_usage(user_id)
+
     client = get_client()
     result = client.table("demo_usage").select("*").eq("user_id", user_id).execute()
     today = date.today().isoformat()
-    tier_limit = payments.effective_limit(user_id)
 
     if result.data:
         row = result.data[0]
-        limit = max(row["free_limit"], tier_limit)
+        limit = row["free_limit"]
         # "usage_date" absent (pre-migration row/column) reads as None,
         # which is never == today — but with no date column to tell "new
         # day" apart from "column just doesn't exist," treating every
@@ -90,7 +92,7 @@ def get_usage(user_id: str) -> dict:
             used = row["used_count"]
     else:
         used = 0
-        limit = tier_limit
+        limit = DEFAULT_FREE_LIMIT
         _write_usage(client, user_id, used, today, extra={"user_id": user_id, "free_limit": limit})
 
     return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
@@ -98,11 +100,19 @@ def get_usage(user_id: str) -> dict:
 
 def record_usage(user_id: str) -> dict:
     """
-    Increments this user's used_count by 1 (for TODAY — get_usage above
-    already reset it if this is a new day) and returns the updated usage
+    Increments this user's usage by 1 and returns the updated usage
     dict. Call this ONLY after an analysis has genuinely completed
     successfully — never on a failed run or a mere button click.
+
+    Branches on subscription tier same as get_usage — an active paid
+    subscriber's usage is recorded against their monthly window, not
+    demo_usage's daily counter.
     """
+    import payments
+    sub = payments.get_subscription(user_id)
+    if sub["tier"] != "free":
+        return payments.record_monthly_usage(user_id)
+
     current = get_usage(user_id)  # ensures row exists and today's reset has happened
     client = get_client()
     new_used = current["used"] + 1
