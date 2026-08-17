@@ -4069,30 +4069,30 @@ with st.sidebar.expander("📐 Camera Positioning Guide", expanded=False):
 """)
 
 # ====================================================================
-# BALL TRACKING (ADMIN/EXPERIMENTAL — 2026-08-16)
+# BALL TRACKING (BETA — opened to all coaches 2026-08-17)
 #
-# Gated behind BOTH a hard code-level flag AND the existing admin
-# allowlist (usage_limits.is_admin), so it is invisible to every regular
-# coach account regardless of this flag's value — flip ENABLE_BALL_
-# TRACKING to False to kill the feature outright without touching the
-# gate logic itself.
+# Was admin-only through 2026-08-16 pending multi-clip validation; that
+# validation is done (see the project memory on ball-tracking strategy —
+# 5 real clips, clean single-subject footage tracks reliably). Opened up
+# to every signed-in coach behind just ENABLE_BALL_TRACKING now, a plain
+# kill-switch, not an allowlist — flip to False to pull the feature
+# without touching gate logic.
 #
-# Validated against 3 real clips before this UI was built (see the
-# project memory on ball-tracking strategy): 100% gapless, sub-3px
-# tracking on clean single-bowler footage in the SAME compression regime
-# real coaches actually upload through — but only ~33% partial coverage
-# on crowded, native-resolution footage (bowler + batter + onlookers).
-# This is NOT a general-purpose feature yet, which is the whole reason
-# it's admin-only rather than visible to every coach: shipping a
-# trajectory that works great on most uploads and silently stops partway
-# through the harder ones, unlabeled, would be presenting a partial
-# result as a complete one. The regime gap is disclosed directly below,
-# not hidden.
+# STILL A REAL, DISCLOSED LIMITATION, now surfaced directly in the UI
+# instead of solved by hiding the feature: this tracker can lock onto
+# the wrong object and never recover on cluttered/crowded footage (2+
+# people, busy background) — confirmed on a real coach-uploaded clip
+# 2026-08-16, and three different same-night fix attempts for it were
+# each caught by testing and reverted rather than shipped half-working.
+# The honest scope is "clean, single-subject footage" — the guidance
+# block below sets that expectation BEFORE a coach uploads, and the
+# post-run warning below catches it after, rather than presenting a
+# partial/wrong trail as a finished result either way.
 #
 # Deliberately its OWN, fully self-contained upload/seed/run flow — does
 # NOT reuse the bowling-analysis video already in session state, so
-# there is zero chance of this experimental code path interfering with
-# the proven, live bowling/batting analysis flows above it.
+# there is zero chance of this code path interfering with the proven,
+# live bowling/batting analysis flows above it.
 # ====================================================================
 ENABLE_BALL_TRACKING = True
 
@@ -4103,24 +4103,33 @@ def render_ball_tracking_admin_panel():
     auth_user = st.session_state.get("auth_user")
     if not auth_user:
         return
-    import usage_limits
-    if not usage_limits.is_admin(auth_user.get("email", "")):
-        return
 
     st.sidebar.divider()
-    show = st.sidebar.checkbox("🧪 Ball Tracking (Admin/Experimental)", key="_bt_show", value=False)
+    show = st.sidebar.checkbox("🎯 Ball Tracking (Beta)", key="_bt_show", value=False)
     if not show:
         return
 
     st.divider()
-    st.header("🧪 Ball Trajectory Tracking — Admin/Experimental")
+    st.header("🎯 Ball Trajectory Tracking (Beta)")
     st.caption(
-        "Not visible to regular coach accounts. Validated at 100% gapless accuracy on "
-        "clean, single-bowler footage in the same compression regime most uploads already "
-        "use — but only partial coverage on crowded or native-resolution clips (bowler + "
-        "batter + onlookers in frame). See the ball-tracking project memory for the full "
-        "real-clip validation this is based on."
+        "Follows the ball forward from a point you click, drawing its real tracked path — "
+        "never a guessed or smoothed-over one. Works best on **one bowler, minimal "
+        "background clutter** (nets, a clear pitch). On busier footage (a batter and "
+        "onlookers also in frame) it can lose the real ball and lock onto the wrong object "
+        "— if that happens, the result below will say so rather than show it as if it "
+        "were reliable."
     )
+    with st.expander("Tips for a clean result"):
+        st.markdown(
+            "- Film **one bowler only** in frame if possible — extra people (a batter, "
+            "onlookers) are the main thing that trips this up\n"
+            "- A plain background (net, open pitch) works better than a busy one "
+            "(crowd, other players, cluttered signage)\n"
+            "- Click the seed point on a frame where the ball is clearly, sharply "
+            "visible — not mid-blur\n"
+            "- This is a beta feature — no ball speed or pitch-map yet, just the "
+            "tracked path"
+        )
 
     uploaded = st.file_uploader(
         "Upload a clip to test tracking on", type=["mp4", "mov"], key="_bt_upload"
@@ -4200,6 +4209,22 @@ def render_ball_tracking_admin_panel():
             "Lost the trail early — likely a harder clip (crowded scene, native "
             "resolution, or fast/blurred release). Real, disclosed limitation, not a bug."
         )
+    # A LONG span is NOT proof of a correct trail (2026-08-16, real coach
+    # clip): a tracker that locks onto the wrong object can keep
+    # "succeeding" against ITSELF for dozens of frames, producing a
+    # confident-looking span while wrong for a real stretch in the
+    # middle — traced and confirmed on a real clip that reached a 59-
+    # frame span while badly wrong for ~24 of those frames. There's no
+    # reliable automatic signal for this yet (three same-night attempts
+    # to build one were each caught by testing and reverted), so the
+    # honest thing is asking a human to look, not implying a long run
+    # means a trustworthy one.
+    st.info(
+        "👀 Always compare the yellow trail below against the real ball in the video, "
+        "even on a long tracked span — a confident-looking trail can still be locked "
+        "onto the wrong object for part of the clip, especially with more than one "
+        "person in frame."
+    )
 
     out_path = os.path.join("input", f"_bt_trajectory_{uploaded.name}.mp4")
     _render_trajectory_with_fade(ref_path, points, out_path)

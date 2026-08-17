@@ -9,6 +9,7 @@ gets reset to 0 before being read OR incremented, using a fake Supabase
 client so no real network/Supabase project is needed to run them.
 """
 
+from contextlib import contextmanager
 from datetime import date, timedelta
 from unittest.mock import patch
 
@@ -66,8 +67,20 @@ class _FakeClient:
         return _FakeTable(self.store)
 
 
+@contextmanager
 def _patched_client(store):
-    return patch("usage_limits.get_client", return_value=_FakeClient(store))
+    """Also patches payments.get_client (2026-08-17) — get_usage() now
+    calls payments.effective_limit(), a separate name binding of the
+    same underlying profile_store.get_client, which the old single-patch
+    version left unmocked. Without this, these tests silently made a
+    real network call to the live Supabase project (harmless — it just
+    hit a graceful fallback for a table that doesn't exist yet — but not
+    a real unit test anymore). An empty store (no subscription rows) is
+    fine: payments.get_subscription's own "no rows" path already returns
+    the free tier by default."""
+    with patch("usage_limits.get_client", return_value=_FakeClient(store)), \
+         patch("payments.get_client", return_value=_FakeClient({})):
+        yield
 
 
 class TestDailyReset:
@@ -150,7 +163,8 @@ class TestDailyReset:
             def table(self, _name):
                 return _NoUsageDateColumnTable(self.store)
 
-        with patch("usage_limits.get_client", return_value=_NoUsageDateColumnClient(store)):
+        with patch("usage_limits.get_client", return_value=_NoUsageDateColumnClient(store)), \
+             patch("payments.get_client", return_value=_FakeClient({})):
             result = ul.get_usage("new-coach")
         assert result == {"used": 0, "limit": ul.DEFAULT_FREE_LIMIT, "remaining": ul.DEFAULT_FREE_LIMIT}
         assert store["new-coach"]["used_count"] == 0

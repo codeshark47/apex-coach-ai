@@ -57,14 +57,27 @@ def get_usage(user_id: str) -> dict:
     for TODAY specifically. Creates a row with used=0 on first-ever call
     for a given user, and resets used_count to 0 (persisted immediately,
     not just returned) the first time this is called on a new day.
+
+    limit is the GREATER of the row's stored free_limit (a manual
+    per-user override — e.g. the two demo-coach accounts set to 10, see
+    tests) and payments.effective_limit() (2026-08-17, a real
+    subscription tier). Two different override mechanisms, both real:
+    a manual grant should never be clawed back by a coach's tier being
+    "free," and a genuine paid subscription should never be capped by
+    whatever free_limit happened to be written when the row was first
+    created (that column predates paid tiers, written once at row-
+    creation time — without this max(), a coach who upgrades after
+    their row already exists would stay capped at day-one's limit).
     """
+    import payments
     client = get_client()
     result = client.table("demo_usage").select("*").eq("user_id", user_id).execute()
     today = date.today().isoformat()
+    tier_limit = payments.effective_limit(user_id)
 
     if result.data:
         row = result.data[0]
-        limit = row["free_limit"]
+        limit = max(row["free_limit"], tier_limit)
         # "usage_date" absent (pre-migration row/column) reads as None,
         # which is never == today — but with no date column to tell "new
         # day" apart from "column just doesn't exist," treating every
@@ -77,7 +90,7 @@ def get_usage(user_id: str) -> dict:
             used = row["used_count"]
     else:
         used = 0
-        limit = DEFAULT_FREE_LIMIT
+        limit = tier_limit
         _write_usage(client, user_id, used, today, extra={"user_id": user_id, "free_limit": limit})
 
     return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
