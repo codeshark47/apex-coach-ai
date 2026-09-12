@@ -101,6 +101,8 @@ _BOWLING_METRIC_FRAMES = {
     "hip_shoulder_separation": ["ffc"],  # always DESCRIPTIVE (see metric_ranges._ALWAYS_DESCRIPTIVE_METRICS) — never actually flags, kept for completeness
     "release_height": ["release"],
     "head_stability": ["bfc", "release"],  # a whole-window (BFC->BR) metric — shown on both bookends rather than forced onto one arbitrary frame
+    "rear_knee_angle": ["bfc"],  # computed from the BFC row (see orchestrator.py's bfc_row extraction)
+    "rear_hip_flexion": ["bfc"],  # same BFC row — real >30-degree injury-risk threshold, see kinematics.calculate_rear_hip_flexion
 }
 
 _BATTING_METRIC_FRAMES = {
@@ -201,6 +203,13 @@ def _bowling_metric_anchor(metric_key, row, width, height, lead_side, bowl_side)
         return _landmark_px(row, f"{bowl_side}_WRIST", width, height)
     if metric_key == "head_stability":
         return _landmark_px(row, "NOSE", width, height)
+    if metric_key == "rear_knee_angle":
+        # bowl_side doubles as the trail/rear leg's side — the trail leg
+        # is always the SAME side as the bowling arm (see orchestrator.py's
+        # trail_side computation), so no separate parameter is needed.
+        return _landmark_px(row, f"{bowl_side}_KNEE", width, height)
+    if metric_key == "rear_hip_flexion":
+        return _landmark_px(row, f"{bowl_side}_HIP", width, height)
     return None
 
 

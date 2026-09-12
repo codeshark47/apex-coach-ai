@@ -9,7 +9,9 @@ from main import extract_video_landmarks, extract_raw_landmarks_window
 from kinematics import (
     calculate_knee_bracing,
     calculate_trunk_lean,
-    calculate_head_stability
+    calculate_head_stability,
+    calculate_rear_knee_angle,
+    calculate_rear_hip_flexion,
 )
 import camera_angle_detection as cad
 
@@ -2001,7 +2003,7 @@ def run_complete_bowling_analysis(video_path: str,
                                    bowler_type: str = None) -> dict:
     """
     Core orchestration loop.
-    Extracts landmarks, detects events, calculates all 5 biomechanical
+    Extracts landmarks, detects events, calculates all 7 biomechanical
     metrics, generates annotated video, and returns unified payload.
 
     seed_point/seed_frame_index: optional coach click identifying the
@@ -2076,11 +2078,35 @@ def run_complete_bowling_analysis(video_path: str,
         }
     br_row = br_rows.iloc[0]
     lead_side = "left" if bowling_arm == "right" else "right"
+    # The TRAIL (rear/back) leg is always the SAME side as the bowling
+    # arm — opposite the lead leg above (matches lead_side/bowl_side's
+    # existing convention throughout this file).
+    trail_side = "right" if bowling_arm == "right" else "left"
+    _trail_upper = "RIGHT" if trail_side == "right" else "LEFT"
+    # Soft/best-effort lookup, unlike ffc_row/br_row above: a brief
+    # single-frame tracking dropout on the trail leg's landmarks right at
+    # BFC (a real, common occlusion moment — that's the foot that's
+    # actively landing) shouldn't take down the whole analysis the way a
+    # missing FFC/BR row does, since these two new metrics are the ONLY
+    # things that need this row. Falls back to None (both new metrics
+    # then read as "Tracking Drop"/unavailable) rather than failing.
+    bfc_row = _nearest_complete_row(
+        df, events["BFC"],
+        [f"{_trail_upper}_HIP_x", f"{_trail_upper}_HIP_y",
+         f"{_trail_upper}_KNEE_x", f"{_trail_upper}_KNEE_y",
+         f"{_trail_upper}_ANKLE_x", f"{_trail_upper}_ANKLE_y"],
+    )
 
     # STAGE 4 — METRIC CALCULATIONS
     knee_analysis = calculate_knee_bracing(ffc_row, lead_side=lead_side)
     knee_at_release = calculate_knee_bracing(br_row, lead_side=lead_side)
     lean_analysis = calculate_trunk_lean(br_row)
+    if bfc_row is not None:
+        rear_knee_analysis = calculate_rear_knee_angle(bfc_row, trail_side=trail_side)
+        rear_hip_flexion_analysis = calculate_rear_hip_flexion(bfc_row, trail_side=trail_side)
+    else:
+        rear_knee_analysis = {"degrees": None, "tier": "Tracking Drop", "status": "error"}
+        rear_hip_flexion_analysis = {"degrees": None, "tier": "Tracking Drop", "status": "error"}
     # RAW RE-EXTRACTION (2026-08-08): same dilution problem/fix as
     # release_height's _refine_release_landmarks_raw above, applied to
     # head_stability's whole BFC-BR window instead of two single frames —
@@ -2287,6 +2313,16 @@ def run_complete_bowling_analysis(video_path: str,
                 "yield_status": knee_delta_status
             },
             "hip_shoulder_separation": hip_separation,
+            "rear_knee_angle": {
+                "degrees": rear_knee_analysis.get("degrees"),
+                "tier": rear_knee_analysis.get("tier", "Unknown"),
+                "status": rear_knee_analysis.get("status", "error"),
+            },
+            "rear_hip_flexion": {
+                "degrees": rear_hip_flexion_analysis.get("degrees"),
+                "tier": rear_hip_flexion_analysis.get("tier", "Unknown"),
+                "status": rear_hip_flexion_analysis.get("status", "error"),
+            },
             "bowling_arm_detected": bowling_arm,
             "release_height": {
                 "ratio": release_height.get("ratio"),

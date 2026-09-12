@@ -58,6 +58,17 @@ class TestAnchorResolution:
         nose = diag._bowling_metric_anchor("head_stability", row, w, h, "LEFT", "RIGHT")
         assert nose == (int(0.50 * w), int(0.20 * h))
 
+    def test_rear_leg_anchors_use_bowl_side_not_lead_side(self):
+        """rear_knee_angle/rear_hip_flexion anchor on the TRAIL leg, which
+        bowl_side already represents (same side as the bowling arm) --
+        no separate trail_side parameter needed."""
+        row = _standing_row()
+        w, h = 1000, 1000
+        rear_knee = diag._bowling_metric_anchor("rear_knee_angle", row, w, h, "LEFT", "RIGHT")
+        assert rear_knee == (int(0.55 * w), int(0.70 * h))  # bowl_side="RIGHT" -> RIGHT_KNEE
+        rear_hip = diag._bowling_metric_anchor("rear_hip_flexion", row, w, h, "LEFT", "RIGHT")
+        assert rear_hip == (int(0.54 * w), int(0.55 * h))  # bowl_side="RIGHT" -> RIGHT_HIP
+
     def test_midpoint_anchor_is_between_both_landmarks(self):
         row = _standing_row()
         w, h = 1000, 1000
@@ -295,3 +306,22 @@ class TestMetricsByFrame:
         entries = [e for e in per_frame["release"] if e[0] == "trunk_lean"]
         assert len(entries) == 1
         assert entries[0][2] == "unknown"
+
+    def test_rear_leg_metrics_are_mapped_to_bfc_only(self):
+        per_frame = diag._metrics_by_frame(
+            diag._BOWLING_METRIC_FRAMES,
+            {"rear_knee_angle": {"degrees": 150.0}, "rear_hip_flexion": {"degrees": 35.0}},
+            None, ["bfc", "ffc", "release"])
+        assert any(e[0] == "rear_knee_angle" for e in per_frame["bfc"])
+        assert any(e[0] == "rear_hip_flexion" for e in per_frame["bfc"])
+        assert not any(e[0] == "rear_knee_angle" for e in per_frame["ffc"])
+        assert not any(e[0] == "rear_hip_flexion" for e in per_frame["release"])
+
+        rear_hip_entry = [e for e in per_frame["bfc"] if e[0] == "rear_hip_flexion"][0]
+        _, value, tier, eligible = rear_hip_entry
+        assert tier == "red"
+        assert eligible is True  # rear_hip_flexion is a real scored metric, unlike rear_knee_angle
+
+        rear_knee_entry = [e for e in per_frame["bfc"] if e[0] == "rear_knee_angle"][0]
+        assert rear_knee_entry[2] == "descriptive"
+        assert rear_knee_entry[3] is False

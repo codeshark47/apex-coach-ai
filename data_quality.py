@@ -16,7 +16,7 @@ Without a guard, the app would:
 This module doesn't try to invalidate individual implausible values (that
 would require physiologically-validated bounds we don't have a source for —
 exactly the kind of fabricated threshold Claude was told to avoid). Instead
-it uses an objective, unfakeable signal: how many of the 5 metrics failed to
+it uses an objective, unfakeable signal: how many of the 7 metrics failed to
 compute at all in this same run. If tracking broke down badly enough to lose
 several metrics, the ones that "succeeded" numerically are not trustworthy
 either, since they came from the same degraded landmark stream.
@@ -24,7 +24,13 @@ either, since they came from the same degraded landmark stream.
 
 import metric_ranges as mr
 
-LOW_CONFIDENCE_THRESHOLD = 3  # out of 5 metrics — tune based on real-world data, not guessed science
+# Scaled up (2026-09-XX) from the original 5-metric set's "3 out of 5" (60%)
+# to keep roughly the same bar now that rear_knee_angle/rear_hip_flexion
+# bring the bowling total to 7 — same ~60% ratio (3/5 = 60% -> 4/7 = 57%,
+# close enough not to need its own tuning pass), matching the exact
+# reasoning BATTING_LOW_CONFIDENCE_THRESHOLD below already used when
+# batting shipped with 7 metrics from the start.
+LOW_CONFIDENCE_THRESHOLD = 4  # out of 7 metrics — tune based on real-world data, not guessed science
 
 # Batting's own threshold (2026-08-15): scaled proportionally to keep
 # roughly the same ~60% bar bowling uses, now that there are 7 metrics

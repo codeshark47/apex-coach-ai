@@ -1844,7 +1844,7 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
                                      fontName='Helvetica-Bold')
         missing_labels = [mr.RANGES[k].label for k in quality["missing_metrics"]]
         story.append(Paragraph(
-            f"⚠ LOW TRACKING CONFIDENCE: {quality['missing_count']} of 5 metrics "
+            f"⚠ LOW TRACKING CONFIDENCE: {quality['missing_count']} of 7 metrics "
             f"failed to compute ({', '.join(missing_labels)}). Remaining values in "
             f"this report came from the same degraded tracking and should not be "
             f"treated as reliable. Re-shoot this delivery before acting on these results.",
@@ -2869,7 +2869,7 @@ if (camera_mode == "Single Camera" and uploaded_single is not None and single_se
                         "This changes what Trunk Lean and Head Stability actually measure.")
             elif angle_estimate.angle == "side_on":
                 st.success(f"Detected: **side-on** (shoulder ratio {angle_estimate.ratio}) — "
-                           f"the best-supported angle for all 5 metrics. Confirm or correct below.")
+                           f"the best-supported angle for all 7 metrics. Confirm or correct below.")
             else:
                 st.warning(f"📐 {angle_estimate.confidence_note} (shoulder-width ratio: {angle_estimate.ratio}) "
                            f"— front and rear look nearly identical from pose data alone, so please "
@@ -3459,7 +3459,7 @@ if st.session_state.get("pending_result_payload") is not None:
                 missing_labels = [mr.RANGES[k].label for k in quality["missing_metrics"]]
                 st.error(
                     f"⚠️ Low tracking confidence on this clip — "
-                    f"{quality['missing_count']} of 5 metrics failed to compute "
+                    f"{quality['missing_count']} of 7 metrics failed to compute "
                     f"({', '.join(missing_labels)}). This usually means motion blur, "
                     f"occlusion, or the bowler leaving frame during this delivery. "
                     f"Any remaining numeric values below came from the same degraded "
@@ -3468,7 +3468,7 @@ if st.session_state.get("pending_result_payload") is not None:
                 )
 
             # --- RELEASE-FRAME CONFIDENCE GUARD ---
-            # Separate from the guard above: this clip can have all 5 metrics
+            # Separate from the guard above: this clip can have all 7 metrics
             # compute "successfully" and still have an unreliable release
             # frame, because the arm moves fastest (and blurs most) at the
             # exact instant it's trying to pinpoint. Verified directly: the
@@ -3726,6 +3726,8 @@ if st.session_state.get("pending_result_payload") is not None:
                 trunk_deg = mr.extract_metric_value(metrics, "trunk_lean")
                 rel_ratio = mr.extract_metric_value(metrics, "release_height")
                 head_val = mr.extract_metric_value(metrics, "head_stability")
+                rear_knee_deg = mr.extract_metric_value(metrics, "rear_knee_angle")
+                rear_hip_deg = mr.extract_metric_value(metrics, "rear_hip_flexion")
 
                 def ui_deg(val):
                     return f"{round(float(val), 1)}°" if val is not None else "N/A"
@@ -3869,6 +3871,18 @@ if st.session_state.get("pending_result_payload") is not None:
                     with st.expander("🔧 Debug Info — Release Height Ratio"):
                         st.json(rel_debug)
 
+                st.write("")
+                m6, m7 = st.columns(2)
+                m6.metric("Rear Knee Angle (BFC)", ui_deg(rear_knee_deg),
+                           _tier_caption("rear_knee_angle", metrics.get('rear_knee_angle', {}).get('tier', 'N/A'), rear_knee_deg))
+                m7.metric("Rear Hip Flexion (BFC)", ui_deg(rear_hip_deg),
+                           _tier_caption("rear_hip_flexion", metrics.get('rear_hip_flexion', {}).get('tier', 'N/A'), rear_hip_deg))
+                if rear_hip_deg is not None and float(rear_hip_deg) > 30.0:
+                    m7.caption(
+                        "⚠️ Above the 30° threshold associated with significantly higher lumbar "
+                        "bone stress injury risk (Alway, Felton, Brooke-Wavell, Peirce & King, 2021)."
+                    )
+
 
 
                 if resolved_angle in ("rear", "front", "unknown"):
@@ -3903,6 +3917,8 @@ if st.session_state.get("pending_result_payload") is not None:
                         "trunk_lean": trunk_deg,
                         "release_height": rel_ratio,
                         "head_stability": head_val,
+                        "rear_knee_angle": rear_knee_deg,
+                        "rear_hip_flexion": rear_hip_deg,
                     }
                     dot = {"green": "🟢", "amber": "🟡", "red": "🔴", "unknown": "⚪", "descriptive": "🔵"}
                     for key in mr.all_metric_keys():

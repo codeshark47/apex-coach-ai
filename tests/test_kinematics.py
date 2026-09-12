@@ -204,6 +204,136 @@ class TestHeadStability:
         assert result["tier"] == "Tracking Drop"
 
 
+class TestRearKneeAngle:
+    def test_degenerate_denominator_returns_none_not_zero(self):
+        row = _row(RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.5,
+                    RIGHT_KNEE_x=0.6, RIGHT_KNEE_y=0.5,
+                    RIGHT_ANKLE_x=0.6, RIGHT_ANKLE_y=0.5)
+        result = k.calculate_rear_knee_angle(row, trail_side="right")
+        assert result["degrees"] is None
+        assert result["status"] == "error"
+
+    def test_missing_column_returns_none_not_zero(self):
+        row = pd.Series({"RIGHT_HIP_x": 0.6})
+        result = k.calculate_rear_knee_angle(row, trail_side="right")
+        assert result["degrees"] is None
+        assert result["status"] == "error"
+
+    def test_extended_rear_knee_tier(self):
+        row = _row(RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.3,
+                    RIGHT_KNEE_x=0.6, RIGHT_KNEE_y=0.6,
+                    RIGHT_ANKLE_x=0.6, RIGHT_ANKLE_y=0.9)
+        result = k.calculate_rear_knee_angle(row, trail_side="right")
+        assert result["status"] == "success"
+        assert result["degrees"] >= 170.0
+        assert result["tier"] == "Extended Rear Knee"
+
+    def test_flexed_rear_knee_tier(self):
+        row = _row(RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.3,
+                    RIGHT_KNEE_x=0.6, RIGHT_KNEE_y=0.6,
+                    RIGHT_ANKLE_x=0.75, RIGHT_ANKLE_y=0.55)
+        result = k.calculate_rear_knee_angle(row, trail_side="right")
+        assert result["status"] == "success"
+        assert result["degrees"] < 170.0
+        assert result["tier"] == "Flexed Rear Knee"
+
+    def test_trail_side_left_for_left_arm_bowler(self):
+        """A left-arm bowler's trail (rear) leg is the LEFT leg — same
+        opposite-of-lead convention as calculate_knee_bracing's own
+        lead_side test above, mirrored for the trail leg."""
+        row = _row(LEFT_HIP_x=0.5, LEFT_HIP_y=0.3,
+                    LEFT_KNEE_x=0.5, LEFT_KNEE_y=0.6,
+                    LEFT_ANKLE_x=0.5, LEFT_ANKLE_y=0.9,
+                    # RIGHT leg deliberately degenerate — if the function
+                    # measured the wrong leg, this test would fail loudly
+                    RIGHT_HIP_x=0.1, RIGHT_HIP_y=0.1,
+                    RIGHT_KNEE_x=0.1, RIGHT_KNEE_y=0.1,
+                    RIGHT_ANKLE_x=0.1, RIGHT_ANKLE_y=0.1)
+        result = k.calculate_rear_knee_angle(row, trail_side="left")
+        assert result["status"] == "success"
+        assert result["degrees"] >= 165.0
+
+
+def _hip_flexion_row(**overrides):
+    """A minimally valid landmark row for the RIGHT trail hip/knee and
+    both shoulders, with the hip directly below the shoulder midpoint
+    and the knee directly below the hip — a neutral (0-degree flexion)
+    starting position — override individual fields per test."""
+    base = {
+        "LEFT_SHOULDER_x": 0.5, "LEFT_SHOULDER_y": 0.2,
+        "RIGHT_SHOULDER_x": 0.7, "RIGHT_SHOULDER_y": 0.2,
+        "RIGHT_HIP_x": 0.6, "RIGHT_HIP_y": 0.5,
+        "RIGHT_KNEE_x": 0.6, "RIGHT_KNEE_y": 0.7,
+    }
+    base.update(overrides)
+    return pd.Series(base)
+
+
+class TestRearHipFlexion:
+    def test_degenerate_denominator_returns_none_not_zero(self):
+        row = _hip_flexion_row(RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.5,
+                                RIGHT_KNEE_x=0.6, RIGHT_KNEE_y=0.5,
+                                LEFT_SHOULDER_x=0.6, LEFT_SHOULDER_y=0.5,
+                                RIGHT_SHOULDER_x=0.6, RIGHT_SHOULDER_y=0.5)
+        result = k.calculate_rear_hip_flexion(row, trail_side="right")
+        assert result["degrees"] is None
+        assert result["status"] == "error"
+
+    def test_missing_column_returns_none_not_zero(self):
+        row = pd.Series({"RIGHT_HIP_x": 0.6})
+        result = k.calculate_rear_hip_flexion(row, trail_side="right")
+        assert result["degrees"] is None
+        assert result["status"] == "error"
+
+    def test_neutral_upright_position_reports_zero_flexion(self):
+        """Shoulder midpoint directly above the hip, knee directly below
+        it (a straight vertical line) — the real 0-degree-flexion
+        boundary case."""
+        row = _hip_flexion_row(LEFT_SHOULDER_x=0.5, RIGHT_SHOULDER_x=0.7,  # midpoint x = 0.6, matches hip_x
+                                RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.5,
+                                RIGHT_KNEE_x=0.6, RIGHT_KNEE_y=0.7)
+        result = k.calculate_rear_hip_flexion(row, trail_side="right")
+        assert result["status"] == "success"
+        assert result["degrees"] == 0.0
+        assert result["tier"] == "Within Typical Range"
+
+    def test_elevated_flexion_above_30_degrees_flags_injury_risk(self):
+        """Knee driven forward relative to the hip (a real hip-flexed
+        position at BFC) — the exact real research threshold this
+        metric exists to score (Alway, Felton, Brooke-Wavell, Peirce &
+        King, 2021): >30 degrees of rear hip flexion at BFC."""
+        row = _hip_flexion_row(LEFT_SHOULDER_x=0.5, RIGHT_SHOULDER_x=0.7,
+                                RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.5,
+                                RIGHT_KNEE_x=0.5, RIGHT_KNEE_y=0.6)
+        result = k.calculate_rear_hip_flexion(row, trail_side="right")
+        assert result["status"] == "success"
+        assert result["degrees"] > 30.0
+        assert result["tier"] == "Elevated Injury-Risk Loading"
+
+    def test_implausibly_extreme_flexion_flagged_as_unreliable(self):
+        """A reading this extreme (thigh folded most of the way back
+        toward the trunk) is not a real grounded BFC position — almost
+        always a landmark mix-up. Must flag as unreliable, not report a
+        fabricated extreme number as real technique."""
+        row = _hip_flexion_row(LEFT_SHOULDER_x=0.5, RIGHT_SHOULDER_x=0.7,
+                                RIGHT_HIP_x=0.6, RIGHT_HIP_y=0.5,
+                                RIGHT_KNEE_x=0.62, RIGHT_KNEE_y=0.3)
+        result = k.calculate_rear_hip_flexion(row, trail_side="right")
+        assert result["status"] == "error"
+        assert "implausible" in result["tier"].lower()
+
+    def test_trail_side_left_for_left_arm_bowler(self):
+        row = _hip_flexion_row(LEFT_SHOULDER_x=0.3, RIGHT_SHOULDER_x=0.5,
+                                LEFT_HIP_x=0.4, LEFT_HIP_y=0.5,
+                                LEFT_KNEE_x=0.4, LEFT_KNEE_y=0.7,
+                                # RIGHT leg deliberately degenerate
+                                RIGHT_HIP_x=0.1, RIGHT_HIP_y=0.1,
+                                RIGHT_KNEE_x=0.1, RIGHT_KNEE_y=0.1)
+        result = k.calculate_rear_hip_flexion(row, trail_side="left")
+        assert result["status"] == "success"
+        assert result["degrees"] == 0.0
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

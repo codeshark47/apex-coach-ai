@@ -155,6 +155,65 @@ class TestAlwaysDescriptiveMetrics:
         assert "Senington" in note
 
 
+class TestRearHipFlexionScoring:
+    """rear_hip_flexion: green=(0,25), amber=(25,30) — a genuinely SCORED
+    metric (unlike rear_knee_angle below), real threshold from Alway,
+    Felton, Brooke-Wavell, Peirce & King (2021, Medicine & Science in
+    Sports & Exercise 53:581-589): >30 degrees of rear hip flexion at
+    Back Foot Contact is associated with significantly higher risk of
+    lumbar bone stress injury. Only the 30-degree line itself is cited;
+    the 25-degree amber floor is an engineering buffer (see
+    kinematics.calculate_rear_hip_flexion's docstring)."""
+
+    def test_green_at_zero(self):
+        assert mr.classify("rear_hip_flexion", 0.0) == "green"
+
+    def test_green_at_upper_boundary(self):
+        assert mr.classify("rear_hip_flexion", 25.0) == "green"
+
+    def test_amber_band(self):
+        assert mr.classify("rear_hip_flexion", 28.0) == "amber"
+
+    def test_amber_upper_boundary_is_amber_not_red(self):
+        assert mr.classify("rear_hip_flexion", 30.0) == "amber"
+
+    def test_above_the_real_cited_threshold_is_red(self):
+        """The one real, cited number in this whole metric — must
+        classify as the elevated-risk tier."""
+        assert mr.classify("rear_hip_flexion", 30.1) == "red"
+        assert mr.classify("rear_hip_flexion", 45.0) == "red"
+
+    def test_has_validated_range_is_true(self):
+        """Unlike rear_knee_angle, this one IS a real scored metric —
+        not in _ALWAYS_DESCRIPTIVE_METRICS."""
+        assert mr.has_validated_range("rear_hip_flexion", None) is True
+
+    def test_is_critical_and_eligible_above_threshold(self):
+        assert mr.is_critical_and_eligible("rear_hip_flexion", 35.0) is True
+        assert mr.is_critical_and_eligible("rear_hip_flexion", 20.0) is False
+
+
+class TestRearKneeAngleAlwaysDescriptive:
+    """rear_knee_angle: always DESCRIPTIVE (see _ALWAYS_DESCRIPTIVE_METRICS)
+    — real research shows this differs between injured/non-injured
+    bowlers, but no clean, precise degree threshold with a verified angle
+    convention could be found (kinematics.calculate_rear_knee_angle's
+    docstring) — same treatment as front_knee_bracing."""
+
+    def test_always_descriptive_regardless_of_value(self):
+        assert mr.classify("rear_knee_angle", 175.0) == "descriptive"
+        assert mr.classify("rear_knee_angle", 120.0) == "descriptive"
+
+    def test_has_validated_range_is_false(self):
+        assert mr.has_validated_range("rear_knee_angle", None) is False
+
+    def test_never_eligible_even_if_numerically_extreme(self):
+        assert mr.is_critical_and_eligible("rear_knee_angle", 100.0) is False
+
+    def test_missing_value_is_unknown_not_descriptive(self):
+        assert mr.classify("rear_knee_angle", None) == "unknown"
+
+
 class TestTrunkLeanReversedDirection:
     """DIRECTION FIX (2026-08-06): trunk_lean used to score less forward
     lean as better (lower_better, green 0-20deg). Real research (Elliott
@@ -227,6 +286,14 @@ class TestExtractMetricValue:
 
     def test_missing_metric_dict_returns_none(self):
         assert mr.extract_metric_value({}, "trunk_lean") is None
+
+    def test_extracts_rear_knee_and_hip_flexion(self):
+        metrics = {
+            "rear_knee_angle": {"degrees": 140.0},
+            "rear_hip_flexion": {"degrees": 22.5},
+        }
+        assert mr.extract_metric_value(metrics, "rear_knee_angle") == 140.0
+        assert mr.extract_metric_value(metrics, "rear_hip_flexion") == 22.5
 
 
 class TestDescribeRangeMatchesClassify:
@@ -372,6 +439,26 @@ class TestBowlerTypeClassification:
         160-180 band description."""
         assert mr.describe_range("front_knee_bracing") == mr.describe_range("front_knee_bracing", None)
         assert "Portus" in mr.describe_range("front_knee_bracing")
+
+
+class TestAllMetricKeys:
+    def test_bowling_now_includes_the_two_rear_leg_metrics(self):
+        """2026-09-XX: bowling grew from 5 to 7 metrics (rear_knee_angle,
+        rear_hip_flexion) — regression test so a future edit can't
+        silently drop either from the coaching report/PDF/UI, all of
+        which iterate this list rather than a separate hardcoded one."""
+        keys = mr.all_metric_keys()
+        assert "rear_knee_angle" in keys
+        assert "rear_hip_flexion" in keys
+        assert len(keys) == 7
+
+    def test_batting_keys_are_unaffected(self):
+        """Adding bowling metrics to RANGES must never leak into batting's
+        explicitly separate key list."""
+        keys = mr.all_batting_metric_keys()
+        assert "rear_knee_angle" not in keys
+        assert "rear_hip_flexion" not in keys
+        assert len(keys) == 7
 
 
 class TestIsCriticalAndEligible:

@@ -210,6 +210,44 @@ RANGES = {
         amber=(0.08, 0.15),
         display_optimal="0.00–0.08",
     ),
+    # NEW (2026-09-XX): rear/trail knee angle at Back Foot Contact — same
+    # Law-of-Cosines technique as front_knee_bracing, applied to the
+    # opposite (trail) leg. Always DESCRIPTIVE (see
+    # _ALWAYS_DESCRIPTIVE_METRICS below) — real research (Bayne et al.
+    # 2016, cited in later lumbar-bone-stress-injury systematic reviews)
+    # shows this differs between injured/non-injured bowlers, but no
+    # clean, precise degree threshold with a verified angle convention
+    # could be found despite real effort (three primary sources checked,
+    # all paywalled or silent on the specific number). Bounds below are
+    # DEAD for classification, kept only so label/unit/display_optimal
+    # resolve — same pattern as front_knee_bracing's own dead bounds.
+    "rear_knee_angle": MetricRange(
+        label="Rear Knee Angle (BFC)",
+        unit="°",
+        kind="higher_better",
+        green=(160.0, 180.0),
+        amber=(145.0, 160.0),
+        display_optimal="No validated benchmark — reported as a measurement only",
+    ),
+    # NEW (2026-09-XX): rear/trail hip flexion at Back Foot Contact — a
+    # genuinely SCORED metric (unlike rear_knee_angle above), real
+    # research backing: Alway, Felton, Brooke-Wavell, Peirce & King
+    # (2021), "Cricket Fast Bowling Technique and Lumbar Bone Stress
+    # Injury", Medicine & Science in Sports & Exercise 53:581-589 — >30
+    # degrees of rear hip flexion at BFC is associated with significantly
+    # higher risk of lumbar bone stress injury. Only the 30-degree line
+    # itself is the cited threshold; the green/amber split below it is an
+    # engineering buffer (matches orchestrator.py's KNEE_ANGLE_
+    # IMPLAUSIBLE_THRESHOLD precedent for an honestly-labeled non-cited
+    # buffer), not itself a separately cited number.
+    "rear_hip_flexion": MetricRange(
+        label="Rear Hip Flexion (BFC)",
+        unit="°",
+        kind="lower_better",
+        green=(0.0, 25.0),
+        amber=(25.0, 30.0),
+        display_optimal="<25° (>30° = elevated lumbar bone stress injury risk)",
+    ),
 
     # --- BATTING METRICS (2026-08-03) ---
     # Namespaced with a "batting_" prefix, deliberately, so they can never
@@ -383,7 +421,7 @@ _SPIN_BOWLER_TYPES = ("finger_spin", "wrist_spin")
 # "descriptive" in classify() UNLESS a specific (metric, bowler_type) pair
 # has a real override in SPIN_RANGE_OVERRIDES (front_knee_bracing/
 # wrist_spin does).
-_ALWAYS_DESCRIPTIVE_METRICS = ("front_knee_bracing", "hip_shoulder_separation")
+_ALWAYS_DESCRIPTIVE_METRICS = ("front_knee_bracing", "hip_shoulder_separation", "rear_knee_angle")
 
 
 def has_validated_range(metric_key: str, bowler_type: str = None) -> bool:
@@ -450,7 +488,7 @@ def descriptive_note(metric_key: str, value=None, bowler_type: str = None) -> st
 # all_batting_metric_keys() below.
 _BOWLING_METRIC_KEYS = [
     "front_knee_bracing", "hip_shoulder_separation", "trunk_lean",
-    "release_height", "head_stability",
+    "release_height", "head_stability", "rear_knee_angle", "rear_hip_flexion",
 ]
 _BATTING_METRIC_KEYS = [
     "batting_head_movement", "batting_front_foot_alignment",
@@ -667,6 +705,8 @@ def extract_metric_value(metrics: dict, metric_key: str):
         "trunk_lean": metrics.get("trunk_lean", {}).get("degrees"),
         "release_height": metrics.get("release_height", {}).get("ratio"),
         "head_stability": head_value,
+        "rear_knee_angle": metrics.get("rear_knee_angle", {}).get("degrees"),
+        "rear_hip_flexion": metrics.get("rear_hip_flexion", {}).get("degrees"),
     }
     return lookup.get(metric_key)
 

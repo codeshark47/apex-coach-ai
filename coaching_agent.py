@@ -61,7 +61,7 @@ def _strip_section_header(text: str) -> str:
 def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> dict:
     """
     Production AI Coaching Agent.
-    Extracts all 5 biomechanical metrics and sends them to Gemini for analysis.
+    Extracts all 7 biomechanical metrics and sends them to Gemini for analysis.
     Returns a structured dict with narrative_analysis and prescribed_drills.
     Never uses fake defaults. Never silently fails.
     """
@@ -116,6 +116,14 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     head_recalibration_pending = bool(head_data.get("recalibration_pending"))
     head_tracking_uncertain = bool(head_data.get("release_window_tracking_uncertain"))
 
+    rear_knee_data = metrics.get("rear_knee_angle", {})
+    rear_knee_angle = rear_knee_data.get("degrees")
+    rear_knee_descriptor = rear_knee_data.get("tier", "Unknown")
+
+    rear_hip_data = metrics.get("rear_hip_flexion", {})
+    rear_hip_flexion = rear_hip_data.get("degrees")
+    rear_hip_descriptor = rear_hip_data.get("tier", "Unknown")
+
     # --- SINGLE SOURCE OF TRUTH ---
     # ZONE below comes from metric_ranges.py — the SAME classifier used by
     # the sidebar UI and the PDF report. Previously this prompt used
@@ -131,6 +139,8 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     hip_zone = ZONE_LABELS[mr.classify("hip_shoulder_separation", hip_sep, bowler_type)]
     release_zone = ZONE_LABELS[mr.classify("release_height", release_ratio, bowler_type)]
     head_zone = ZONE_LABELS[mr.classify("head_stability", head_val, bowler_type)]
+    rear_knee_zone = ZONE_LABELS[mr.classify("rear_knee_angle", rear_knee_angle, bowler_type)]
+    rear_hip_zone = ZONE_LABELS[mr.classify("rear_hip_flexion", rear_hip_flexion, bowler_type)]
 
     # 3. VALIDATE — block only if majority of metrics are missing
     missing = []
@@ -139,6 +149,8 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
     if hip_sep is None: missing.append("hip_shoulder_separation")
     if release_ratio is None: missing.append("release_height")
     if head_val is None: missing.append("head_stability")
+    if rear_knee_angle is None: missing.append("rear_knee_angle")
+    if rear_hip_flexion is None: missing.append("rear_hip_flexion")
 
     missing_note = ""
     if missing:
@@ -146,7 +158,16 @@ def generate_biomechanical_coaching_report(result_payload: Dict[str, Any]) -> di
             f"\nNOTE: The following metrics could not be calculated: {', '.join(missing)}. "
             f"Acknowledge this in your narrative. Do not fabricate values for them.\n"
         )
-        if len(missing) >= 4:
+        # Scaled up from the original 5-metric set's ">= 4" (80% missing)
+        # to keep roughly the same bar now that there are 7 — matches
+        # generate_batting_coaching_report's identical ">= 5 out of 7"
+        # scaling below, same reasoning (the trail-leg BFC landmarks
+        # rear_knee_angle/rear_hip_flexion depend on are a real, common
+        # single-frame occlusion point — see orchestrator.py's bfc_row
+        # extraction — so it's expected and fine for one or two metrics
+        # to occasionally be unavailable, not grounds alone to fail the
+        # whole report).
+        if len(missing) >= 5:
             return _error_state(
                 f"Too many metrics missing: {', '.join(missing)}. "
                 f"Check landmark tracking quality and camera angle."
@@ -196,6 +217,8 @@ descriptor in parentheses, which is supplementary color commentary only):
 3. Hip-Shoulder Separation: {fmt(hip_sep)} — ZONE: {hip_zone} (descriptor: {hip_descriptor})
 4. Release Height Ratio: {release_display} — ZONE: {release_zone} (descriptor: {release_descriptor}){" [RECALIBRATION PENDING - see rule below]" if release_recalibration_pending else ""}{" [TRACKING UNCERTAIN - see rule below]" if release_tracking_uncertain else ""}
 5. Head Stability Variance: {fmt(head_val, "")} — ZONE: {head_zone} (descriptor: {head_descriptor}){" [RECALIBRATION PENDING - see rule below]" if head_recalibration_pending else ""}{" [TRACKING UNCERTAIN - see rule below]" if head_tracking_uncertain else ""}
+6. Rear Knee Angle (at Back Foot Contact): {fmt(rear_knee_angle)} — ZONE: {rear_knee_zone} (descriptor: {rear_knee_descriptor})
+7. Rear Hip Flexion (at Back Foot Contact): {fmt(rear_hip_flexion)} — ZONE: {rear_hip_zone} (descriptor: {rear_hip_descriptor})
 {missing_note}
 REFERENCE RANGES (CBC-style classification — authoritative, matches the UI and PDF report exactly):
 {reference_ranges_block}
@@ -206,7 +229,7 @@ COACHING PHILOSOPHY:
 - Only prescribe drills for metrics whose ZONE is CRITICAL, or metrics showing severe technical blocks (extreme outliers) — but see the DESCRIPTIVE/RECALIBRATION-PENDING/TRACKING-UNCERTAIN rules below FIRST, which override this and exclude a metric from drill-prescription entirely regardless of how alarming its descriptor text reads.
   FIX (2026-08-07, real bug found in an actual coaching report): this rule used to name 'Blocked rotation' as an example trigger — that was Hip-Shoulder Separation's OLD raw descriptor, before the real literature audit found this metric is always-descriptive (varies by bowling action type, not skill; see the DESCRIPTIVE ZONE RULE). That example directly contradicted the DESCRIPTIVE ZONE RULE below and was confirmed live: a report correctly said in its narrative "there are no metrics identified as requiring immediate correction," then prescribed 3 real drills targeting Hip-Shoulder Separation anyway — the exact metric its own narrative had just excluded. A metric's ZONE (DESCRIPTIVE/RECALIBRATION-PENDING/TRACKING-UNCERTAIN) always wins over how its descriptor text sounds.
 - If trunk lean exceeds 45 degrees, note that the absolute measurement may be exaggerated by a 2D camera angle artifact, but still comment on managing the load from excessive forward trunk flexion at release.
-- DESCRIPTIVE ZONE RULE: a ZONE of "DESCRIPTIVE (see reference ranges below)" means there is currently no validated pass/fail range for this metric — either because published research doesn't give a validated target for this bowler's style (common for spin bowlers), or because the metric itself has no universal target for ANY style (Lead Knee Bracing and Hip-Shoulder Separation are always descriptive now — real research shows both are technique classifications, not a higher/lower-is-better scale: Lead Knee Bracing splits into real Extended-Knee/Flexed-Knee techniques that are both legitimate at the elite level, and Hip-Shoulder Separation varies by bowling action type, not skill). Report the number as neutral, informational context only (e.g. "for reference, X was measured at..."). NEVER call it optimal, acceptable, or critical, and NEVER prescribe a drill based on a DESCRIPTIVE metric alone.
+- DESCRIPTIVE ZONE RULE: a ZONE of "DESCRIPTIVE (see reference ranges below)" means there is currently no validated pass/fail range for this metric — either because published research doesn't give a validated target for this bowler's style (common for spin bowlers), or because the metric itself has no universal target for ANY style (Lead Knee Bracing, Hip-Shoulder Separation, and Rear Knee Angle are always descriptive now — real research shows Lead Knee Bracing and Rear Knee Angle are each real technique/injury-risk factors without a precisely established degree threshold, and Hip-Shoulder Separation varies by bowling action type, not skill). Report the number as neutral, informational context only (e.g. "for reference, X was measured at..."). NEVER call it optimal, acceptable, or critical, and NEVER prescribe a drill based on a DESCRIPTIVE metric alone.
 - RECALIBRATION-PENDING RULE: if ANY metric above is marked "[RECALIBRATION PENDING]", its underlying measurement was just corrected to fix a real false-reading bug, but the OPTIMAL/ACCEPTABLE/CRITICAL bands it's compared against were tuned for the OLD measurement and have not been re-validated for the new one yet. You may still report the number and its ZONE as useful, directional information, but explicitly note in the narrative that this specific reading is provisional pending re-validation, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 - TRACKING-UNCERTAIN RULE (2026-08-07): if ANY metric above is marked "[TRACKING UNCERTAIN]", the pose tracking right around ball release was flagged unstable (heavy motion blur is the common cause) for THIS specific delivery — the same landmark data that metric is computed from. This is a data-quality flag, not a technique finding: explicitly note in the narrative that this specific reading may be affected by tracking quality rather than real technique, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 

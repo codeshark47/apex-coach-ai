@@ -112,6 +112,115 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
     except Exception:
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
+def calculate_rear_knee_angle(row: pd.Series, trail_side: str = "right") -> dict:
+    """
+    Computes the 2D angle of the REAR (trail/back) knee joint at Back
+    Foot Contact, via the same Law-of-Cosines HIP-KNEE-ANKLE technique
+    as calculate_knee_bracing above — applied to the trail leg (the side
+    that plants first at BFC, always the SAME side as the bowling arm,
+    opposite the lead/front leg) instead of the lead leg, and at BFC
+    instead of FFC/release.
+    trail_side: 'right' for a right-arm bowler's standard action, 'left'
+    for a left-arm bowler.
+
+    Always DESCRIPTIVE, never scored green/amber/red (see
+    metric_ranges._ALWAYS_DESCRIPTIVE_METRICS) — real research shows rear
+    knee angle at BFC differs between injured and non-injured bowlers
+    (e.g. Bayne et al. 2016, cited in later systematic reviews of lumbar
+    bone stress injury), but no clean, precise degree threshold with a
+    verified angle convention could be found despite real effort (three
+    separate primary sources checked, all paywalled or silent on the
+    specific number) — so this ships as a real, honest measurement with
+    no invented judgment, the same discipline already applied to
+    front_knee_bracing above.
+    """
+    try:
+        side = "RIGHT" if trail_side == "right" else "LEFT"
+        h = np.array([float(row[f"{side}_HIP_x"]), float(row[f"{side}_HIP_y"])])
+        k = np.array([float(row[f"{side}_KNEE_x"]), float(row[f"{side}_KNEE_y"])])
+        a = np.array([float(row[f"{side}_ANKLE_x"]), float(row[f"{side}_ANKLE_y"])])
+
+        kh, ka = h - k, a - k
+        denom = np.linalg.norm(kh) * np.linalg.norm(ka)
+        if denom == 0 or np.isnan(denom):
+            return {"degrees": None, "tier": "Tracking Drop", "status": "error"}
+
+        cos_theta = np.dot(kh, ka) / denom
+        angle = round(float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))), 1)
+
+        tier = "Extended Rear Knee" if angle >= 170.0 else "Flexed Rear Knee"
+        return {"degrees": angle, "tier": tier, "status": "success"}
+    except Exception:
+        return {"degrees": None, "tier": "Data Deficit", "status": "error"}
+
+
+def calculate_rear_hip_flexion(row: pd.Series, trail_side: str = "right") -> dict:
+    """
+    Measures forward flexion of the REAR (trail/back) hip at Back Foot
+    Contact — the angle between the trunk (mid-shoulder to trail-hip
+    vector) and the trail thigh (trail-hip to trail-knee vector),
+    converted to a flexion-FROM-NEUTRAL reading (0 degrees = hip in a
+    straight, anatomically neutral line with the thigh; higher = more
+    forward hip flexion) via 180 minus the raw 3-point joint angle —
+    matching the standard goniometric convention the source research
+    below reports its threshold in (the same 180-minus-raw conversion
+    calculate_trunk_lean already uses for a different joint pairing).
+    trail_side: 'right' for a right-arm bowler's standard action, 'left'
+    for a left-arm bowler.
+
+    REAL RESEARCH (Alway, Felton, Brooke-Wavell, Peirce & King, 2021,
+    Medicine & Science in Sports & Exercise 53:581-589): fast bowlers
+    with >30 degrees of rear hip flexion at Back Foot Contact (combined
+    with <3 degrees of flexion at Front Foot Contact) are at
+    significantly higher risk of lumbar bone stress injury — rear hip
+    flexion at BFC and lumbopelvic flexion together correctly classified
+    88% of bowlers into injured/non-injured groups (97% of lumbar bone
+    stress injury cases specifically). Only the BFC-side half of that
+    finding is scored here; the FFC-side (lumbopelvic) half is not
+    implemented. The 30-degree line itself is the cited threshold; the
+    green/amber split below it is an engineering buffer (same reasoning
+    as orchestrator.py's KNEE_ANGLE_IMPLAUSIBLE_THRESHOLD comment), not
+    itself a separately cited number — see metric_ranges.RANGES
+    ["rear_hip_flexion"].
+    """
+    try:
+        side = "RIGHT" if trail_side == "right" else "LEFT"
+        mid_sh_x = (float(row["LEFT_SHOULDER_x"]) + float(row["RIGHT_SHOULDER_x"])) / 2
+        mid_sh_y = (float(row["LEFT_SHOULDER_y"]) + float(row["RIGHT_SHOULDER_y"])) / 2
+        h = np.array([float(row[f"{side}_HIP_x"]), float(row[f"{side}_HIP_y"])])
+        k = np.array([float(row[f"{side}_KNEE_x"]), float(row[f"{side}_KNEE_y"])])
+        sh = np.array([mid_sh_x, mid_sh_y])
+
+        hs, hk = sh - h, k - h
+        denom = np.linalg.norm(hs) * np.linalg.norm(hk)
+        if denom == 0 or np.isnan(denom):
+            return {"degrees": None, "tier": "Tracking Drop", "status": "error"}
+
+        cos_theta = np.dot(hs, hk) / denom
+        raw_angle = float(np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0))))
+        flexion = round(180.0 - raw_angle, 1)
+        if np.isnan(flexion):
+            return {"degrees": None, "tier": "Tracking Drop", "status": "error"}
+
+        # A reading this extreme (thigh vector folded most of the way
+        # back toward the trunk vector) is not achievable in a real,
+        # grounded BFC position — same "flag as unreliable, don't report
+        # a false number" discipline as calculate_trunk_lean's >90-degree
+        # guard above (almost always a landmark swap/tracking error, e.g.
+        # the trail knee landmark snapping onto the lead leg). 120 is an
+        # engineering plausibility ceiling based on basic human anatomy
+        # (a dynamic athletic lunge rarely if ever exceeds ~100-110 of
+        # actual hip flexion), not a cited biomechanics constant — same
+        # status as orchestrator.py's KNEE_ANGLE_IMPLAUSIBLE_THRESHOLD.
+        if flexion > 120.0:
+            return {"degrees": flexion, "tier": "Tracking Unreliable (implausible angle)", "status": "error"}
+
+        tier = "Elevated Injury-Risk Loading" if flexion > 30.0 else "Within Typical Range"
+        return {"degrees": flexion, "tier": tier, "status": "success"}
+    except Exception:
+        return {"degrees": None, "tier": "Data Deficit", "status": "error"}
+
+
 def calculate_head_stability(df: pd.DataFrame, start_frame: int, end_frame: int) -> dict:
     """
     Tracks lateral head-position stability during the delivery stride,
