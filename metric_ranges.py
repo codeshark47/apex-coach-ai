@@ -522,6 +522,27 @@ def classify(metric_key: str, value, bowler_type: str = None) -> str:
         raise ValueError(f"Unsupported range kind '{r.kind}' for '{metric_key}'")
 
 
+def is_critical_and_eligible(metric_key: str, value, bowler_type: str = None,
+                              recalibration_pending: bool = False,
+                              tracking_uncertain: bool = False) -> bool:
+    """
+    True only if this metric should trigger a drill/callout right now.
+
+    This is the SAME rule coaching_agent.py's Section 2 prompt has always
+    asked Gemini to self-apply in prose ("a metric qualifies ONLY if its
+    ZONE is CRITICAL AND it is not marked DESCRIPTIVE, RECALIBRATION-
+    PENDING, or TRACKING-UNCERTAIN") — written here as real code so the
+    freeze-frame callout feature and the drill-eligibility rule can never
+    drift apart. Guards the exact historical bug already documented in
+    that file: a DESCRIPTIVE metric (e.g. hip_shoulder_separation, always
+    descriptive) got 3 drills prescribed for it anyway, because that rule
+    previously lived only in prompt text, not code.
+    """
+    if recalibration_pending or tracking_uncertain:
+        return False
+    return classify(metric_key, value, bowler_type) == "red"
+
+
 def all_metric_keys():
     """Bowling's 5 metric keys ONLY — explicitly hardcoded (not
     list(RANGES.keys())) so adding batting_* entries to RANGES can never

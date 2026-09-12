@@ -2245,7 +2245,7 @@ def run_complete_bowling_analysis(video_path: str,
         knee_bracing_val = None
 
     # STAGE 7 — RETURN UNIFIED PAYLOAD
-    return {
+    result_payload = {
         "status": "success",
         "bowler_type": bowler_type,
         "video_metadata": {
@@ -2327,3 +2327,22 @@ def run_complete_bowling_analysis(video_path: str,
         },
         "annotated_video_output": web_safe_video_file.replace("\\", "/")
     }
+
+    # DIAGNOSTIC FREEZE-FRAMES (2026-09-XX): skeleton + CRITICAL-metric
+    # callout stills at BFC/FFC/Release, for the report/PDF and for
+    # coaching_agent.py to attach to its Gemini call (so the AI narrative
+    # can reference what's visually shown, not just recite numbers). Own
+    # try/except, deliberately separate from any Gemini-related error
+    # handling downstream — a frame-drawing bug must degrade to "no
+    # images" quietly, never surface as a fake analysis failure.
+    try:
+        from diagnostic_frames import generate_bowling_diagnostic_frames
+        result_payload["diagnostic_frames"] = generate_bowling_diagnostic_frames(
+            video_path, _skeleton_df, events, result_payload["biomechanical_metrics"],
+            bowler_type, bowling_arm,
+        )
+    except Exception as e:
+        monitoring.capture(e)
+        result_payload["diagnostic_frames"] = {"bfc": None, "ffc": None, "release": None}
+
+    return result_payload

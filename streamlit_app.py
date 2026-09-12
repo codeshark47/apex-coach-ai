@@ -16,7 +16,7 @@ import orchestrator as o
 from coaching_agent import generate_biomechanical_coaching_report
 
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from io import BytesIO
@@ -1359,10 +1359,24 @@ def render_batting_analysis_ui(player_name: str, history_enabled: bool):
     </div>
     """)
 
+        diagnostic_frames = result_payload.get("diagnostic_frames") or {}
+        if any(diagnostic_frames.get(k) for k in ("stance", "backlift", "contact")):
+            st.markdown("### 🖼️ Diagnostic Freeze-Frames")
+            for _dcol, _dkey, _dlabel in zip(
+                st.columns(3), ("stance", "backlift", "contact"),
+                ("Stance", "Backlift", "Point of Contact"),
+            ):
+                with _dcol:
+                    if diagnostic_frames.get(_dkey):
+                        st.image(diagnostic_frames[_dkey], caption=_dlabel, use_container_width=True)
+                    else:
+                        st.caption(f"{_dlabel}: unavailable")
+
         clean_slug = player_name.replace(" ", "_")
         pdf_data = generate_batting_pdf_report(
             metrics, result_payload["time_indices"], insights, batter_name=player_name,
             falling_over_risk=falling_over,
+            diagnostic_frames=result_payload.get("diagnostic_frames"),
         )
         st.download_button(
             label="📄 Download Official PDF Report",
@@ -1796,7 +1810,8 @@ os.makedirs("input", exist_ok=True)
 # ====================================================================
 def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete",
                          camera_mode="Single Camera", phase_durations=None,
-                         speed_result=None, quality=None, bowler_type=None):
+                         speed_result=None, quality=None, bowler_type=None,
+                         diagnostic_frames=None):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter,
                              rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
@@ -1902,6 +1917,17 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
     story.append(Paragraph(narrative, body_style))
     story.append(Spacer(1, 15))
 
+    # DIAGNOSTIC FREEZE-FRAMES
+    if diagnostic_frames:
+        story.append(Paragraph("Diagnostic Freeze-Frames", h2_style))
+        for _key, _label in (("bfc", "Back Foot Contact"), ("ffc", "Front Foot Contact"), ("release", "Ball Release")):
+            _png_bytes = diagnostic_frames.get(_key)
+            if _png_bytes:
+                story.append(Paragraph(f"<b>{_label}</b>", body_style))
+                story.append(RLImage(BytesIO(_png_bytes), width=250, height=180))
+                story.append(Spacer(1, 8))
+        story.append(Spacer(1, 10))
+
     # DRILLS
     story.append(Paragraph("Prescribed Training Drills", h2_style))
     drills = ai_insights.get("prescribed_drills", [])
@@ -1923,7 +1949,7 @@ def generate_pdf_report(metrics, frames, ai_insights, bowler_name="Elite Athlete
 
 
 def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite Athlete",
-                                 falling_over_risk=None):
+                                 falling_over_risk=None, diagnostic_frames=None):
     """
     Batting equivalent of generate_pdf_report — same reportlab primitives,
     same visual language, simplified for batting's metrics (no speed/
@@ -2044,6 +2070,16 @@ def generate_batting_pdf_report(metrics, frames, ai_insights, batter_name="Elite
     ).strip()
     story.append(Paragraph(narrative, body_style))
     story.append(Spacer(1, 15))
+
+    if diagnostic_frames:
+        story.append(Paragraph("Diagnostic Freeze-Frames", h2_style))
+        for _key, _label in (("stance", "Stance"), ("backlift", "Backlift"), ("contact", "Point of Contact")):
+            _png_bytes = diagnostic_frames.get(_key)
+            if _png_bytes:
+                story.append(Paragraph(f"<b>{_label}</b>", body_style))
+                story.append(RLImage(BytesIO(_png_bytes), width=250, height=180))
+                story.append(Spacer(1, 8))
+        story.append(Spacer(1, 10))
 
     story.append(Paragraph("Prescribed Training Drills", h2_style))
     drills = ai_insights.get("prescribed_drills", [])
@@ -3935,6 +3971,7 @@ if st.session_state.get("pending_result_payload") is not None:
                     speed_result=speed_result,
                     quality=quality,
                     bowler_type=result_payload.get("bowler_type"),
+                    diagnostic_frames=result_payload.get("diagnostic_frames"),
                 )
                 st.download_button(
                     label="📄 Download Official PDF Report",
@@ -3951,6 +3988,19 @@ if st.session_state.get("pending_result_payload") is not None:
                     "SECTION 1 — BIOMECHANICAL NARRATIVE ASSESSMENT:", ""
                 ).replace("SECTION 1 — BIOMECHANICAL NARRATIVE:", "").strip()
                 st.write(narrative)
+
+                diagnostic_frames = result_payload.get("diagnostic_frames") or {}
+                if any(diagnostic_frames.get(k) for k in ("bfc", "ffc", "release")):
+                    st.markdown("### 🖼️ Diagnostic Freeze-Frames")
+                    for _dcol, _dkey, _dlabel in zip(
+                        st.columns(3), ("bfc", "ffc", "release"),
+                        ("Back Foot Contact", "Front Foot Contact", "Ball Release"),
+                    ):
+                        with _dcol:
+                            if diagnostic_frames.get(_dkey):
+                                st.image(diagnostic_frames[_dkey], caption=_dlabel, use_container_width=True)
+                            else:
+                                st.caption(f"{_dlabel}: unavailable")
 
                 st.markdown("### 🎯 Prescribed Training Drills")
                 drills = ai_insights.get("prescribed_drills", [])

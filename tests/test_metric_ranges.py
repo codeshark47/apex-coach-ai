@@ -372,3 +372,42 @@ class TestBowlerTypeClassification:
         160-180 band description."""
         assert mr.describe_range("front_knee_bracing") == mr.describe_range("front_knee_bracing", None)
         assert "Portus" in mr.describe_range("front_knee_bracing")
+
+
+class TestIsCriticalAndEligible:
+    """is_critical_and_eligible() turns coaching_agent.py's Section-2
+    drill-eligibility prompt rule ("qualifies ONLY if CRITICAL and not
+    DESCRIPTIVE/RECALIBRATION-PENDING/TRACKING-UNCERTAIN") into real,
+    shared code — used by both the drill logic and the new freeze-frame
+    diagnostic callouts (diagnostic_frames.py), so they can never
+    disagree about which metric actually qualifies. batting_xfactor_
+    separation is used here since it has real, confirmed red boundaries
+    (see TestClassifyBand above: 5.0 and 84.0 are both "red")."""
+
+    def test_red_and_eligible_is_true(self):
+        assert mr.is_critical_and_eligible("batting_xfactor_separation", 5.0) is True
+        assert mr.is_critical_and_eligible("batting_xfactor_separation", 84.0) is True
+
+    def test_green_is_false(self):
+        assert mr.is_critical_and_eligible("batting_xfactor_separation", 35.0) is False
+
+    def test_amber_is_false(self):
+        assert mr.is_critical_and_eligible("batting_xfactor_separation", 20.0) is False
+
+    def test_descriptive_metric_is_never_eligible_even_if_numerically_extreme(self):
+        """THE regression test for the exact historical bug: hip_shoulder_
+        separation is always descriptive (see TestAlwaysDescriptiveMetrics)
+        — an extreme-looking value must never be flagged critical."""
+        assert mr.is_critical_and_eligible("hip_shoulder_separation", 5.0) is False
+        assert mr.is_critical_and_eligible("hip_shoulder_separation", 90.0) is False
+
+    def test_recalibration_pending_overrides_red(self):
+        assert mr.is_critical_and_eligible(
+            "batting_xfactor_separation", 5.0, recalibration_pending=True) is False
+
+    def test_tracking_uncertain_overrides_red(self):
+        assert mr.is_critical_and_eligible(
+            "batting_xfactor_separation", 5.0, tracking_uncertain=True) is False
+
+    def test_unknown_value_is_never_eligible(self):
+        assert mr.is_critical_and_eligible("batting_xfactor_separation", None) is False

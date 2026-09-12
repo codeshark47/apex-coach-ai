@@ -5,6 +5,25 @@ from typing import Dict, Any
 import metric_ranges as mr
 import monitoring
 
+
+def _build_image_parts(diagnostic_frames: dict, order: list) -> list:
+    """Converts stored PNG bytes (from diagnostic_frames.py, attached to
+    result_payload upstream by orchestrator.py/batting_orchestrator.py)
+    into types.Part objects for the Gemini call, in a fixed event order.
+    Never raises — a missing/None entry (e.g. one frame's skeleton
+    failed plausibility, or the whole dict is absent on an older cached
+    result_payload) is just skipped, so a partial diagnostic_frames dict
+    still attaches whatever did succeed rather than failing the whole
+    narrative generation."""
+    from google.genai import types
+    parts = []
+    for key in order:
+        png_bytes = (diagnostic_frames or {}).get(key)
+        if png_bytes:
+            parts.append(types.Part.from_bytes(data=png_bytes, mime_type="image/png"))
+    return parts
+
+
 ZONE_LABELS = {
     "green": "OPTIMAL", "amber": "ACCEPTABLE", "red": "CRITICAL", "unknown": "NO DATA",
     # No validated pass/fail band exists for this metric/bowler_type pair —
@@ -191,6 +210,8 @@ COACHING PHILOSOPHY:
 - RECALIBRATION-PENDING RULE: if ANY metric above is marked "[RECALIBRATION PENDING]", its underlying measurement was just corrected to fix a real false-reading bug, but the OPTIMAL/ACCEPTABLE/CRITICAL bands it's compared against were tuned for the OLD measurement and have not been re-validated for the new one yet. You may still report the number and its ZONE as useful, directional information, but explicitly note in the narrative that this specific reading is provisional pending re-validation, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 - TRACKING-UNCERTAIN RULE (2026-08-07): if ANY metric above is marked "[TRACKING UNCERTAIN]", the pose tracking right around ball release was flagged unstable (heavy motion blur is the common cause) for THIS specific delivery — the same landmark data that metric is computed from. This is a data-quality flag, not a technique finding: explicitly note in the narrative that this specific reading may be affected by tracking quality rather than real technique, and do NOT prescribe a drill based on this metric alone even if its ZONE reads CRITICAL.
 
+ATTACHED IMAGES: If images are attached to this request, they are freeze-frame stills at Back Foot Contact (BFC), Front Foot Contact (FFC), and Ball Release (BR) — each showing the tracked skeleton with callout boxes marking whichever metric(s) are CRITICAL at that moment. Use these images only for qualitative, visual grounding of your narrative (e.g. describing what a CRITICAL position visibly looks like) — they illustrate the SAME classification already given to you as ZONE above, never a separate source of numeric truth. The rule above still applies without exception: never read, estimate, or restate a numeric value from an image — every number in your narrative must come only from the BIOMECHANICAL MEASUREMENTS table above. If no images are attached, or a given event's freeze-frame shows no callout, proceed exactly as if no images existed.
+
 Your task is to produce a two-section technical coaching report.
 Separate the two sections with exactly one line containing only: ---
 
@@ -221,9 +242,22 @@ DRILL NAME: explaining what it corrects and how to perform it.
 
         client = genai.Client(api_key=api_key)
 
+        # Attach diagnostic freeze-frames (BFC/FFC/Release), if any exist,
+        # as extra image parts alongside the existing text prompt -- own
+        # try/except so an image-attachment problem degrades to today's
+        # exact text-only behavior instead of surfacing as a Gemini
+        # failure (that's what the OUTER try/except below is for).
+        try:
+            image_parts = _build_image_parts(
+                result_payload.get("diagnostic_frames"), ["bfc", "ffc", "release"])
+        except Exception as e:
+            monitoring.capture(e)
+            image_parts = []
+        contents = [prompt] + image_parts if image_parts else prompt
+
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=8000
@@ -469,6 +503,8 @@ COACHING PHILOSOPHY:
   a "top-hand only" shadow shot drill for elbow control, an off-stump guard drill for the falling-over
   fault) — not vague, generic advice like "practice more."
 
+ATTACHED IMAGES: If images are attached to this request, they are freeze-frame stills at Stance, Backlift (top of swing), and Point of Contact — each showing the tracked skeleton with callout boxes marking whichever metric(s) are CRITICAL at that moment. Use these images only for qualitative, visual grounding of your narrative — they illustrate the SAME classification already given to you as ZONE above, never a separate source of numeric truth. Never read, estimate, or restate a numeric value from an image — every number in your narrative must come only from the measurements given above. If no images are attached, or a given event's freeze-frame shows no callout, proceed exactly as if no images existed.
+
 Your task is to produce a two-section technical coaching report.
 Separate the two sections with exactly one line containing only: ---
 
@@ -499,9 +535,23 @@ DRILL NAME: explaining what it corrects and how to perform it.
 
         client = genai.Client(api_key=api_key)
 
+        # Attach diagnostic freeze-frames (Stance/Backlift/Contact), if
+        # any exist, as extra image parts alongside the existing text
+        # prompt -- own try/except so an image-attachment problem
+        # degrades to today's exact text-only behavior instead of
+        # surfacing as a Gemini failure (that's what the OUTER
+        # try/except below is for).
+        try:
+            image_parts = _build_image_parts(
+                result_payload.get("diagnostic_frames"), ["stance", "backlift", "contact"])
+        except Exception as e:
+            monitoring.capture(e)
+            image_parts = []
+        contents = [prompt] + image_parts if image_parts else prompt
+
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=8000

@@ -250,6 +250,61 @@ def run_batting_analysis(video_path: str,
 
     view_confidence_caveats = list(VIEW_SENSITIVE_METRIC_KEYS) if camera_angle == "front_or_rear" else []
 
+    bio_metrics = {
+        "batting_hand_detected": batting_hand,
+        "head_movement": {
+            "value": _val(head_movement, "deviation_index"),
+            "tier": head_movement.get("tier", "Unknown"),
+            "status": head_movement.get("status", "error"),
+        },
+        "front_foot_alignment": {
+            "signed_degrees": _val(front_foot, "signed_degrees"),
+            "side": front_foot.get("side"),
+            "deviation_degrees": _val(front_foot, "deviation_degrees"),
+            "target_shot": front_foot.get("target_shot"),
+            "tier": front_foot.get("tier", "Unknown"),
+            "status": front_foot.get("status", "error"),
+        },
+        "weight_transfer": {
+            "percent": _val(weight_transfer, "percent"),
+            "tier": weight_transfer.get("tier", "Unknown"),
+            "status": weight_transfer.get("status", "error"),
+        },
+        "downswing_plane": {
+            "degrees": _val(downswing_plane, "degrees"),
+            "tier": downswing_plane.get("tier", "Unknown"),
+            "status": downswing_plane.get("status", "error"),
+        },
+        "top_elbow_angle": {
+            "degrees": _val(top_elbow, "degrees"),
+            "tier": top_elbow.get("tier", "Unknown"),
+            "status": top_elbow.get("status", "error"),
+        },
+        "front_knee_flexion": {
+            "degrees": _val(front_knee_flexion, "degrees"),
+            "tier": front_knee_flexion.get("tier", "Unknown"),
+            "status": front_knee_flexion.get("status", "error"),
+        },
+        "xfactor_separation": {
+            "degrees": _val(xfactor_separation, "degrees"),
+            "tier": xfactor_separation.get("tier", "Unknown"),
+            "status": xfactor_separation.get("status", "error"),
+        },
+    }
+
+    # DIAGNOSTIC FREEZE-FRAMES (2026-09-XX): batting equivalent of the
+    # bowling orchestrator's own diagnostic-frame step — see that file's
+    # identical comment for the full reasoning. Own try/except, kept
+    # separate from Gemini's own error handling downstream.
+    try:
+        from diagnostic_frames import generate_batting_diagnostic_frames
+        diagnostic_frames = generate_batting_diagnostic_frames(
+            video_path, df, events, bio_metrics, batting_hand,
+        )
+    except Exception as e:
+        monitoring.capture(e)
+        diagnostic_frames = {"stance": None, "backlift": None, "contact": None}
+
     return {
         "status": "success",
         "analysis_type": "batting",
@@ -279,46 +334,7 @@ def run_batting_analysis(video_path: str,
             "foot_cross_pct": falling_over.get("foot_cross_pct"),
             "status": falling_over.get("status", "error"),
         },
-        "biomechanical_metrics": {
-            "batting_hand_detected": batting_hand,
-            "head_movement": {
-                "value": _val(head_movement, "deviation_index"),
-                "tier": head_movement.get("tier", "Unknown"),
-                "status": head_movement.get("status", "error"),
-            },
-            "front_foot_alignment": {
-                "signed_degrees": _val(front_foot, "signed_degrees"),
-                "side": front_foot.get("side"),
-                "deviation_degrees": _val(front_foot, "deviation_degrees"),
-                "target_shot": front_foot.get("target_shot"),
-                "tier": front_foot.get("tier", "Unknown"),
-                "status": front_foot.get("status", "error"),
-            },
-            "weight_transfer": {
-                "percent": _val(weight_transfer, "percent"),
-                "tier": weight_transfer.get("tier", "Unknown"),
-                "status": weight_transfer.get("status", "error"),
-            },
-            "downswing_plane": {
-                "degrees": _val(downswing_plane, "degrees"),
-                "tier": downswing_plane.get("tier", "Unknown"),
-                "status": downswing_plane.get("status", "error"),
-            },
-            "top_elbow_angle": {
-                "degrees": _val(top_elbow, "degrees"),
-                "tier": top_elbow.get("tier", "Unknown"),
-                "status": top_elbow.get("status", "error"),
-            },
-            "front_knee_flexion": {
-                "degrees": _val(front_knee_flexion, "degrees"),
-                "tier": front_knee_flexion.get("tier", "Unknown"),
-                "status": front_knee_flexion.get("status", "error"),
-            },
-            "xfactor_separation": {
-                "degrees": _val(xfactor_separation, "degrees"),
-                "tier": xfactor_separation.get("tier", "Unknown"),
-                "status": xfactor_separation.get("status", "error"),
-            },
-        },
+        "biomechanical_metrics": bio_metrics,
+        "diagnostic_frames": diagnostic_frames,
         "annotated_video_output": annotated_video_output,
     }
