@@ -100,7 +100,83 @@ def _hist_similarity(hist_a, hist_b) -> float:
     return float(cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL))
 
 
-def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bound, hi_bound):
+def _seed_appearance_majority_ok(seed_hists: list) -> list:
+    """
+    REAL BUG FOUND (2026-09-12, coach-reported and confirmed on real
+    footage): the seed-frame match itself (see _walk_from_seed below) had
+    ZERO appearance verification — the very first click-to-person match
+    is pure "nearest detected candidate within SEED_MATCH_TOLERANCE," no
+    different from picking the wrong person entirely if they happen to be
+    the closer of two candidates to an imprecise click. Confirmed
+    directly: a coach's seed click near the bowler still matched the
+    batter instead, and the walk then built a confident, internally-
+    consistent appearance profile of the WRONG person for that whole zone.
+
+    This is the credible second layer of defense the coach's own workflow
+    already provides for free: the SAME bowler is confirmed at multiple
+    (typically 4) separate seed points. If most of those seeds' matched
+    appearances agree with each other, any one seed whose match looks
+    nothing like that agreement is very likely a wrong-person match, not
+    a coincidentally different-looking moment of the same real person
+    (lighting/pose varies frame to frame, but not usually enough to erase
+    all resemblance to your OWN other confirmed sightings of yourself).
+
+    Deliberately conservative — matches this file's own header warning
+    that heuristics here have repeatedly looked right and then broken a
+    different real clip: with fewer than 3 real (non-None) histograms
+    there's nothing meaningful to vote with, so this returns all-True
+    (no override) rather than guess from 1-2 data points. The majority
+    baseline is computed from the TOP-scoring seeds only (never lowered
+    by including the outlier's own poor score), so one bad seed can never
+    drag the bar down far enough to excuse itself.
+
+    Returns a list of booleans, same length/order as seed_hists — True
+    for a seed whose match should be trusted, False for a clear
+    appearance outlier relative to the others.
+    """
+    real_idx = [i for i, h in enumerate(seed_hists) if h is not None]
+    if len(real_idx) < 3:
+        return [True] * len(seed_hists)
+
+    pairwise = {}
+    for a in range(len(real_idx)):
+        for b in range(a + 1, len(real_idx)):
+            i, j = real_idx[a], real_idx[b]
+            pairwise[(i, j)] = _hist_similarity(seed_hists[i], seed_hists[j])
+
+    avg_sim = {}
+    for i in real_idx:
+        others = [pairwise[(min(i, j), max(i, j))] for j in real_idx if j != i]
+        avg_sim[i] = sum(others) / len(others)
+
+    sorted_scores = sorted(avg_sim.values(), reverse=True)
+    majority_count = max(2, (len(real_idx) * 2) // 3)  # e.g. 3 of 4, 2 of 3
+    majority_baseline = sum(sorted_scores[:majority_count]) / majority_count
+
+    # ABSOLUTE gap, not a ratio (BUG FOUND via this file's own test suite
+    # before shipping: cv2.HISTCMP_CORREL can be negative for two
+    # genuinely different appearances, e.g. -0.3 vs -0.6 — multiplying a
+    # NEGATIVE baseline by a ratio makes the threshold LESS negative, the
+    # opposite of "more lenient," which flagged every seed as an outlier
+    # in a case where none of them actually stood out from the others).
+    # An absolute gap in HISTCMP_CORREL's bounded [-1, 1] range behaves
+    # the same regardless of sign. 0.25 is roughly half the real same-
+    # person-vs-different-person gap this project already measured on
+    # real footage (_compute_appearance_histogram's docstring: 0.71 for
+    # the true bowler's own later frames vs. 0.25 for a different real
+    # person, a ~0.46 real gap) — a deliberately conservative half of
+    # that margin, not the full gap, so normal appearance noise between
+    # a genuine seed's own frames doesn't get over-flagged.
+    OUTLIER_GAP = 0.25
+    ok = [True] * len(seed_hists)
+    for i in real_idx:
+        if majority_baseline - avg_sim[i] > OUTLIER_GAP:
+            ok[i] = False
+    return ok
+
+
+def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bound, hi_bound,
+                     trust_seed_match: bool = True, prior_profile: list = None):
     """
     Anchors at seed_idx (matching seed_xy within SEED_MATCH_TOLERANCE),
     then walks forward to hi_bound and backward to lo_bound using
@@ -136,10 +212,50 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
     zone of the clip (split at the midpoint to its neighboring seeds),
     so seeds never fight over which one "wins" a given frame.
 
-    Returns {frame_idx: chosen_landmarks_or_None} for every frame in
-    [lo_bound, hi_bound].
+    trust_seed_match (2026-09-12, see _seed_appearance_majority_ok above):
+    False means skip the seed-frame match entirely and anchor on the raw
+    click coordinate with no starting candidate/profile — used by
+    extract_video_landmarks when this seed's own match was flagged as an
+    appearance outlier against the coach's OTHER confirmed seeds for the
+    same clip, so a likely-wrong match is discarded instead of confidently
+    seeding a wrong appearance profile across this seed's whole zone.
+
+    prior_profile (2026-09-12, real gap found tracing an actual coach-
+    reported failure): when this seed's OWN exact-frame match fails
+    (nobody detected close enough to the click — a real, correct outcome
+    when the target is momentarily too small/distant/occluded to detect,
+    not a bug by itself), the walk used to start with a completely EMPTY
+    appearance profile, so pick_closest fails open on position alone
+    (APPEARANCE_MIN_PROFILE frames' grace period) for the first few
+    matches in this zone — exactly long enough for a wrong-but-nearby
+    person to get "confirmed" 3 times and become the trusted profile
+    before the real target is ever seen. Confirmed directly on a real
+    clip: the bowler wasn't detected at all near an early seed click (too
+    small/distant that instant), and the walk locked onto the batter
+    instead for the whole zone, appearance-consistent with ONLY itself.
+    prior_profile lets the caller pass in real appearance evidence from
+    the coach's OTHER confirmed seeds (which matched something) as a
+    warm start — the appearance gate is then live from the very first
+    frame of this zone's walk, checked against what the target actually
+    looks like elsewhere in the SAME clip, instead of blindly trusting
+    whichever candidate happens to be nearest first.
+
+    Returns ({frame_idx: chosen_landmarks_or_None} for every frame in
+    [lo_bound, hi_bound], chosen_hist_at_the_seed_frame_or_None) — the
+    histogram is returned so the caller can cross-check it against other
+    seeds before committing to this walk (see extract_video_landmarks).
     """
-    SEED_MATCH_TOLERANCE = 0.2
+    # TIGHTENED (2026-09-12, real bug — see _seed_appearance_majority_ok
+    # above): 0.2 (20% of frame) was generous enough that an imprecise
+    # click on the true target could still land closer to a completely
+    # different nearby person than to the intended one, with NO
+    # appearance check at all to catch it (the profile is empty at this
+    # exact point). A tighter radius fails SAFE, not wrong: worst case,
+    # a very imprecise click matches nobody and this zone falls back to
+    # position-only tracking from the raw click (the existing, already-
+    # tested "no seed candidate" path) — never a confident lock onto the
+    # wrong person the way a loose radius could.
+    SEED_MATCH_TOLERANCE = 0.08
     MAX_DIST_PER_SECOND = 0.6
     MAX_DIST_CAP = 0.25
     MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
@@ -196,7 +312,7 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
     seed_cands = frame_candidates[seed_idx]
     seed_hists = frame_hists[seed_idx]
     chosen, chosen_hist = pick_closest(seed_cands, seed_hists, seed_xy, SEED_MATCH_TOLERANCE,
-                                        collections.deque(), 0) if seed_cands else (None, None)
+                                        collections.deque(), 0) if (trust_seed_match and seed_cands) else (None, None)
     result[seed_idx] = chosen
     seed_anchor = _centroid_xy(chosen) if chosen is not None else seed_xy
 
@@ -206,6 +322,13 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
         profile = collections.deque(maxlen=APPEARANCE_PROFILE_LEN)
         if chosen_hist is not None:
             profile.append(chosen_hist)
+        elif prior_profile:
+            # See prior_profile's docstring above — a real appearance
+            # reference from the coach's OTHER confirmed seeds, used only
+            # when THIS seed's own exact-frame match found nothing to
+            # seed the profile with directly. Real chosen_hist (above)
+            # always takes priority when it exists.
+            profile.extend(prior_profile[:APPEARANCE_PROFILE_LEN])
         for i in frame_range:
             if frames_since_confirmed > MAX_GAP_FRAMES:
                 result[i] = None
@@ -227,7 +350,7 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
     walk_direction(range(seed_idx + 1, hi_bound + 1))
     walk_direction(range(seed_idx - 1, lo_bound - 1, -1))
 
-    return result
+    return result, chosen_hist
 
 
 def smooth_without_resurrecting_gaps(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
@@ -435,13 +558,67 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
             key=lambda s: s[0]
         )
 
-        seeded_chosen = [None] * total_frames
+        # PASS 1: match + walk every seed normally, but keep each seed's
+        # own chosen_hist around instead of committing to seeded_chosen
+        # yet — needed for the cross-seed appearance check below.
+        seed_zones = []
         for k, (s_idx, s_pt) in enumerate(seeds):
             lo_bound = 0 if k == 0 else (seeds[k - 1][0] + s_idx) // 2 + 1
             hi_bound = (total_frames - 1) if k == len(seeds) - 1 else (s_idx + seeds[k + 1][0]) // 2
             s_xy = (s_pt[0] / frame_width, s_pt[1] / frame_height)
-            walk_result = _walk_from_seed(s_idx, s_xy, frame_candidates, frame_hists, fps, lo_bound, hi_bound)
-            for i, v in walk_result.items():
+            walk_result, chosen_hist = _walk_from_seed(s_idx, s_xy, frame_candidates, frame_hists, fps, lo_bound, hi_bound)
+            seed_zones.append({"s_idx": s_idx, "s_xy": s_xy, "lo": lo_bound, "hi": hi_bound,
+                                "walk_result": walk_result, "hist": chosen_hist})
+
+        # CROSS-SEED APPEARANCE CHECK (2026-09-12, real bug — see
+        # _seed_appearance_majority_ok's own docstring): the coach
+        # confirms the SAME bowler at every seed, so their matched
+        # appearances should mostly agree with each other. Any seed whose
+        # match is a clear appearance outlier likely locked onto the
+        # wrong person at that exact click (see SEED_MATCH_TOLERANCE's
+        # own note above) — redo ONLY that seed's walk with its own
+        # (likely wrong) seed-frame match discarded, falling back to
+        # position-only tracking from the raw click instead of
+        # confidently propagating a wrong appearance profile across its
+        # whole zone.
+        majority_ok = _seed_appearance_majority_ok([z["hist"] for z in seed_zones])
+
+        # WARM-START PROFILE (2026-09-12, real gap found tracing an actual
+        # coach-reported failure — see _walk_from_seed's prior_profile
+        # docstring): a seed whose own exact-frame match found NOBODY
+        # (the target was momentarily too small/distant/occluded — a
+        # real, correct outcome, not itself a bug) used to hand its zone's
+        # walk a completely empty appearance profile, so the walk fails
+        # open on position alone for its first few matches — long enough
+        # for a wrong-but-nearby person to become the "confirmed" profile
+        # before the real target is ever seen in that zone. The coach's
+        # OTHER trustworthy seed matches already tell us what this person
+        # actually looks like elsewhere in the SAME clip — reusing that
+        # here means the appearance gate is live from frame 1 of a zone
+        # like this, instead of starting from zero evidence every time.
+        reference_profile = [z["hist"] for k, z in enumerate(seed_zones)
+                              if z["hist"] is not None and majority_ok[k]]
+
+        for k, z in enumerate(seed_zones):
+            if not majority_ok[k]:
+                # A real match that disagrees with the coach's OTHER
+                # confirmed seeds — discard it (trust_seed_match=False)
+                # but still give the walk the same warm-start reference
+                # the other zones get, rather than falling all the way
+                # back to blind position-only tracking.
+                z["walk_result"], _ = _walk_from_seed(
+                    z["s_idx"], z["s_xy"], frame_candidates, frame_hists, fps, z["lo"], z["hi"],
+                    trust_seed_match=False, prior_profile=reference_profile or None,
+                )
+            elif z["hist"] is None and reference_profile:
+                z["walk_result"], _ = _walk_from_seed(
+                    z["s_idx"], z["s_xy"], frame_candidates, frame_hists, fps, z["lo"], z["hi"],
+                    prior_profile=reference_profile,
+                )
+
+        seeded_chosen = [None] * total_frames
+        for z in seed_zones:
+            for i, v in z["walk_result"].items():
                 seeded_chosen[i] = v
 
         # MERGE: prefer single-pose's landmarks (better per-frame
