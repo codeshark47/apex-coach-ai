@@ -25,13 +25,21 @@ coupling for something this size. The plausibility GATES themselves
 (torso_shape_is_plausible etc.) are genuinely shared logic, not just
 data, and ARE imported directly from video_overlay.py.
 
-CRITICAL-ELIGIBILITY RULE: every metric here is checked through
-metric_ranges.is_critical_and_eligible() — the same rule
-coaching_agent.py's drill-prescription prompt has always asked Gemini to
-self-apply in prose (CRITICAL zone only, never DESCRIPTIVE/
-RECALIBRATION-PENDING/TRACKING-UNCERTAIN). Using the shared function
-here means a freeze-frame callout and a prescribed drill can never
-disagree about which metric actually qualifies.
+SHOW EVERY MAPPED METRIC, TAG ONLY THE DRILL-ELIGIBLE ONES (2026-09-XX,
+real bug found from an actual coach test): the first version of this
+file only ever drew a callout for a metric that passed
+metric_ranges.is_critical_and_eligible() — meaning a delivery where
+every metric was either DESCRIPTIVE, RECALIBRATION-PENDING, TRACKING-
+UNCERTAIN, or simply not critical rendered a skeleton with NO numbers
+on it at all, which is what the coach actually hit and flagged. Every
+metric mapped to a given frame is now ALWAYS drawn with its real value
+and its real tier color (green/amber/red/descriptive/unknown, straight
+from metric_ranges.classify() — never invented here). is_critical_and_
+eligible() still runs, but now only decides whether to ALSO print a
+"CRITICAL" tag on that same panel — it no longer decides whether the
+panel exists. This keeps the freeze-frame and the drill-prescription
+logic in agreement about which metric actually warrants a drill,
+without making non-qualifying metrics invisible.
 """
 
 import cv2
@@ -242,21 +250,47 @@ def _fit_font_scale(text, max_width_px, start_scale, min_scale, font=cv2.FONT_HE
     return max(scale, min_scale)
 
 
-def _draw_callout(frame_bgr, anchor_px, title, detail, box_x, box_y, box_w, side):
+def _panel_text(metric_key: str, value, tier: str, eligible: bool) -> str:
+    """The second line of a callout: the real formatted value, plus a
+    suffix reflecting exactly why it does/doesn't count as a drill
+    target — never inventing a number metric_ranges didn't already
+    compute. mr.format_value() assumes a real numeric value, so a
+    missing/unknown reading is handled before ever reaching it (calling
+    it on None would raise, e.g. float(None) for a "%"-unit metric)."""
+    if value is None or tier == "unknown":
+        return "N/A — no reading this delivery"
+    formatted = mr.format_value(metric_key, value)
+    if eligible:
+        return f"{formatted} — CRITICAL"
+    if tier == "descriptive":
+        return f"{formatted} — DESCRIPTIVE"
+    if tier == "red":
+        # Genuinely red but excluded from drills (recalibration-pending
+        # or tracking-uncertain this delivery) — still real information,
+        # just not solid enough to act on yet. See is_critical_and_
+        # eligible's own docstring for the two flags this covers.
+        return f"{formatted} — CRITICAL (provisional)"
+    return f"{formatted} — {tier.upper()}"
+
+
+def _draw_callout(frame_bgr, anchor_px, title, detail, tier, box_x, box_y, box_w, side):
     """One callout: rounded panel + two lines of text + a leader line
     from the box's inner edge to the anchor point, plus a small circle
     marking the anchor itself — the same 'line + endpoint circle(s)'
     idiom video_overlay.py's existing release-height drop-line already
     uses, generalized from always-vertical-one-fixed-metric to a
-    diagonal line to any joint."""
+    diagonal line to any joint. Color is always the real tier color
+    (green/amber/red/descriptive/unknown) — a callout is drawn for
+    every mapped metric now, not just critical ones, so the accent color
+    is what actually communicates severity at a glance."""
     box_h = _CALLOUT_BOX_H
     _draw_panel(frame_bgr, (box_x, box_y), (box_x + box_w, box_y + box_h))
-    red = TIER_COLORS_BGR["red"]
+    accent = TIER_COLORS_BGR.get(tier, TIER_COLORS_BGR["unknown"])
     text_max_w = box_w - 24  # 12px padding each side
 
     title_scale = _fit_font_scale(title, text_max_w, start_scale=0.5, min_scale=0.32)
     cv2.putText(frame_bgr, title, (box_x + 12, box_y + 26),
-                cv2.FONT_HERSHEY_SIMPLEX, title_scale, red, 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, title_scale, accent, 1, cv2.LINE_AA)
 
     detail_scale = _fit_font_scale(detail, text_max_w, start_scale=0.55, min_scale=0.35)
     cv2.putText(frame_bgr, detail, (box_x + 12, box_y + 48),
@@ -264,13 +298,13 @@ def _draw_callout(frame_bgr, anchor_px, title, detail, box_x, box_y, box_w, side
 
     inner_x = box_x + box_w if side == "left" else box_x
     inner_y = box_y + box_h // 2
-    cv2.line(frame_bgr, (inner_x, inner_y), anchor_px, red, 2, cv2.LINE_AA)
-    cv2.circle(frame_bgr, anchor_px, 5, red, -1, cv2.LINE_AA)
+    cv2.line(frame_bgr, (inner_x, inner_y), anchor_px, accent, 2, cv2.LINE_AA)
+    cv2.circle(frame_bgr, anchor_px, 5, accent, -1, cv2.LINE_AA)
     cv2.circle(frame_bgr, anchor_px, 7, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def _layout_and_draw_callouts(frame_bgr, callouts: list):
-    """callouts: [{"anchor": (x,y), "title": str, "detail": str}, ...].
+    """callouts: [{"anchor": (x,y), "title": str, "detail": str, "tier": str}, ...].
     Buckets left/right by anchor x vs. frame center, rebalances toward
     the lighter side if one has 2+ more than the other (so a heavy
     cluster on one side never overflows the frame height), stacks
@@ -305,13 +339,15 @@ def _layout_and_draw_callouts(frame_bgr, callouts: list):
 
     y = _CALLOUT_TOP_Y
     for c in left:
-        _draw_callout(frame_bgr, c["anchor"], c["title"], c["detail"], _CALLOUT_MARGIN_X, y, box_w, side="left")
+        _draw_callout(frame_bgr, c["anchor"], c["title"], c["detail"], c["tier"],
+                      _CALLOUT_MARGIN_X, y, box_w, side="left")
         y += _CALLOUT_BOX_H + _CALLOUT_GAP_Y
 
     y = _CALLOUT_TOP_Y
     for c in right:
         box_x = width - _CALLOUT_MARGIN_X - box_w
-        _draw_callout(frame_bgr, c["anchor"], c["title"], c["detail"], box_x, y, box_w, side="right")
+        _draw_callout(frame_bgr, c["anchor"], c["title"], c["detail"], c["tier"],
+                      box_x, y, box_w, side="right")
         y += _CALLOUT_BOX_H + _CALLOUT_GAP_Y
 
 
@@ -320,11 +356,18 @@ def _encode_png(frame_bgr):
     return buf.tobytes() if ok else None
 
 
-def _eligible_callouts_by_frame(metric_frames: dict, metrics: dict, bowler_type,
-                                 frame_keys: list) -> dict:
-    """Shared eligibility pass for both sports: for each metric mapped in
-    metric_frames, checks is_critical_and_eligible() once and files it
-    under every frame_key it's assigned to. Returns {frame_key: [(metric_key, value), ...]}."""
+def _metrics_by_frame(metric_frames: dict, metrics: dict, bowler_type,
+                       frame_keys: list) -> dict:
+    """Shared pass for both sports: for EVERY metric mapped in
+    metric_frames (regardless of tier), computes its real value, real
+    tier (green/amber/red/descriptive/unknown, from metric_ranges.
+    classify()), and whether it's drill-eligible (is_critical_and_
+    eligible()) — then files it under every frame_key it's assigned to.
+    Every mapped metric always appears here; eligibility is carried
+    along for the CALLER to decide whether to add a "CRITICAL" tag, not
+    used here to hide anything (see this module's own docstring for the
+    real bug this fixes). Returns
+    {frame_key: [(metric_key, value, tier, eligible), ...]}."""
     per_frame = {fk: [] for fk in frame_keys}
     for metric_key, mapped_frame_keys in metric_frames.items():
         if metric_key.startswith("batting_"):
@@ -335,10 +378,10 @@ def _eligible_callouts_by_frame(metric_frames: dict, metrics: dict, bowler_type,
         m = m if isinstance(m, dict) else {}
         recalibration_pending = bool(m.get(_RECALIBRATION_FLAG_KEYS.get(metric_key, ""), False))
         tracking_uncertain = bool(m.get(_TRACKING_UNCERTAIN_FLAG_KEYS.get(metric_key, ""), False))
-        if not mr.is_critical_and_eligible(metric_key, value, bowler_type, recalibration_pending, tracking_uncertain):
-            continue
+        tier = mr.classify(metric_key, value, bowler_type)
+        eligible = mr.is_critical_and_eligible(metric_key, value, bowler_type, recalibration_pending, tracking_uncertain)
         for fk in mapped_frame_keys:
-            per_frame[fk].append((metric_key, value))
+            per_frame[fk].append((metric_key, value, tier, eligible))
     return per_frame
 
 
@@ -370,7 +413,7 @@ def generate_bowling_diagnostic_frames(video_path: str, df: pd.DataFrame, events
         lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
         bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
         frame_map = {"bfc": events.get("BFC"), "ffc": events.get("FFC"), "release": events.get("BR")}
-        per_frame_metrics = _eligible_callouts_by_frame(
+        per_frame_metrics = _metrics_by_frame(
             _BOWLING_METRIC_FRAMES, metrics, bowler_type, list(frame_map.keys()))
 
         for frame_key, frame_idx in frame_map.items():
@@ -387,7 +430,7 @@ def generate_bowling_diagnostic_frames(video_path: str, df: pd.DataFrame, events
                 continue
 
             callouts = []
-            for metric_key, value in per_frame_metrics[frame_key]:
+            for metric_key, value, tier, eligible in per_frame_metrics[frame_key]:
                 anchor = _bowling_metric_anchor(
                     metric_key, row, frame_bgr.shape[1], frame_bgr.shape[0], lead_side, bowl_side)
                 if anchor is None:
@@ -395,7 +438,8 @@ def generate_bowling_diagnostic_frames(video_path: str, df: pd.DataFrame, events
                 callouts.append({
                     "anchor": anchor,
                     "title": mr.RANGES[metric_key].label.upper(),
-                    "detail": f"{mr.format_value(metric_key, value)} — CRITICAL",
+                    "detail": _panel_text(metric_key, value, tier, eligible),
+                    "tier": tier,
                 })
             _layout_and_draw_callouts(frame_bgr, callouts)
             result[frame_key] = _encode_png(frame_bgr)
@@ -419,7 +463,7 @@ def generate_batting_diagnostic_frames(video_path: str, df: pd.DataFrame, events
             "backlift": events.get("BACKLIFT"),
             "contact": events.get("CONTACT"),
         }
-        per_frame_metrics = _eligible_callouts_by_frame(
+        per_frame_metrics = _metrics_by_frame(
             _BATTING_METRIC_FRAMES, metrics, None, list(frame_map.keys()))
 
         for frame_key, frame_idx in frame_map.items():
@@ -436,7 +480,7 @@ def generate_batting_diagnostic_frames(video_path: str, df: pd.DataFrame, events
                 continue
 
             callouts = []
-            for metric_key, value in per_frame_metrics[frame_key]:
+            for metric_key, value, tier, eligible in per_frame_metrics[frame_key]:
                 anchor = _batting_metric_anchor(
                     metric_key, row, frame_bgr.shape[1], frame_bgr.shape[0], front_side, top_hand_side)
                 if anchor is None:
@@ -444,7 +488,8 @@ def generate_batting_diagnostic_frames(video_path: str, df: pd.DataFrame, events
                 callouts.append({
                     "anchor": anchor,
                     "title": mr.RANGES[metric_key].label.upper(),
-                    "detail": f"{mr.format_value(metric_key, value)} — CRITICAL",
+                    "detail": _panel_text(metric_key, value, tier, eligible),
+                    "tier": tier,
                 })
             _layout_and_draw_callouts(frame_bgr, callouts)
             result[frame_key] = _encode_png(frame_bgr)
