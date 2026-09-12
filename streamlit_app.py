@@ -4142,7 +4142,21 @@ def render_ball_tracking_admin_panel():
         os.makedirs("input", exist_ok=True)
         ref_path = os.path.abspath(os.path.join("input", f"_bt_ref_{uploaded.name}"))
         try:
-            o.save_uploaded_video_capped(uploaded, ref_path)
+            # HIGHER RESOLUTION CAP than the main app's default (2026-09-XX,
+            # real coach feedback: "quality shouldn't be [as low as] the way
+            # i see it right now"). save_uploaded_video_capped's own 1280x720
+            # default was set for the MAIN bowling/batting pipeline's real,
+            # documented memory ceiling — every frame there gets decoded and
+            # run through MediaPipe pose estimation TWICE plus drawn again
+            # for the overlay, a 3x-plus multiplier that genuinely crashed
+            # the server at higher resolutions (see that function's own
+            # docstring). Ball tracking has none of that: no pose pipeline,
+            # just cv2 I/O and one YOLO pass per frame on a small (250-500px)
+            # crop, not the full frame — the same memory risk doesn't apply
+            # here, so this path can afford the same 1920x1080 cap already
+            # used safely elsewhere in this codebase (compress_video_file's
+            # own default, for the ball-tracking training pipeline).
+            o.save_uploaded_video_capped(uploaded, ref_path, max_width=1920, max_height=1080)
         except RuntimeError as e:
             st.error(f"⚠️ {e}")
             return
@@ -4234,7 +4248,17 @@ def render_ball_tracking_admin_panel():
     # transcode_to_h264 already exists for exactly this; reusing it instead
     # of re-solving the same problem a second time.
     web_safe_path = o.transcode_to_h264(out_path)
-    st.video(web_safe_path)
+    # CONSTRAINED WIDTH (2026-09-XX, real coach feedback: "video screen is
+    # too big, make it small and fit"). st.video() with no width bound
+    # fills the FULL page — fine for a landscape batting/bowling overlay,
+    # but this source is typically portrait (a coach filming behind the
+    # bowler's stumps), so full-page-width also meant absurdly tall.
+    # Matches the column-constrained pattern already used for the
+    # batting-analysis video (st.columns([1, 1.5])) elsewhere in this
+    # file, rather than inventing a new layout convention.
+    col_video, _, _ = st.columns([2, 1, 1])
+    with col_video:
+        st.video(web_safe_path)
 
 
 @st.cache_resource
@@ -4284,13 +4308,18 @@ def _render_trajectory_with_fade(video_path: str, points: list, output_path: str
                 if f1 > fade_start_frame:
                     alpha = max(0.15, 1.0 - (f1 - fade_start_frame) / fade_frames)
                 color = tuple(int(c * alpha) for c in (0, 255, 255))
-                cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)), color, 2)
+                # LINE_AA (2026-09-XX, real coach feedback on video polish):
+                # cv2's default line type is aliased/jagged at this thin a
+                # width — anti-aliasing costs nothing extra to compute and
+                # is the single biggest lever for a "professional broadcast
+                # overlay" look vs. a stair-stepped debug line.
+                cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)), color, 2, cv2.LINE_AA)
             for f, px, py in trail:
                 alpha = 1.0
                 if f > fade_start_frame:
                     alpha = max(0.15, 1.0 - (f - fade_start_frame) / fade_frames)
                 color = tuple(int(c * alpha) for c in (0, 0, 255))
-                cv2.circle(frame, (int(px), int(py)), 4, color, -1)
+                cv2.circle(frame, (int(px), int(py)), 4, color, -1, cv2.LINE_AA)
         writer.write(frame)
         idx += 1
     writer.release()
