@@ -49,17 +49,39 @@ LANDMARK_NAMES = [
 # the arms/legs are swinging, unlike e.g. the wrists.
 _TORSO_INDICES = [0, 11, 12, 23, 24]
 
+# Shoulders+hips ONLY (no nose) — used for the APPEARANCE crop, a
+# deliberately different, tighter region than _TORSO_INDICES above (which
+# stays as-is for position/centroid matching — see _centroid_xy). See
+# _compute_appearance_histogram's docstring for why.
+_CLOTHING_BBOX_INDICES = [11, 12, 23, 24]
+
 
 def _centroid_xy(landmarks_list):
     pts = [(landmarks_list[i].x, landmarks_list[i].y) for i in _TORSO_INDICES]
     return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
 
 
-def _bbox_from_landmarks(landmarks, width, height, margin=0.04):
-    xs = [landmarks[i].x for i in _TORSO_INDICES]
-    ys = [landmarks[i].y for i in _TORSO_INDICES]
+def _bbox_from_landmarks(landmarks, width, height, indices=_TORSO_INDICES, margin=0.04, shrink=0.0):
+    """
+    shrink (2026-09-13, real fix — see _compute_appearance_histogram's
+    docstring): pulls the box in toward its own center by this fraction
+    on each side AFTER margin is applied — 0.3 keeps the central 70%.
+    A rectangular box drawn around a handful of sparse landmarks always
+    has background in its corners (a person's real silhouette isn't a
+    rectangle), and that background gets worse the wider the margin —
+    shrinking back toward center trims exactly that contamination without
+    needing a per-pixel body mask.
+    """
+    xs = [landmarks[i].x for i in indices]
+    ys = [landmarks[i].y for i in indices]
     min_x, max_x = max(0.0, min(xs) - margin), min(1.0, max(xs) + margin)
     min_y, max_y = max(0.0, min(ys) - margin), min(1.0, max(ys) + margin)
+    if shrink > 0.0:
+        cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
+        half_w = (max_x - min_x) / 2 * (1.0 - shrink)
+        half_h = (max_y - min_y) / 2 * (1.0 - shrink)
+        min_x, max_x = cx - half_w, cx + half_w
+        min_y, max_y = cy - half_h, cy + half_h
     return int(min_x * width), int(min_y * height), int(max_x * width), int(max_y * height)
 
 
@@ -80,9 +102,32 @@ def _compute_appearance_histogram(frame_bgr, landmarks):
     could not have been responsible for that revert. No broad except
     here for exactly that reason — a real failure should surface in
     testing, not vanish into a default score.
+
+    CROP TIGHTENED (2026-09-13, real bug — see project memory on the
+    bowler-identity seed fix): confirmed on a real clip that this
+    histogram wasn't discriminative enough between two actual different
+    people post-release — cross-person similarity averaged 0.79, barely
+    below either person's own 0.93-0.96 self-similarity, letting the
+    identity walk drift onto the wrong one once a real gap grew the
+    position radius wide enough to reach them. Traced to background
+    contamination: the OLD box used nose+shoulders+hips with a 0.04
+    margin — the nose pulls the top edge up into the neck/lower-face
+    (skin tone, not clothing, and often similar across different real
+    people), and the margin plus the box's own rectangular corners
+    (a person's silhouette isn't a rectangle) both add background pixels
+    that dilute the signal. Measured directly (not guessed) against the
+    same real clip: dropping the nose (shoulders+hips only), removing the
+    margin, and shrinking the box to its central 70% took cross-person
+    similarity from 0.79 down to 0.005, while each person's own self-
+    similarity stayed a real, usable 0.38-0.42 — a clean, verified
+    separation instead of a marginal one. Position matching (_centroid_xy,
+    _TORSO_INDICES) is deliberately UNCHANGED — the nose is still a good,
+    stable point for tracking WHERE someone is; it's specifically a poor
+    ingredient for WHAT they look like.
     """
     height, width = frame_bgr.shape[:2]
-    x1, y1, x2, y2 = _bbox_from_landmarks(landmarks, width, height)
+    x1, y1, x2, y2 = _bbox_from_landmarks(
+        landmarks, width, height, indices=_CLOTHING_BBOX_INDICES, margin=0.0, shrink=0.3)
     if x2 <= x1 or y2 <= y1:
         return None
     roi = frame_bgr[y1:y2, x1:x2]

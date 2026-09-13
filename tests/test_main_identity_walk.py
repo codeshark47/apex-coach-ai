@@ -43,6 +43,78 @@ _HIST_A = _hist((2, 2))     # "the real bowler"'s appearance
 _HIST_B = _hist((14, 14))   # a completely different appearance
 
 
+class TestAppearanceCropTightening:
+    """
+    REAL BUG (2026-09-13, traced on the same real clip as the seed-match
+    fix): the OLD appearance crop (nose+shoulders+hips, margin=0.04, no
+    shrink) wasn't discriminative enough between two actual different
+    people post-release — cross-person similarity averaged 0.79 against
+    each person's own 0.93-0.96 self-similarity, letting the identity
+    walk drift onto the wrong one. Measured directly against the real
+    clip that dropping the nose, removing the margin, and shrinking to
+    the central 70% took cross-person similarity down to 0.005. These
+    tests pin down the crop geometry itself (fast, synthetic, no video).
+    """
+
+    def test_shrink_reduces_box_size_around_the_same_center(self):
+        landmarks = _torso_landmarks(0.5, 0.5, spread=0.10)
+        x1, y1, x2, y2 = main._bbox_from_landmarks(landmarks, 1000, 1000, margin=0.0, shrink=0.0)
+        sx1, sy1, sx2, sy2 = main._bbox_from_landmarks(landmarks, 1000, 1000, margin=0.0, shrink=0.3)
+        assert (sx2 - sx1) < (x2 - x1)
+        assert (sy2 - sy1) < (y2 - y1)
+        # Same center, just tighter.
+        assert abs((sx1 + sx2) - (x1 + x2)) <= 2
+        assert abs((sy1 + sy2) - (y1 + y2)) <= 2
+
+    def test_clothing_indices_exclude_the_nose(self):
+        """The nose sits well above the shoulder/hip box (a real face is
+        above the torso) — using _CLOTHING_BBOX_INDICES must not extend
+        the box up to include it, unlike _TORSO_INDICES."""
+        landmarks = _torso_landmarks(0.5, 0.5, spread=0.05)
+        landmarks[0] = _FakeLandmark(0.5, 0.05)  # nose far above the torso box
+        full_x1, full_y1, full_x2, full_y2 = main._bbox_from_landmarks(
+            landmarks, 1000, 1000, indices=main._TORSO_INDICES, margin=0.0)
+        clothing_x1, clothing_y1, clothing_x2, clothing_y2 = main._bbox_from_landmarks(
+            landmarks, 1000, 1000, indices=main._CLOTHING_BBOX_INDICES, margin=0.0)
+        assert full_y1 < clothing_y1  # full box reaches up to the nose; clothing box doesn't
+
+    def test_default_indices_match_torso_for_backward_compatibility(self):
+        """No caller currently omits `indices`, but the default must still
+        be the original torso set — never a silent behavior change for a
+        hypothetical future caller that doesn't pass it explicitly."""
+        landmarks = _torso_landmarks(0.5, 0.5, spread=0.05)
+        default_box = main._bbox_from_landmarks(landmarks, 1000, 1000, margin=0.0)
+        explicit_box = main._bbox_from_landmarks(
+            landmarks, 1000, 1000, indices=main._TORSO_INDICES, margin=0.0)
+        assert default_box == explicit_box
+
+
+class TestComputeAppearanceHistogramUsesTightenedCrop:
+    def test_histogram_ignores_a_differently_colored_nose_region(self):
+        """Build a synthetic frame where the area around the nose is a
+        totally different color from the shoulder/hip area — the computed
+        histogram must match one built from the shoulder/hip region alone,
+        proving the nose region is excluded, not just down-weighted."""
+        import cv2
+        import numpy as np
+
+        frame = np.zeros((400, 400, 3), dtype=np.uint8)
+        frame[:, :] = (0, 255, 0)          # whole frame green (stand-in "nose/background" color)
+        frame[150:350, 100:300] = (0, 0, 255)  # a red region covering the shoulder/hip area
+
+        landmarks = _torso_landmarks(0.5, 0.5, spread=0.25)  # shoulders/hips ~ (100-300, 150-350) in px
+        landmarks[0] = _FakeLandmark(0.5, 0.05)  # nose far above, still in the green region
+
+        hist = main._compute_appearance_histogram(frame, landmarks)
+        red_only_region = frame[150:350, 100:300]
+        hsv = cv2.cvtColor(red_only_region, cv2.COLOR_BGR2HSV)
+        reference_hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(reference_hist, reference_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+        similarity = main._hist_similarity(hist, reference_hist)
+        assert similarity > 0.99
+
+
 def test_appearance_gate_rejects_a_positionally_plausible_but_wrong_looking_candidate():
     """
     Direct regression test for the real bug found validating against real
