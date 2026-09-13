@@ -169,3 +169,67 @@ class TestDailyReset:
         assert result == {"used": 0, "limit": ul.DEFAULT_FREE_LIMIT, "remaining": ul.DEFAULT_FREE_LIMIT}
         assert store["new-coach"]["used_count"] == 0
         assert "usage_date" not in store["new-coach"]
+
+
+class _RaisingTable:
+    """Simulates a total Supabase outage — every call raises."""
+    def select(self, *_a): return self
+    def eq(self, *_a): return self
+    def update(self, *_a): return self
+    def insert(self, *_a): return self
+    def execute(self):
+        raise Exception("Connection timed out")
+
+
+class _RaisingClient:
+    def table(self, _name):
+        return _RaisingTable()
+
+
+class TestOutageResilience:
+    """
+    REAL BUG (2026-09-13, found in a robustness audit): get_usage/
+    record_usage ran with NO try/except at all around the demo_usage
+    Supabase calls. payments.get_subscription (called first, on the very
+    same outage) already gracefully falls back to {"tier": "free"} — but
+    that's exactly the path this code took right into the unguarded
+    crash, one line later. A Supabase hiccup used to take down the ENTIRE
+    app for every coach, since get_usage runs unconditionally on every
+    script rerun, not just on "Execute Analysis". Must now fail open
+    (never block a coach's analysis over a usage-counter outage) instead
+    of crashing the page.
+    """
+
+    def test_get_usage_survives_a_total_outage(self):
+        with patch("usage_limits.get_client", return_value=_RaisingClient()), \
+             patch("payments.get_client", return_value=_RaisingClient()):
+            result = ul.get_usage("user-1")
+        assert result == {"used": 0, "limit": ul.DEFAULT_FREE_LIMIT, "remaining": ul.DEFAULT_FREE_LIMIT}
+
+    def test_record_usage_survives_a_total_outage_and_returns_current(self):
+        """Called right after a coach's analysis has genuinely finished —
+        must never crash and lose their finished results over a usage-
+        counter write failing."""
+        with patch("usage_limits.get_client", return_value=_RaisingClient()), \
+             patch("payments.get_client", return_value=_RaisingClient()):
+            result = ul.record_usage("user-1")
+        assert result == {"used": 0, "limit": ul.DEFAULT_FREE_LIMIT, "remaining": ul.DEFAULT_FREE_LIMIT}
+
+    def test_record_usage_outage_after_a_real_read_returns_that_reads_count(self):
+        """The read (get_usage) succeeds and shows real prior usage; only
+        the increment-write fails — must return the LAST KNOWN GOOD
+        count, not silently reset to 0."""
+        store = {"user-1": {"user_id": "user-1", "used_count": 3, "free_limit": 10, "usage_date": TODAY}}
+
+        class _WriteFailsTable(_FakeTable):
+            def update(self, values):
+                raise Exception("Connection timed out")
+
+        class _WriteFailsClient(_FakeClient):
+            def table(self, _name):
+                return _WriteFailsTable(self.store)
+
+        with patch("usage_limits.get_client", return_value=_WriteFailsClient(store)), \
+             patch("payments.get_client", return_value=_FakeClient({})):
+            result = ul.record_usage("user-1")
+        assert result == {"used": 3, "limit": 10, "remaining": 7}

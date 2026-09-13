@@ -53,6 +53,18 @@ def estimate_camera_angle(df: pd.DataFrame, reference_frame_idx: int,
     upright (e.g. BFC or FFC) — using the run mid-point avoids picking a
     frame with an extreme, non-representative body pose.
     """
+    # BUG FIX (2026-09-13, robustness audit): an empty df (e.g. a video
+    # main.extract_video_landmarks couldn't read a single frame from) used
+    # to fall through the check below unguarded — reference_frame_idx got
+    # reassigned to len(df)//2 = 0, which is STILL out of bounds for a
+    # zero-row frame, and df.iloc[0] a few lines down raised a raw,
+    # unrelated-looking IndexError instead of this function's own honest
+    # "unavailable" result. main.py now catches this earlier for its own
+    # normal path, but this guard stays as real, cheap protection for any
+    # other/future caller that hands this function an empty dataframe.
+    if df.empty:
+        return AngleEstimate("unavailable", None, "No landmark data available.")
+
     required = ["LEFT_SHOULDER_x", "RIGHT_SHOULDER_x", "NOSE_y",
                 "LEFT_ANKLE_y", "RIGHT_ANKLE_y"]
     if not all(c in df.columns for c in required):

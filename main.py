@@ -468,10 +468,36 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
 
     if not os.path.exists(model_path):
         model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+        # BUG FIX (2026-09-13, robustness audit): urlretrieve used to write
+        # straight to model_path — a network drop mid-transfer, or a
+        # redirect to an HTML error page saved as if it were the model,
+        # left a PARTIAL/CORRUPT file there with no validation. Every
+        # subsequent run's os.path.exists(model_path) check above was then
+        # true, so it never re-downloaded and crashed uncaught deeper in
+        # this function (PoseLandmarker.create_from_options) on every
+        # single call until someone manually deleted the file. Now
+        # downloads to a temp path first, validates a minimum real size
+        # (the genuine model is ~9.4MB; a truncated/error-page download is
+        # nowhere close), and only moves it into place once confirmed —
+        # cleaning up the temp file on any failure so the next run gets a
+        # clean retry instead of a permanently poisoned cache.
+        MIN_MODEL_SIZE_BYTES = 1_000_000
+        tmp_model_path = model_path + ".part"
         try:
-            urllib.request.urlretrieve(model_url, model_path)
+            urllib.request.urlretrieve(model_url, tmp_model_path)
+            if not os.path.exists(tmp_model_path) or os.path.getsize(tmp_model_path) < MIN_MODEL_SIZE_BYTES:
+                raise IOError(
+                    f"Downloaded model file is too small to be genuine "
+                    f"({os.path.getsize(tmp_model_path) if os.path.exists(tmp_model_path) else 0} bytes)."
+                )
+            os.replace(tmp_model_path, model_path)
         except Exception as e:
             monitoring.capture(e)
+            if os.path.exists(tmp_model_path):
+                try:
+                    os.remove(tmp_model_path)
+                except OSError:
+                    pass
             return {"status": "error", "error_message": f"Failed to download model file: {str(e)}"}
 
     try:
@@ -552,8 +578,46 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
     # (multi-pose) for several frames. When a seed is given, this result
     # is used as a preferred data SOURCE, not authoritative on its own —
     # see the merge logic below for why.
-    single_pass_candidates, _ = run_detection_pass(1)
+    # BUG FIX (2026-09-13, robustness audit): the model file can exist and
+    # pass the download-size check above yet still not be a genuinely
+    # valid model (disk corruption, manual tampering, or any failure mode
+    # the size check doesn't catch) — vision.PoseLandmarker.create_from_
+    # options raises a native error in that case, previously uncaught here
+    # and crashing every single call until someone manually deleted the
+    # file. Caught at the first real use, with the poisoned file removed
+    # so the NEXT call gets a clean re-download instead of repeating the
+    # same crash forever.
+    try:
+        single_pass_candidates, _ = run_detection_pass(1)
+    except Exception as e:
+        monitoring.capture(e)
+        if os.path.exists(model_path):
+            try:
+                os.remove(model_path)
+            except OSError:
+                pass
+        return {"status": "error", "error_message": f"Pose detection model failed to load: {str(e)}"}
     total_frames = len(single_pass_candidates)
+    # BUG FIX (2026-09-13, robustness audit): a corrupted/truncated/0-byte
+    # upload, or a genuinely unreadable codec (most likely to reach here
+    # specifically when ffmpeg isn't on PATH — see
+    # orchestrator.compress_video_file's own comment on that fallback),
+    # used to fall all the way through this function reporting
+    # "status": "success" with an empty landmarks dataframe — no video
+    # was actually ever readable, but nothing said so. Downstream code
+    # (e.g. camera_angle_detection.estimate_camera_angle's own df.iloc[0])
+    # assumes AT LEAST ONE real frame exists and crashes on this silently-
+    # empty result instead. Caught here, at the source, with a clear
+    # message instead of an unrelated-looking crash several calls later.
+    if total_frames == 0:
+        return {
+            "status": "error",
+            "error_message": (
+                "Could not read any frames from this video. The file may be corrupted, "
+                "empty, or in a format this app can't decode — try re-exporting or "
+                "re-uploading it."
+            ),
+        }
     single_pose_chosen = [cands[0] if cands else None for cands in single_pass_candidates]
 
     if seed_point is None:

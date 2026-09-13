@@ -164,6 +164,31 @@ class TestGetMonthlyUsage:
         assert result["limit"] >= pm.UNLIMITED_DISPLAY_THRESHOLD
         assert result["remaining"] > 0
 
+    def test_window_reset_write_failure_does_not_crash(self):
+        """REAL BUG (2026-09-13, robustness audit): the period-reset
+        write sat OUTSIDE the read's own try/except — a transient failure
+        here used to crash every page load for a paying subscriber whose
+        30-day window had just rolled over, even though the read that
+        determined "used should now be 0" already succeeded. The in-
+        memory reset must still be reported even if persisting it fails."""
+        stale = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "starter", "used_this_period": 9, "period_start": stale}}
+
+        class _WriteFailsTable(_FakeTable):
+            def update(self, values):
+                raise Exception("Connection timed out")
+
+        class _WriteFailsClient(_FakeClient):
+            def table(self, name):
+                if name == "subscriptions":
+                    return _WriteFailsTable(self.subs_store)
+                return super().table(name)
+
+        with patch("payments.get_client", return_value=_WriteFailsClient(subs)):
+            result = pm.get_monthly_usage("user-1")
+        assert result["used"] == 0
+        assert result["remaining"] == pm.TIER_MONTHLY_LIMITS["starter"]
+
 
 class TestRecordMonthlyUsage:
     def test_increments_used_this_period(self):
@@ -173,6 +198,29 @@ class TestRecordMonthlyUsage:
             result = pm.record_monthly_usage("user-1")
         assert result["used"] == 3
         assert client.subs_store["user-1"]["used_this_period"] == 3
+
+    def test_write_failure_returns_current_usage_instead_of_crashing(self):
+        """REAL BUG (2026-09-13, robustness audit): called right after a
+        paying coach's analysis has genuinely finished — the worst
+        possible moment for an unrelated usage-counter write to crash the
+        page and lose their results. Must fail open."""
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        subs = {"user-1": {"user_id": "user-1", "tier": "starter", "used_this_period": 2, "period_start": recent}}
+
+        class _WriteFailsTable(_FakeTable):
+            def update(self, values):
+                raise Exception("Connection timed out")
+
+        class _WriteFailsClient(_FakeClient):
+            def table(self, name):
+                if name == "subscriptions":
+                    return _WriteFailsTable(self.subs_store)
+                return super().table(name)
+
+        with patch("payments.get_client", return_value=_WriteFailsClient(subs)):
+            result = pm.record_monthly_usage("user-1")
+        assert result["used"] == 2  # unchanged -- the read succeeded, only the increment-write failed
+        assert result["limit"] == pm.TIER_MONTHLY_LIMITS["starter"]
 
 
 class TestSubmitPayment:

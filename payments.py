@@ -167,9 +167,21 @@ def get_monthly_usage(user_id: str) -> dict:
 
     if period_start is None or now >= period_start + timedelta(days=USAGE_PERIOD_DAYS):
         used = 0
-        client.table("subscriptions").update(
-            {"used_this_period": 0, "period_start": now.isoformat()}
-        ).eq("user_id", user_id).execute()
+        # BUG FIX (2026-09-13, robustness audit): this write sat OUTSIDE
+        # the try/except above — a transient failure here (the read just
+        # above it can succeed and this one still fail) crashed every
+        # page load for a paying subscriber whose window had just rolled
+        # over. The in-memory `used = 0` already reflects the correct
+        # reset regardless of whether the persist succeeds — this is a
+        # cache write, not the source of truth for THIS call, so a failed
+        # persist here should degrade to "try again next call," not a
+        # crash.
+        try:
+            client.table("subscriptions").update(
+                {"used_this_period": 0, "period_start": now.isoformat()}
+            ).eq("user_id", user_id).execute()
+        except Exception as e:
+            monitoring.capture(e)
 
     return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
 
@@ -180,10 +192,21 @@ def record_monthly_usage(user_id: str) -> dict:
     a new window just started). Call this ONLY after an analysis has
     genuinely completed successfully, same rule as usage_limits.record_usage."""
     current = get_monthly_usage(user_id)  # ensures the window reset has happened
-    client = get_client()
-    new_used = current["used"] + 1
-    client.table("subscriptions").update({"used_this_period": new_used}).eq("user_id", user_id).execute()
-    return {"used": new_used, "limit": current["limit"], "remaining": max(0, current["limit"] - new_used)}
+    # BUG FIX (2026-09-13, robustness audit): same real gap as
+    # usage_limits.record_usage — called right after a paying coach's
+    # analysis has genuinely finished, the worst moment for an unrelated
+    # usage-counter write to crash the page and lose their results. Fail
+    # open: if the write fails, the coach still sees their analysis; the
+    # count just isn't incremented this one time (logged, not silently
+    # invisible).
+    try:
+        client = get_client()
+        new_used = current["used"] + 1
+        client.table("subscriptions").update({"used_this_period": new_used}).eq("user_id", user_id).execute()
+        return {"used": new_used, "limit": current["limit"], "remaining": max(0, current["limit"] - new_used)}
+    except Exception as e:
+        monitoring.capture(e)
+        return current
 
 
 def submit_payment(user_id: str, user_email: str, tier: str, billing_period: str,

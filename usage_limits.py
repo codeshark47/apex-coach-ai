@@ -73,29 +73,43 @@ def get_usage(user_id: str) -> dict:
     if sub["tier"] != "free":
         return payments.get_monthly_usage(user_id)
 
-    client = get_client()
-    result = client.table("demo_usage").select("*").eq("user_id", user_id).execute()
-    today = date.today().isoformat()
+    # BUG FIX (2026-09-13, real gap found in a robustness audit): this
+    # whole block used to run with no try/except at all — the ONE path
+    # payments.get_subscription's own _free_fallback() routes every coach
+    # into during a real Supabase outage (it correctly swallows the error
+    # and returns "free" tier) was, one line later, the exact path with
+    # no protection of its own, so the outage crashed the page anyway,
+    # just one function deeper. Same "never crash a coach's session over
+    # infrastructure, fail toward letting them keep working" philosophy
+    # as _free_fallback — a usage-limit soft-gate should never be the
+    # reason an outage takes down analysis entirely.
+    try:
+        client = get_client()
+        result = client.table("demo_usage").select("*").eq("user_id", user_id).execute()
+        today = date.today().isoformat()
 
-    if result.data:
-        row = result.data[0]
-        limit = row["free_limit"]
-        # "usage_date" absent (pre-migration row/column) reads as None,
-        # which is never == today — but with no date column to tell "new
-        # day" apart from "column just doesn't exist," treating every
-        # call as same-day (skip the reset) is the correct pre-migration
-        # fallback: it's exactly today's old lifetime-cap behavior.
-        if "usage_date" in row and row["usage_date"] != today:
-            used = 0
-            _write_usage(client, user_id, 0, today)
+        if result.data:
+            row = result.data[0]
+            limit = row["free_limit"]
+            # "usage_date" absent (pre-migration row/column) reads as None,
+            # which is never == today — but with no date column to tell "new
+            # day" apart from "column just doesn't exist," treating every
+            # call as same-day (skip the reset) is the correct pre-migration
+            # fallback: it's exactly today's old lifetime-cap behavior.
+            if "usage_date" in row and row["usage_date"] != today:
+                used = 0
+                _write_usage(client, user_id, 0, today)
+            else:
+                used = row["used_count"]
         else:
-            used = row["used_count"]
-    else:
-        used = 0
-        limit = DEFAULT_FREE_LIMIT
-        _write_usage(client, user_id, used, today, extra={"user_id": user_id, "free_limit": limit})
+            used = 0
+            limit = DEFAULT_FREE_LIMIT
+            _write_usage(client, user_id, used, today, extra={"user_id": user_id, "free_limit": limit})
 
-    return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
+        return {"used": used, "limit": limit, "remaining": max(0, limit - used)}
+    except Exception as e:
+        monitoring.capture(e)
+        return {"used": 0, "limit": DEFAULT_FREE_LIMIT, "remaining": DEFAULT_FREE_LIMIT}
 
 
 def record_usage(user_id: str) -> dict:
@@ -114,10 +128,21 @@ def record_usage(user_id: str) -> dict:
         return payments.record_monthly_usage(user_id)
 
     current = get_usage(user_id)  # ensures row exists and today's reset has happened
-    client = get_client()
-    new_used = current["used"] + 1
-    _write_usage(client, user_id, new_used, date.today().isoformat())
-    return {"used": new_used, "limit": current["limit"], "remaining": max(0, current["limit"] - new_used)}
+    # BUG FIX (2026-09-13, robustness audit): this is called right after a
+    # coach's analysis has genuinely finished — the worst possible moment
+    # for an unrelated usage-counter write to crash the page and lose their
+    # finished results. Same fail-open philosophy as get_usage above: if
+    # the write fails, the coach still sees their analysis; the count is
+    # just not incremented this one time (logged, not silently lost from
+    # visibility).
+    try:
+        client = get_client()
+        new_used = current["used"] + 1
+        _write_usage(client, user_id, new_used, date.today().isoformat())
+        return {"used": new_used, "limit": current["limit"], "remaining": max(0, current["limit"] - new_used)}
+    except Exception as e:
+        monitoring.capture(e)
+        return current
 
 
 def is_admin(email: str) -> bool:

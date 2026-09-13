@@ -2200,7 +2200,16 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
     # design intended. See add_camera_calibrations.sql for the real fix —
     # this lets a coach reload a named setup instantly instead.
     if not st.session_state.calibration:
-        _saved_calibrations = store.list_calibrations(st.session_state.auth_user["id"])
+        # BUG FIX (2026-09-13, robustness audit): unlike the neighboring
+        # store.list_athletes/get_athlete_history calls above (which are
+        # guarded), this one ran with no try/except at all — a Supabase
+        # blip while just opening this page crashed it outright.
+        try:
+            _saved_calibrations = store.list_calibrations(st.session_state.auth_user["id"])
+        except Exception as e:
+            monitoring.capture(e)
+            _saved_calibrations = []
+            st.error(f"Could not load saved calibrations: {e}")
         if _saved_calibrations:
             _saved_labels = [c["setup_label"] for c in _saved_calibrations]
             _load_choice = st.selectbox(
@@ -2369,11 +2378,22 @@ with st.expander("Calibrate camera for speed (once per setup)", expanded=False):
         with save_col2:
             st.write("")
             if st.button("💾 Save for future sessions", use_container_width=True, disabled=not setup_name.strip()):
-                store.save_calibration(
-                    st.session_state.auth_user["id"], setup_name,
-                    c.to_dict(), st.session_state.get("calibration_frame_width", 0),
-                )
-                st.success(f"Saved — reload it anytime as \"{setup_name.strip()}\".")
+                # BUG FIX (2026-09-13, robustness audit): unguarded — a
+                # Supabase blip here used to crash the page right as the
+                # coach clicked save, losing the calibration they'd just
+                # walked through instead of just failing this one save.
+                try:
+                    store.save_calibration(
+                        st.session_state.auth_user["id"], setup_name,
+                        c.to_dict(), st.session_state.get("calibration_frame_width", 0),
+                    )
+                    st.success(f"Saved — reload it anytime as \"{setup_name.strip()}\".")
+                except Exception as e:
+                    monitoring.capture(e)
+                    st.error(
+                        f"Could not save this calibration ({e}) — it's still active for this "
+                        f"session, just not saved for next time. Try again in a moment."
+                    )
 
         if st.button("Clear calibration"):
             st.session_state.calibration = None
