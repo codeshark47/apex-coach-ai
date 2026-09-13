@@ -14,6 +14,7 @@ import pandas as pd
 from orchestrator import run_complete_bowling_analysis
 import orchestrator as o
 from coaching_agent import generate_biomechanical_coaching_report
+import main
 
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
@@ -2516,6 +2517,77 @@ else:
         uploaded_rear = None
 
 
+@st.cache_resource
+def _get_seed_check_landmarker():
+    """
+    A single, reused (2026-09-13) MediaPipe PoseLandmarker for the
+    click-time detection check below — IMAGE mode (a one-off still, not
+    a video stream), same model file and confidence thresholds as
+    main.py's own seeded multi-pose pass, so this check tells the truth
+    about what the real walk will see. Cached as a Streamlit resource so
+    the (slow) model load only happens once per server process, not once
+    per click. Returns None if the model file isn't available yet — the
+    caller treats that as "can't check," not "check failed."
+    """
+    model_path = os.path.join("models", "pose_landmarker_full.task")
+    if not os.path.exists(model_path):
+        return None
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_poses=3,
+        min_pose_detection_confidence=0.3,
+        min_pose_presence_confidence=0.3,
+    )
+    return vision.PoseLandmarker.create_from_options(options)
+
+
+def _seed_click_found_a_person(pil_img, click_xy) -> bool:
+    """
+    REAL GAP FOUND (2026-09-13, traced on a real coach-reported failure):
+    the seed-click UI silently accepted ANY click and only main.py's
+    walk later discovered — sometimes many frames downstream, visible
+    only in the diagnostic images — whether MediaPipe actually detected
+    a real person there. Confirmed directly: on a crowded real clip, the
+    bowler is only reliably detectable in a narrow ~12-frame window out
+    of 140 (motion blur during his run/jump, not a confidence-threshold
+    problem — verified a lower threshold doesn't meaningfully widen it);
+    a coach's 4 clicks spread naturally across the clip are quite likely
+    to miss that narrow window entirely, leaving nothing real for the
+    identity walk to anchor on, however good the walk's own selection
+    logic is.
+
+    Runs the SAME detection pass and SEED_MATCH_TOLERANCE main.py's own
+    seed-matching uses (main.SEED_MATCH_TOLERANCE — imported, never a
+    separate copy that could drift) directly on this one still frame —
+    gives the coach an honest, immediate answer to "did this click just
+    work," instead of a silent accept that only fails later, invisibly.
+    Returns True/False, or None if the model isn't available to check
+    (caller must not block on that — see _get_seed_check_landmarker).
+    """
+    landmarker = _get_seed_check_landmarker()
+    if landmarker is None:
+        return None
+    import numpy as np
+    import mediapipe as mp
+    frame_rgb = np.array(pil_img.convert("RGB"))
+    height, width = frame_rgb.shape[:2]
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+    result = landmarker.detect(mp_image)
+    if not result.pose_landmarks:
+        return False
+    click_x_norm, click_y_norm = click_xy[0] / width, click_xy[1] / height
+    for landmarks in result.pose_landmarks:
+        cx, cy = main._centroid_xy(landmarks)
+        dist = ((cx - click_x_norm) ** 2 + (cy - click_y_norm) ** 2) ** 0.5
+        if dist <= main.SEED_MATCH_TOLERANCE:
+            return True
+    return False
+
+
 def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: str = None):
     """
     One-time-per-video step: save the upload, show a scrubbable reference
@@ -2550,6 +2622,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
     point_key = f"{key_prefix}_seed_point"
     frame_key = f"{key_prefix}_seed_frame"
     identity_key = f"{key_prefix}_seed_identity"
+    detected_key = f"{key_prefix}_seed_click_detected"
     shared_ref_identity_key = f"_{save_key}_shared_seed_ref_identity"
     # Deliberately the SAME name the old key_prefix-scoped version used
     # (e.g. "single_seed_ref_path") — several places further down the
@@ -2582,6 +2655,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
         st.session_state[identity_key] = file_identity
         st.session_state[point_key] = None
         st.session_state[frame_key] = 0
+        st.session_state[detected_key] = None
 
     ref_path = st.session_state[shared_ref_path_key]
     total_frames = cal.get_frame_count(ref_path)
@@ -2631,6 +2705,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
 
         if st.session_state.get(f"_{key_prefix}_last_frame_idx") != frame_idx:
             st.session_state[point_key] = None
+            st.session_state[detected_key] = None
             st.session_state[f"_{key_prefix}_last_frame_idx"] = frame_idx
 
         if frame is not None:
@@ -2642,7 +2717,24 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             if point is None:
                 st.caption("📍 Click directly on the bowler below.")
             else:
-                st.caption("✅ Bowler confirmed — click again to move the marker.")
+                detected = st.session_state.get(detected_key)
+                if detected is False:
+                    st.warning(
+                        "⚠️ No person detected right at this click — this frame likely won't "
+                        "anchor the tracker (the bowler may be too small, blurred, or "
+                        "mid-motion here). Try scrubbing to a nearby frame where he's clearly "
+                        "visible and standing/running normally, then click again."
+                    )
+                elif detected is True:
+                    st.caption(
+                        "✅ A real person is detected right at this click — this frame will "
+                        "anchor the tracker. (This only confirms someone is there, not that "
+                        "it's the bowler — that part is still on you.)"
+                    )
+                else:
+                    # Model unavailable to check, or not yet computed for this
+                    # exact point — don't claim more confidence than we have.
+                    st.caption("✅ Bowler confirmed — click again to move the marker.")
 
             new_point = render_zoomable_click_image(
                 pil_img, key_prefix=f"{key_prefix}_seed", marker_point=point,
@@ -2651,6 +2743,9 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             if new_point is not None and st.session_state.get(point_key) != new_point:
                 st.session_state[point_key] = new_point
                 st.session_state[frame_key] = frame_idx
+                # See _seed_click_found_a_person's docstring — computed once,
+                # right when this click is registered, not on every rerun.
+                st.session_state[detected_key] = _seed_click_found_a_person(pil_img, new_point)
                 st.rerun()
 
             if st.session_state.get(point_key) is not None:

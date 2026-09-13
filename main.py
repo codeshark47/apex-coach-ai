@@ -55,6 +55,13 @@ _TORSO_INDICES = [0, 11, 12, 23, 24]
 # _compute_appearance_histogram's docstring for why.
 _CLOTHING_BBOX_INDICES = [11, 12, 23, 24]
 
+# Module-level (2026-09-13, promoted out of _walk_from_seed) so
+# streamlit_app.py's click-time "did this seed click actually find a real
+# person" check (see render_bowler_seed_ui) uses the EXACT same radius
+# the real walk matches against — a UI-side copy of this number could
+# silently drift from the real one and start giving false reassurance.
+SEED_MATCH_TOLERANCE = 0.08
+
 
 def _centroid_xy(landmarks_list):
     pts = [(landmarks_list[i].x, landmarks_list[i].y) for i in _TORSO_INDICES]
@@ -299,8 +306,8 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
     # a very imprecise click matches nobody and this zone falls back to
     # position-only tracking from the raw click (the existing, already-
     # tested "no seed candidate" path) — never a confident lock onto the
-    # wrong person the way a loose radius could.
-    SEED_MATCH_TOLERANCE = 0.08
+    # wrong person the way a loose radius could. (Now a module-level
+    # constant — see its own definition above.)
     MAX_DIST_PER_SECOND = 0.6
     MAX_DIST_CAP = 0.25
     MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
