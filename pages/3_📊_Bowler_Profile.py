@@ -105,8 +105,18 @@ except Exception as e:
 
 try:
     teams = store.list_teams(coach_user_id)
-except Exception:
-    teams = []  # add_teams.sql not applied yet — profile still works, just no team feature
+except Exception as e:
+    # BUG FIX (2026-09-13, robustness audit): this used to swallow ANY
+    # failure here, not just the documented "add_teams.sql not applied
+    # yet" case — a genuine RLS/permissions bug would look identical to
+    # a harmless pre-migration state, with zero visibility either way.
+    # payments._table_missing distinguishes "table doesn't exist" (the
+    # real, expected, pre-migration case — stays silent, profile still
+    # works with no team feature) from anything else (now captured).
+    from payments import _table_missing
+    if not _table_missing(e):
+        monitoring.capture(e)
+    teams = []
 team_names_by_id = {t["id"]: t["name"] for t in teams}
 
 # ====================================================================

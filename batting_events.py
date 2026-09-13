@@ -31,6 +31,8 @@ seeing the ball either).
 import numpy as np
 import pandas as pd
 
+import monitoring
+
 
 def detect_batting_hand(df: pd.DataFrame, stance_frame: int) -> str:
     """
@@ -54,7 +56,12 @@ def detect_batting_hand(df: pd.DataFrame, stance_frame: int) -> str:
         if np.isnan(l_y) or np.isnan(r_y):
             return "left"
         return "left" if l_y <= r_y else "right"
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): never called
+        # monitoring.capture — a genuine code bug here was indistinguishable
+        # from a real missing-stance-frame case, both silently defaulting to
+        # "left" with zero visibility in error tracking.
+        monitoring.capture(e)
         return "left"
 
 

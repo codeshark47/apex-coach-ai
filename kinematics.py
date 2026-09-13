@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 
+import monitoring
+
 def calculate_knee_bracing(row: pd.Series, lead_side: str = "left") -> dict:
     """
     Computes the 2D angle of the lead knee joint via Law of Cosines.
@@ -49,7 +51,13 @@ def calculate_knee_bracing(row: pd.Series, lead_side: str = "left") -> dict:
         # never contradict the real data.
         tier = "Extended-Knee Technique" if angle >= 170.0 else "Flexed-Knee Technique"
         return {"degrees": angle, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): this except never called
+        # monitoring.capture — a genuine code bug (KeyError/AttributeError
+        # from a schema/column-name change) was indistinguishable from a
+        # real tracking dropout, both silently reporting "Data Deficit"
+        # with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 def calculate_trunk_lean(row: pd.Series) -> dict:
@@ -109,7 +117,13 @@ def calculate_trunk_lean(row: pd.Series) -> dict:
         # "Optimal <= 8 degrees" cutoff did.
         tier = "Effective Forward Drive" if angle >= 13.0 else "Insufficient Forward Lean"
         return {"degrees": angle, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): this except never called
+        # monitoring.capture — a genuine code bug (KeyError/AttributeError
+        # from a schema/column-name change) was indistinguishable from a
+        # real tracking dropout, both silently reporting "Data Deficit"
+        # with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 def calculate_rear_knee_angle(row: pd.Series, trail_side: str = "right") -> dict:
@@ -150,7 +164,13 @@ def calculate_rear_knee_angle(row: pd.Series, trail_side: str = "right") -> dict
 
         tier = "Extended Rear Knee" if angle >= 170.0 else "Flexed Rear Knee"
         return {"degrees": angle, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): this except never called
+        # monitoring.capture — a genuine code bug (KeyError/AttributeError
+        # from a schema/column-name change) was indistinguishable from a
+        # real tracking dropout, both silently reporting "Data Deficit"
+        # with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 
@@ -217,7 +237,13 @@ def calculate_rear_hip_flexion(row: pd.Series, trail_side: str = "right") -> dic
 
         tier = "Elevated Injury-Risk Loading" if flexion > 30.0 else "Within Typical Range"
         return {"degrees": flexion, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): this except never called
+        # monitoring.capture — a genuine code bug (KeyError/AttributeError
+        # from a schema/column-name change) was indistinguishable from a
+        # real tracking dropout, both silently reporting "Data Deficit"
+        # with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 
@@ -282,5 +308,6 @@ def calculate_head_stability(df: pd.DataFrame, start_frame: int, end_frame: int)
 
         tier = "Elite Fixed Gaze Focus" if std_dev <= 0.08 else "Erratic Lateral Head Drift"
         return {"deviation_index": f"{std_dev}", "tier": tier, "status": "success", "recalibration_pending": True}
-    except Exception:
+    except Exception as e:
+        monitoring.capture(e)
         return {"deviation_index": None, "tier": "Data Deficit", "status": "error", "recalibration_pending": False}

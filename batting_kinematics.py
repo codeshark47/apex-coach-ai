@@ -58,6 +58,8 @@ release-detection confidence in the bowling pipeline.
 import numpy as np
 import pandas as pd
 
+import monitoring
+
 
 def _derive_batting_axes(df: pd.DataFrame, stance_frame: int, contact_frame: int,
                           front_side: str):
@@ -135,7 +137,8 @@ def _derive_batting_axes(df: pd.DataFrame, stance_frame: int, contact_frame: int
             return {"status": "error"}
 
         return {"local_x": local_x, "local_y": local_y, "status": "success"}
-    except Exception:
+    except Exception as e:
+        monitoring.capture(e)
         return {"status": "error"}
 
 
@@ -318,7 +321,8 @@ def calculate_front_foot_alignment(df: pd.DataFrame, stance_frame: int, contact_
             "tier": tier,
             "status": "success",
         }
-    except Exception:
+    except Exception as e:
+        monitoring.capture(e)
         return {"signed_degrees": None, "side": None, "deviation_degrees": None,
                  "tier": "Data Deficit", "status": "error"}
 
@@ -401,7 +405,8 @@ def calculate_weight_transfer(df: pd.DataFrame, stance_frame: int, contact_frame
         else:
             tier = "Stuck On The Back Foot"
         return {"percent": percent, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        monitoring.capture(e)
         return {"percent": None, "tier": "Data Deficit", "status": "error"}
 
 
@@ -448,7 +453,12 @@ def calculate_downswing_plane(df: pd.DataFrame, backlift_frame: int, contact_fra
         else:
             tier = "Round-The-Body Swing"
         return {"degrees": angle, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): never called
+        # monitoring.capture — a genuine code bug was indistinguishable
+        # from a real tracking dropout, both silently reporting "Data
+        # Deficit" with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 
@@ -484,7 +494,12 @@ def calculate_top_elbow_angle(row: pd.Series, top_hand_side: str) -> dict:
         else:
             tier = "Locked/Rigid Elbow"
         return {"degrees": angle, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): never called
+        # monitoring.capture — a genuine code bug was indistinguishable
+        # from a real tracking dropout, both silently reporting "Data
+        # Deficit" with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 
@@ -531,7 +546,12 @@ def calculate_front_knee_flexion(row: pd.Series, front_side: str) -> dict:
         else:
             tier = "Locked/Rigid Front Knee"
         return {"degrees": angle, "tier": tier, "status": "success"}
-    except Exception:
+    except Exception as e:
+        # BUG FIX (2026-09-13, robustness audit): never called
+        # monitoring.capture — a genuine code bug was indistinguishable
+        # from a real tracking dropout, both silently reporting "Data
+        # Deficit" with zero visibility in error tracking.
+        monitoring.capture(e)
         return {"degrees": None, "tier": "Data Deficit", "status": "error"}
 
 
@@ -643,6 +663,7 @@ def detect_falling_over_risk(df: pd.DataFrame, stance_frame: int, contact_frame:
             "head_shift_pct": head_shift_pct, "foot_cross_pct": foot_cross_pct,
             "status": "success",
         }
-    except Exception:
+    except Exception as e:
+        monitoring.capture(e)
         return {"flagged": False, "reason": None, "head_shift_pct": None,
                  "foot_cross_pct": None, "status": "error"}
