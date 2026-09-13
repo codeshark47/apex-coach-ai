@@ -283,7 +283,16 @@ DRILL NAME: explaining what it corrects and how to perform it.
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.3,
-                max_output_tokens=8000
+                max_output_tokens=8000,
+                # BUG FIX (2026-09-13, robustness audit): no timeout was
+                # set at all -- a slow/hanging connection had no bound and
+                # would hang "Generate AI Coaching Report" indefinitely
+                # instead of failing predictably into the existing
+                # outer try/except below. 60s is generous for a real
+                # multi-image + long-response call under normal
+                # conditions, same "bounded, not open-ended" discipline
+                # as orchestrator.py's own subprocess timeouts.
+                http_options=types.HttpOptions(timeout=60_000),
             )
         )
 
@@ -577,7 +586,16 @@ DRILL NAME: explaining what it corrects and how to perform it.
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.3,
-                max_output_tokens=8000
+                max_output_tokens=8000,
+                # BUG FIX (2026-09-13, robustness audit): no timeout was
+                # set at all -- a slow/hanging connection had no bound and
+                # would hang "Generate AI Coaching Report" indefinitely
+                # instead of failing predictably into the existing
+                # outer try/except below. 60s is generous for a real
+                # multi-image + long-response call under normal
+                # conditions, same "bounded, not open-ended" discipline
+                # as orchestrator.py's own subprocess timeouts.
+                http_options=types.HttpOptions(timeout=60_000),
             )
         )
 
