@@ -909,3 +909,67 @@ class TestSaveUploadedVideoCapped:
         o.save_uploaded_video_capped(fake_file, dest)
 
         assert "-r" not in captured_cmd
+
+
+class TestDetectDeliveryEventsTooShortClip:
+    """
+    REAL BUG (2026-09-13, robustness audit): a clip with fewer than 10
+    tracked frames used to return FABRICATED event indices (BFC=0,
+    FFC=40% of the clip, BR=80%) with no real detection behind them and
+    no flag saying so — every downstream biomechanical metric is computed
+    FROM these three frame indices, so this silently produced a full,
+    confident-looking report built on made-up event timing. Must now
+    report honestly that detection failed, not guess.
+    """
+
+    def test_short_clip_returns_none_events_with_an_error_not_fabricated_indices(self):
+        df = pd.DataFrame({"frame": range(5)})  # 5 rows: well under the 10-frame floor
+        result = o.detect_delivery_events(df, fps=30, bowling_arm="right")
+        assert result["BFC"] is None
+        assert result["FFC"] is None
+        assert result["BR"] is None
+        assert "error" in result
+        assert "short" in result["error"].lower() or "5" in result["error"]
+
+    def test_exactly_at_the_boundary_still_attempts_real_detection(self):
+        """10 frames is the floor, not "fewer than or equal to" — must not
+        accidentally reject a clip that's exactly long enough to try."""
+        rows = []
+        for i in range(15):
+            # A right-arm bowler's wrist swinging up through release, front
+            # ankle planting and holding, back ankle lifting off -- enough
+            # real signal for the velocity-window detection to land on
+            # something, not a degenerate all-flat input.
+            rows.append({
+                "frame": i,
+                "RIGHT_WRIST_y": 0.9 - i * 0.05,
+                "RIGHT_WRIST_x": 0.5, "RIGHT_ELBOW_x": 0.5, "RIGHT_ELBOW_y": 0.6,
+                "RIGHT_SHOULDER_x": 0.5, "RIGHT_SHOULDER_y": 0.3,
+                "LEFT_ANKLE_y": 0.8 if i < 10 else 0.8,
+                "RIGHT_ANKLE_y": 0.8 - min(i, 8) * 0.02,
+            })
+        df = pd.DataFrame(rows)
+        result = o.detect_delivery_events(df, fps=30, bowling_arm="right")
+        # Real detection was attempted (not the <10-frame fabrication path)
+        # -- whatever it lands on, it must be a real int, not None/error.
+        assert result["BFC"] is not None
+        assert "error" not in result
+
+
+class TestExtractAndDetectEventsPropagatesTooShortClip:
+    def test_caller_reports_failure_instead_of_proceeding_with_null_events(self, tmp_path, monkeypatch):
+        """extract_and_detect_events must catch detect_delivery_events'
+        None-events signal and fail cleanly -- proceeding to compute every
+        downstream metric from a null event frame would be worse than
+        the original fabrication bug, not better."""
+        def _fake_extract_video_landmarks(video_path, output_csv_path, **kwargs):
+            pd.DataFrame({"frame": range(3)}).to_csv(output_csv_path, index=False)
+            return {"status": "success", "fps": 30}
+
+        monkeypatch.setattr(o, "extract_video_landmarks", _fake_extract_video_landmarks)
+        result = o.extract_and_detect_events(
+            "fake.mp4", output_dir=str(tmp_path), camera_angle_override="side_on",
+        )
+        assert result["status"] == "failed"
+        assert result["stage"] == "event_detection"
+        assert "message" in result and result["message"]

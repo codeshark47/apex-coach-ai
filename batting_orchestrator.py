@@ -109,6 +109,19 @@ def extract_and_detect_batting_events(video_path: str,
 
     events = detect_batting_events(df, fps)
 
+    # See detect_batting_events' own comment — a too-short clip now
+    # returns None events with an "error" key instead of fabricated frame
+    # indices. Must be caught here: several lines below assume these are
+    # real ints (e.g. max(events["STANCE"], events["BACKLIFT"]), which
+    # raises TypeError on None) — fail clean instead of crashing deeper in
+    # this function or silently proceeding on null event frames.
+    if events.get("STANCE") is None:
+        return {
+            "status": "failed",
+            "stage": "event_detection",
+            "message": events.get("error", "Could not detect batting events in this clip."),
+        }
+
     if batting_hand_override in ("left", "right"):
         batting_hand = batting_hand_override
     else:

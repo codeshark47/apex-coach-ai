@@ -65,13 +65,26 @@ def detect_batting_events(df: pd.DataFrame, fps: float) -> dict:
     """
     total_frames = len(df)
 
+    # BUG FIX (2026-09-13, robustness audit): this used to return
+    # FABRICATED frame indices (STANCE=0, BACKLIFT=30%, CONTACT=60%,
+    # FOLLOW_THROUGH=last frame) with no real detection behind them,
+    # tagged only "low confidence" — easy to miss, and unlike bowling's
+    # equivalent (also fixed this same audit), nothing here actually
+    # stopped these fabricated numbers from being used. Returning None
+    # instead lets the EXISTING confirmation UI
+    # (streamlit_app.py's _confirm_step) do exactly what it already does
+    # for a genuine auto-detection miss: show "Couldn't auto-detect this
+    # frame at all — scrub manually below" instead of presenting a made-
+    # up frame as a plausible low-confidence guess.
     if total_frames < 10:
         return {
-            "STANCE": 0,
-            "BACKLIFT": int(total_frames * 0.3),
-            "CONTACT": int(total_frames * 0.6),
-            "FOLLOW_THROUGH": max(0, total_frames - 1),
-            "CONTACT_confidence": "low",
+            "STANCE": None, "BACKLIFT": None, "CONTACT": None, "FOLLOW_THROUGH": None,
+            "CONTACT_confidence": "unavailable",
+            "error": (
+                f"This clip only has {total_frames} tracked frame(s) — too short to "
+                f"detect real batting events (stance, backlift, contact). Try a longer "
+                f"recording that captures the full shot."
+            ),
         }
 
     lwx = df["LEFT_WRIST_x"].interpolate(method="linear").bfill().ffill().values

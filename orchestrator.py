@@ -541,11 +541,27 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     """
     total_frames = len(df)
 
+    # BUG FIX (2026-09-13, robustness audit): this used to return
+    # FABRICATED frame indices (BFC=0, FFC=40% of the clip, BR=80% of the
+    # clip) with no real detection behind them at all, and no flag saying
+    # so — directly violating this whole project's "never fabricate a
+    # value" discipline, and worse here than most such bugs: every single
+    # downstream biomechanical metric is computed FROM these three frame
+    # indices, so a too-short clip used to silently produce a full report
+    # of confident-looking numbers built on made-up event timing. A clip
+    # this short (well under half a second at typical fps) genuinely
+    # doesn't carry enough signal for the real velocity-window detection
+    # below — the honest answer is "can't detect this," not a guess.
     if total_frames < 10:
         return {
-            "BFC": 0,
-            "FFC": int(total_frames * 0.4),
-            "BR": int(total_frames * 0.8)
+            "BFC": None, "FFC": None, "BR": None,
+            "BR_confidence": "unavailable", "BR_plausible_fraction": 0.0,
+            "error": (
+                f"This clip only has {total_frames} tracked frame(s) — too short to "
+                f"detect real delivery events (back foot contact, front foot contact, "
+                f"release). Try a longer recording that captures the full run-up "
+                f"through release."
+            ),
         }
 
     bowl_side = "RIGHT" if bowling_arm == "right" else "LEFT"
@@ -1979,6 +1995,17 @@ def extract_and_detect_events(video_path: str,
 
     events = detect_delivery_events(df, fps, bowling_arm=bowling_arm,
                                      camera_angle=camera_angle)
+
+    # See detect_delivery_events' own comment — a too-short clip now
+    # returns None events with an "error" key instead of fabricated frame
+    # indices; this must be caught here rather than silently proceeding to
+    # compute every downstream metric from a null/made-up event frame.
+    if events.get("BFC") is None:
+        return {
+            "status": "failed",
+            "stage": "event_detection",
+            "message": events.get("error", "Could not detect delivery events in this clip."),
+        }
 
     return {
         "status": "success",

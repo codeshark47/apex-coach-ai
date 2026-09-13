@@ -61,12 +61,22 @@ def _synthetic_swing_df(n_frames=30, contact_idx=20):
 
 
 class TestDetectBattingEvents:
-    def test_short_clip_uses_proportional_fallback(self):
+    def test_short_clip_returns_none_events_with_an_error_not_fabricated_indices(self):
+        """REAL BUG (2026-09-13, robustness audit): this used to return
+        FABRICATED frame indices (STANCE=0, BACKLIFT=30%, CONTACT=60%,
+        FOLLOW_THROUGH=last frame) with no real detection behind them,
+        tagged only "low confidence" -- easy to miss and nothing actually
+        stopped these made-up numbers from being used to compute every
+        downstream batting metric. Must report honestly that detection
+        failed on a too-short clip, not guess."""
         df = pd.DataFrame([{"frame": i, "LEFT_WRIST_x": 0.5, "LEFT_WRIST_y": 0.5,
                              "RIGHT_WRIST_x": 0.5, "RIGHT_WRIST_y": 0.5} for i in range(5)])
         events = be.detect_batting_events(df, fps=30)
-        assert events["CONTACT_confidence"] == "low"
-        assert 0 <= events["STANCE"] <= events["CONTACT"] <= events["FOLLOW_THROUGH"] < 5
+        assert events["STANCE"] is None
+        assert events["BACKLIFT"] is None
+        assert events["CONTACT"] is None
+        assert events["FOLLOW_THROUGH"] is None
+        assert "error" in events
 
     def test_contact_lands_on_the_peak_speed_frame(self):
         df = _synthetic_swing_df(n_frames=30, contact_idx=20)
