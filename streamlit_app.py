@@ -2588,6 +2588,67 @@ def _seed_click_found_a_person(pil_img, click_xy) -> bool:
     return False
 
 
+def _find_nearest_frame_with_detection(ref_path: str, frame_idx: int, click_xy: tuple,
+                                        total_frames: int, max_offset: int = 10):
+    """
+    REAL, BOUNDED CONVENIENCE (2026-09-13) — for the exact real gap this
+    was built for: the coach clicked on a frame where the bowler is
+    genuinely visible to the human eye but MediaPipe couldn't detect him
+    (motion blur mid-jump, or a moment right as he's entering frame).
+    Rather than making the coach hunt frame-by-frame for one MediaPipe
+    can see, scan outward (closest frame first, alternating earlier/
+    later) up to max_offset frames for the nearest one with a real
+    detection near the SAME click position.
+
+    DELIBERATELY NOT auto-applied (see this session's own real
+    evaluation of an external AI suggestion that proposed exactly that):
+    over even a 10-frame window, a bowler mid-run-up can move 100+px —
+    measured directly on a real clip — so a nearby-frame detection is a
+    SUGGESTION for the coach to visually confirm, never something silently
+    substituted for their own click. If a genuinely different, closer
+    person (e.g. a bystander) happens to sit within SEED_MATCH_TOLERANCE
+    of the original click, an unconfirmed auto-snap could lock onto them
+    exactly as confidently and invisibly as the original bug this whole
+    identity-tracking fix was built to close — the coach looking at the
+    suggested frame before accepting it is the safeguard, not a detail.
+
+    Returns (nearby_frame_idx, nearby_point_px) for the closest match, or
+    None if nothing turned up within max_offset frames either direction.
+    nearby_point_px is the MATCHED CANDIDATE's own detected position on
+    that frame (not the stale original click) — the whole premise is
+    that the person may have moved between frames.
+    """
+    landmarker = _get_seed_check_landmarker()
+    if landmarker is None:
+        return None
+    import numpy as np
+    import mediapipe as mp
+
+    base_frame = cal.extract_reference_frame(ref_path, frame_index=frame_idx)
+    if base_frame is None:
+        return None
+    height, width = base_frame.shape[:2]
+    click_x_norm, click_y_norm = click_xy[0] / width, click_xy[1] / height
+
+    for offset in range(1, max_offset + 1):
+        for candidate_idx in (frame_idx - offset, frame_idx + offset):
+            if candidate_idx < 0 or candidate_idx >= total_frames:
+                continue
+            frame = cal.extract_reference_frame(ref_path, frame_index=candidate_idx)
+            if frame is None:
+                continue
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame))
+            result = landmarker.detect(mp_image)
+            if not result.pose_landmarks:
+                continue
+            for landmarks in result.pose_landmarks:
+                cx, cy = main._centroid_xy(landmarks)
+                dist = ((cx - click_x_norm) ** 2 + (cy - click_y_norm) ** 2) ** 0.5
+                if dist <= main.SEED_MATCH_TOLERANCE:
+                    return candidate_idx, (int(round(cx * width)), int(round(cy * height)))
+    return None
+
+
 def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: str = None):
     """
     One-time-per-video step: save the upload, show a scrubbable reference
@@ -2623,6 +2684,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
     frame_key = f"{key_prefix}_seed_frame"
     identity_key = f"{key_prefix}_seed_identity"
     detected_key = f"{key_prefix}_seed_click_detected"
+    suggestion_key = f"{key_prefix}_seed_click_suggestion"
     shared_ref_identity_key = f"_{save_key}_shared_seed_ref_identity"
     # Deliberately the SAME name the old key_prefix-scoped version used
     # (e.g. "single_seed_ref_path") — several places further down the
@@ -2656,6 +2718,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
         st.session_state[point_key] = None
         st.session_state[frame_key] = 0
         st.session_state[detected_key] = None
+        st.session_state[suggestion_key] = None
 
     ref_path = st.session_state[shared_ref_path_key]
     total_frames = cal.get_frame_count(ref_path)
@@ -2706,6 +2769,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
         if st.session_state.get(f"_{key_prefix}_last_frame_idx") != frame_idx:
             st.session_state[point_key] = None
             st.session_state[detected_key] = None
+            st.session_state[suggestion_key] = None
             st.session_state[f"_{key_prefix}_last_frame_idx"] = frame_idx
 
         if frame is not None:
@@ -2725,6 +2789,28 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                         "mid-motion here). Try scrubbing to a nearby frame where he's clearly "
                         "visible and standing/running normally, then click again."
                     )
+                    suggestion = st.session_state.get(suggestion_key)
+                    if suggestion is not None:
+                        nearby_frame_idx, nearby_point = suggestion
+                        offset = nearby_frame_idx - frame_idx
+                        direction = "later" if offset > 0 else "earlier"
+                        st.info(
+                            f"💡 A detectable person was found near your click at frame "
+                            f"{nearby_frame_idx} ({abs(offset)} frame(s) {direction}). Look "
+                            f"below to confirm it's really the bowler before using it — this "
+                            f"never gets applied automatically."
+                        )
+                        if st.button(
+                            f"➡️ Jump to frame {nearby_frame_idx} and use that detection",
+                            key=f"{key_prefix}_use_suggestion",
+                        ):
+                            st.session_state[f"{key_prefix}_seed_slider"] = nearby_frame_idx
+                            st.session_state[point_key] = nearby_point
+                            st.session_state[frame_key] = nearby_frame_idx
+                            st.session_state[detected_key] = True
+                            st.session_state[suggestion_key] = None
+                            st.session_state[f"_{key_prefix}_last_frame_idx"] = nearby_frame_idx
+                            st.rerun()
                 elif detected is True:
                     st.caption(
                         "✅ A real person is detected right at this click — this frame will "
@@ -2745,12 +2831,24 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                 st.session_state[frame_key] = frame_idx
                 # See _seed_click_found_a_person's docstring — computed once,
                 # right when this click is registered, not on every rerun.
-                st.session_state[detected_key] = _seed_click_found_a_person(pil_img, new_point)
+                just_detected = _seed_click_found_a_person(pil_img, new_point)
+                st.session_state[detected_key] = just_detected
+                if just_detected is False:
+                    # See _find_nearest_frame_with_detection's docstring —
+                    # a bounded, coach-confirmed convenience only, never an
+                    # automatic substitution for the click itself.
+                    with st.spinner("No one detected exactly there — checking nearby frames..."):
+                        st.session_state[suggestion_key] = _find_nearest_frame_with_detection(
+                            ref_path, frame_idx, new_point, total_frames)
+                else:
+                    st.session_state[suggestion_key] = None
                 st.rerun()
 
             if st.session_state.get(point_key) is not None:
                 if st.button("↺ Reset marker", key=f"{key_prefix}_reset_seed"):
                     st.session_state[point_key] = None
+                    st.session_state[detected_key] = None
+                    st.session_state[suggestion_key] = None
                     st.rerun()
         else:
             st.error("Could not read a frame from that video.")
