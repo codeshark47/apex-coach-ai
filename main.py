@@ -900,7 +900,7 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
 
 
 def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: list,
-                                  start_idx: int, end_idx: int) -> dict:
+                                  start_idx: int, end_idx: int, num_poses: int = 3) -> dict:
     """
     Re-extracts RAW (unsmoothed, un-outlier-filtered) normalized (0-1)
     positions for specific named landmarks, directly from the source
@@ -925,11 +925,32 @@ def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: li
     wrist-window pattern exactly; detection needs earlier frames to have
     "warmed up" properly.
 
-    Returns {frame_index: {landmark_name: (x_norm, y_norm, visibility)}}
-    — a frame/landmark with no confident detection is simply absent,
-    never a fabricated position. Callers must fall back to the existing
-    smoothed-CSV values when a needed frame/landmark isn't present here
-    (e.g. real occlusion, or the video ended before end_idx).
+    MULTI-CANDIDATE (2026-09-15, real coach-reported bug, second root
+    cause found after the identity-consistency gate in orchestrator.py):
+    this used to run num_poses=1 and blindly take MediaPipe's own single
+    top-ranked candidate. In a multi-person scene, MediaPipe's own
+    confidence ranking frequently favors a static, unblurred bystander
+    over the actual moving/blurred subject (this app's real footage:
+    the bowler is legitimately blurred and harder to score confidently
+    during the fastest part of the action, exactly when a stationary
+    bystander scores cleanly) — so index [0] silently returning "whoever
+    scored highest" is itself part of the bug, independent of anything
+    downstream. Now requests num_poses=3 (matching the seeded walk's own
+    convention — main.py's run_detection_pass(3, ...)) and returns EVERY
+    detected candidate per frame, unranked and unfiltered — selecting
+    which candidate is actually the tracked subject is an identity
+    question, not a confidence question, and is left entirely to the
+    caller (see orchestrator._select_identity_consistent_candidate),
+    which validates candidates against the coach's own already-confirmed
+    identity rather than trusting MediaPipe's internal scoring.
+
+    Returns {frame_index: [{landmark_name: (x_norm, y_norm, visibility)}, ...]}
+    — a list of every detected candidate's landmarks for that frame (never
+    just one), in whatever order MediaPipe returned them (not meaningful,
+    not to be relied on). A frame with no confident detection at all is
+    simply absent, never a fabricated position. Callers must fall back to
+    the existing smoothed-CSV values when a needed frame/landmark isn't
+    present here (e.g. real occlusion, or the video ended before end_idx).
     """
     import os
     import cv2
@@ -945,7 +966,7 @@ def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: li
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
         output_segmentation_masks=False,
-        num_poses=1,
+        num_poses=num_poses,
         min_pose_detection_confidence=0.3,
         min_pose_presence_confidence=0.3,
         min_tracking_confidence=0.4,
@@ -969,13 +990,17 @@ def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: li
         last_ts = ts
         res = landmarker.detect_for_video(img, ts)
         if idx >= start_idx and res.pose_landmarks:
-            frame_landmarks = {}
-            for name, lm_idx in landmark_indices.items():
-                lm = res.pose_landmarks[0][lm_idx]
-                if lm.visibility is None or lm.visibility >= 0.5:
-                    frame_landmarks[name] = (lm.x, lm.y, lm.visibility)
-            if frame_landmarks:
-                positions[idx] = frame_landmarks
+            frame_candidates = []
+            for candidate_landmarks in res.pose_landmarks:
+                frame_landmarks = {}
+                for name, lm_idx in landmark_indices.items():
+                    lm = candidate_landmarks[lm_idx]
+                    if lm.visibility is None or lm.visibility >= 0.5:
+                        frame_landmarks[name] = (lm.x, lm.y, lm.visibility)
+                if frame_landmarks:
+                    frame_candidates.append(frame_landmarks)
+            if frame_candidates:
+                positions[idx] = frame_candidates
         idx += 1
     cap.release()
     landmarker.close()

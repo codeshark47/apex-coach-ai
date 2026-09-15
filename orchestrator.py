@@ -1049,15 +1049,30 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
 # (_refine_release_landmarks_raw, _refine_head_stability_window_raw,
 # _refine_skeleton_window_raw). Each of them re-extracts landmarks with
 # main.extract_raw_landmarks_window, which runs its OWN completely
-# separate, UNSEEDED, single-pose MediaPipe pass — it has no idea which
-# person the coach's seed clicks identified, and in a multi-person scene
-# can lock onto a different, more consistently-detected person entirely
+# separate, UNSEEDED MediaPipe pass — it has no idea which person the
+# coach's seed clicks identified. It ORIGINALLY (num_poses=1) also
+# trusted MediaPipe's own single top-ranked candidate per frame, which in
+# a multi-person scene frequently favors a different, static/unblurred
+# person (a bystander) over the actual moving/blurred subject — entirely
 # independently of the correctly-seeded main identity walk. Every one of
-# these functions used to blindly patch whatever that pass found straight
-# over already-correct seeded values. Verified directly: reproduced with
-# 4 genuinely correct seed clicks (real detected bowler positions, no
-# misclick) and the release-window skeleton AND numeric metrics still
-# reflected a stationary bystander instead of the bowler.
+# these functions used to blindly patch whatever that top candidate was
+# straight over already-correct seeded values. Verified directly:
+# reproduced with 4 genuinely correct seed clicks (real detected bowler
+# positions, no misclick) and the release-window skeleton AND numeric
+# metrics still reflected a stationary bystander instead of the bowler.
+#
+# Fixed in two layers: extract_raw_landmarks_window now returns EVERY
+# detected candidate per frame (num_poses=3) instead of just its own top
+# pick, and _select_identity_consistent_candidate (below) chooses among
+# them by comparing each to the seeded walk's own known-good identity —
+# not by trusting MediaPipe's internal confidence ranking. This also
+# directly addresses feedback relayed from an external (Gemini) review
+# that correctly diagnosed "a higher-confidence static bystander wins"
+# as the mechanism, but proposed fixed spatial-corridor/velocity rules as
+# the fix — those were evaluated and rejected as clip-specific
+# assumptions (this app supports multiple camera angles/framings, and a
+# bowler can legitimately pause or bowl from wide of the crease); an
+# identity-based selection stays general across all of them.
 IDENTITY_CONSISTENCY_MAX_DIST = 0.15
 
 
@@ -1115,44 +1130,61 @@ def _nearest_reference_row(df: pd.DataFrame, frame_idx: int, max_frame_search: i
     return None
 
 
-def _raw_pass_is_identity_consistent(df: pd.DataFrame, frame_idx: int, raw_landmarks: dict) -> bool:
+def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, candidates: list):
     """
-    True only if this frame's raw re-extraction is close enough to a
-    known-good seeded reference to trust as a genuine same-instant
-    REFINEMENT, never a different person entirely.
+    Among EVERY candidate MediaPipe detected at this frame (extract_raw_
+    landmarks_window now returns all of them — see that function's
+    2026-09-15 docstring update for why trusting its own top-ranked pick
+    was itself part of the bug), returns whichever candidate's position
+    is closest to a known-good SEEDED reference at or near this frame —
+    or None if no candidate is close enough to trust.
 
-    Checks the reference at frame_idx itself first, then searches nearby
-    frames (_nearest_reference_row) when this exact frame has no seeded
-    data of its own — the release/contact instant is exactly where
-    motion blur most often costs the seeded walk its own reading, so
-    refusing to check at all there would defeat the point of this gate
-    at the highest-stakes moment.
+    WHY THIS EXISTS (2026-09-15, second structural cause found for the
+    same coach-reported bug, after the first identity-consistency gate):
+    a coach independently relayed an external (Gemini) review correctly
+    diagnosing the MECHANISM — the raw re-extraction locks onto a static,
+    unblurred bystander because that candidate scores higher confidence
+    than the actual, motion-blurred bowler — but proposing fixed spatial
+    corridors (bowler must be at normalized X in [0.25, 0.75]) and
+    velocity thresholds (reject near-zero frame-to-frame movement) as the
+    fix. Both were rejected on the same grounds this whole investigation
+    has already established: this app supports multiple camera angles
+    and framings (side-on, front-on/reverse — see camera_angle_detection.
+    py), so a fixed pitch-corridor assumes one specific camera setup and
+    would misfire on any other; a bowler pausing at the top of his mark,
+    or bowling from wide of the crease, would trip a fixed velocity gate
+    even when correctly tracked. The diagnosis was right; the fix needed
+    to be identity-based, not geometry-based, to stay general.
 
-    FAILS CLOSED (2026-09-15, real coach-reported regression found by
-    re-testing on the actual clip): the first version of this gate was
-    permissive (returned True) whenever THIS exact frame had no seeded
-    reference, reasoning "nothing already-correct to protect." That
-    reasoning was wrong for exactly the case that matters most — the
-    release frame is frequently the one frame in the whole window the
-    seeded walk couldn't confirm (motion blur), which is also exactly
-    when an unseeded single-pose pass is most likely to lock onto a
-    confidently-detected bystander instead. Verified directly: on the
-    coach's real clip, the seeded walk had no data at the BR frame
-    itself, and the permissive fallback let the bystander's landmarks
-    through untouched. Now rejects (keeps no reading, never guesses an
-    identity) when nothing usable is found anywhere within
-    _IDENTITY_REFERENCE_MAX_FRAME_SEARCH frames — matching this
-    project's "never fabricate, disclose instead" rule: an honest gap
-    is better than a confidently wrong person.
+    This is that identity-based fix: instead of trusting MediaPipe's
+    internal confidence ranking (index 0), every detected candidate is
+    compared against the SAME already-seeded, coach-confirmed identity
+    the rest of this pipeline already trusts (_nearest_reference_row),
+    and whichever candidate is actually closest to that known position
+    is selected — directly correcting the exact case a single-candidate
+    accept/reject gate could not: the top-ranked candidate is the wrong
+    person, but the real subject was ALSO detected, just not ranked
+    first.
+
+    FAILS CLOSED: returns None (no candidate selected) when nothing
+    within _IDENTITY_REFERENCE_MAX_FRAME_SEARCH frames has a usable
+    seeded reference to compare against, or when no candidate is within
+    IDENTITY_CONSISTENCY_MAX_DIST of it — an honest gap in the sharpened
+    reading, never a guessed identity. See _refine_skeleton_window_raw's
+    docstring for the original bug this whole gate exists to close.
     """
     ref_row = _nearest_reference_row(df, frame_idx)
     if ref_row is None:
-        return False
-    raw_pt, existing_pt = _raw_reference_point(ref_row, raw_landmarks)
-    if raw_pt is None or existing_pt is None:
-        return False
-    dist = ((raw_pt[0] - existing_pt[0]) ** 2 + (raw_pt[1] - existing_pt[1]) ** 2) ** 0.5
-    return dist <= IDENTITY_CONSISTENCY_MAX_DIST
+        return None
+    best_candidate, best_dist = None, None
+    for candidate in candidates:
+        raw_pt, existing_pt = _raw_reference_point(ref_row, candidate)
+        if raw_pt is None or existing_pt is None:
+            continue
+        dist = ((raw_pt[0] - existing_pt[0]) ** 2 + (raw_pt[1] - existing_pt[1]) ** 2) ** 0.5
+        if dist <= IDENTITY_CONSISTENCY_MAX_DIST and (best_dist is None or dist < best_dist):
+            best_candidate, best_dist = candidate, dist
+    return best_candidate
 
 
 def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
@@ -1205,17 +1237,23 @@ def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
         return None, None
 
     def _row_from_raw(frame_idx):
-        frame_data = raw.get(int(frame_idx))
-        if not frame_data:
+        candidates = raw.get(int(frame_idx))
+        if not candidates:
             return None
         if df is not None:
-            if not _raw_pass_is_identity_consistent(df, int(frame_idx), frame_data):
+            frame_data = _select_identity_consistent_candidate(df, int(frame_idx), candidates)
+            if frame_data is None:
                 monitoring.capture(Exception(
-                    f"_refine_release_landmarks_raw: rejected frame {frame_idx} — raw "
-                    f"re-extraction landed on a position too far from the seeded walk's "
-                    f"own identity to trust."
+                    f"_refine_release_landmarks_raw: rejected frame {frame_idx} — no "
+                    f"detected candidate matched the seeded walk's own identity closely "
+                    f"enough to trust."
                 ))
                 return None
+        else:
+            # No df to validate candidates against (backward-compat only,
+            # no real caller hits this) — fall back to MediaPipe's own
+            # top-ranked candidate, the pre-2026-09-15 behavior.
+            frame_data = candidates[0]
         row = {}
         for name in needed:
             if name in frame_data:
@@ -1253,14 +1291,16 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
 
     IDENTITY CHECK (2026-09-15): same real coach-reported bug and same
     fix as _refine_skeleton_window_raw's docstring — extract_raw_landmarks_
-    window is an unseeded, single-pose pass that can lock onto a different
-    person (e.g. a stationary bystander) than the seeded walk. A frame
-    whose raw NOSE lands far from the already-seeded NOSE at that same
-    frame is rejected (kept at its original smoothed value) rather than
-    patched, using _raw_pass_is_identity_consistent — this metric is
-    exactly the "HEAD STABILITY" number a coach sees, so silently mixing
-    two people's head positions into one variance calculation would
-    fabricate a misleadingly large (or small) instability reading.
+    window can detect multiple people per frame, and MediaPipe's own
+    confidence ranking can favor a different, static person (e.g. a
+    bystander) over the tracked subject. Each frame's candidates are
+    resolved via _select_identity_consistent_candidate (whichever
+    detected candidate is actually closest to the seeded walk's own
+    identity, not just MediaPipe's top pick) before patching — this
+    metric is exactly the "HEAD STABILITY" number a coach sees, so
+    silently mixing two people's head positions into one variance
+    calculation would fabricate a misleadingly large (or small)
+    instability reading.
     """
     try:
         raw = extract_raw_landmarks_window(
@@ -1276,14 +1316,15 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
 
     window = df[(df["frame"] >= start_frame) & (df["frame"] <= end_frame)].copy()
     skipped_frames = []
-    for frame_idx, landmarks in raw.items():
+    for frame_idx, candidates in raw.items():
         mask = window["frame"] == frame_idx
         if not mask.any():
             continue
-        if not _raw_pass_is_identity_consistent(df, frame_idx, landmarks):
+        selected = _select_identity_consistent_candidate(df, frame_idx, candidates)
+        if selected is None:
             skipped_frames.append(frame_idx)
             continue
-        for name, (x, y, _vis) in landmarks.items():
+        for name, (x, y, _vis) in selected.items():
             window.loc[mask, f"{name}_x"] = x
             window.loc[mask, f"{name}_y"] = y
     if skipped_frames:
@@ -1352,43 +1393,51 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
     # BUG FIX (2026-09-15, real coach-reported failure, root-caused after
     # the coach correctly pushed back that their seed clicks WERE on the
     # bowler): extract_raw_landmarks_window runs its OWN completely
-    # separate, UNSEEDED, single-pose (num_poses=1) MediaPipe pass over
-    # this window — it has no idea which person the coach's seed clicks
-    # identified as the bowler, and in a multi-person scene can lock onto
-    # a different, more consistently-detected person (a stationary
-    # bystander) entirely independently of the correctly-seeded walk
-    # above. This function used to blindly PATCH that person's landmarks
-    # straight over the already-correct seeded ones — meaning even a
-    # perfectly-clicked seed couldn't prevent the diagnostic freeze-frame/
-    # annotated-video skeleton from silently swapping onto the wrong
-    # person during exactly the release window a coach cares about most.
-    # Verified directly: reproduced end-to-end with 4 genuinely correct
-    # seed clicks (real detected bowler positions, no misclick) and the
-    # Ball Release freeze-frame still showed a bystander — confirmed this
-    # function, not seed accuracy, was the cause.
+    # separate, UNSEEDED MediaPipe pass over this window — it has no idea
+    # which person the coach's seed clicks identified as the bowler.
+    # ORIGINALLY (num_poses=1) it also blindly trusted MediaPipe's own
+    # single top-ranked candidate per frame, which in a multi-person
+    # scene frequently IS a different, more consistently-detected person
+    # (a static, unblurred bystander) rather than the correctly-seeded
+    # walk's own subject. This function used to blindly PATCH that
+    # person's landmarks straight over the already-correct seeded ones —
+    # meaning even a perfectly-clicked seed couldn't prevent the
+    # diagnostic freeze-frame/annotated-video skeleton from silently
+    # swapping onto the wrong person during exactly the release window a
+    # coach cares about most. Verified directly: reproduced end-to-end
+    # with 4 genuinely correct seed clicks (real detected bowler
+    # positions, no misclick) and the Ball Release freeze-frame still
+    # showed a bystander — confirmed this function, not seed accuracy,
+    # was the cause.
     #
-    # Fix: this function's whole PURPOSE is refining an ALREADY-KNOWN
-    # identity's position, not detecting a fresh one — so before trusting
-    # a frame's raw re-extraction, check it's still plausibly the SAME
-    # person the seeded walk already placed there, via the shared
-    # _raw_pass_is_identity_consistent gate (NOSE primary, mid-hip
-    # fallback — see its docstring above). A genuine same-instant
+    # Fix, two layers: (1) extract_raw_landmarks_window now requests
+    # every detected candidate per frame (num_poses=3), not just
+    # MediaPipe's own top pick — trusting that ranking was itself part of
+    # the bug. (2) this function's whole PURPOSE is refining an ALREADY-
+    # KNOWN identity's position, not detecting a fresh one — so among
+    # those candidates, _select_identity_consistent_candidate picks
+    # whichever one is still plausibly the SAME person the seeded walk
+    # already placed there (NOSE primary, mid-hip fallback, searching
+    # nearby frames if this exact frame has no seeded reference of its
+    # own — see that function's docstring). A genuine same-instant
     # refinement should land within a few percent of frame size of the
     # already-known position, not the 30-50%+ gap a completely different
-    # person in this app's real footage has shown. A frame that fails
-    # this check keeps its original (less sharp, but correctly-identified)
-    # smoothed values — sharper-but-wrong is worse than smoother-but-right
-    # for exactly the diagnostic purpose this exists for.
+    # person in this app's real footage has shown. A frame where no
+    # candidate passes keeps its original (less sharp, but correctly-
+    # identified) smoothed values — sharper-but-wrong is worse than
+    # smoother-but-right for exactly the diagnostic purpose this exists
+    # for.
     patched = df.copy()
     skipped_frames = []
-    for frame_idx, landmarks in raw.items():
+    for frame_idx, candidates in raw.items():
         mask = patched["frame"] == frame_idx
         if not mask.any():
             continue
-        if not _raw_pass_is_identity_consistent(df, frame_idx, landmarks):
+        selected = _select_identity_consistent_candidate(df, frame_idx, candidates)
+        if selected is None:
             skipped_frames.append(frame_idx)
             continue
-        for name, (x, y, _vis) in landmarks.items():
+        for name, (x, y, _vis) in selected.items():
             patched.loc[mask, f"{name}_x"] = x
             patched.loc[mask, f"{name}_y"] = y
     if skipped_frames:
