@@ -95,10 +95,16 @@ class TestRefineSkeletonWindowRawIdentityConsistency:
         row11 = result[result["frame"] == 11].iloc[0]
         assert row11["LEFT_HIP_x"] == 0.24  # unchanged -- rejected via the mid-hip fallback check
 
-    def test_a_frame_with_no_existing_reference_still_gets_patched(self):
-        """If the seeded walk had NOTHING at this frame either (NaN), there's
-        nothing already-correct to protect -- the raw re-extraction is the
-        only data available and should still be used, not discarded."""
+    def test_a_frame_with_no_reference_anywhere_nearby_is_rejected(self):
+        """REGRESSION (2026-09-15): the first version of this gate was
+        permissive here ("nothing already-correct to protect, so use the
+        raw data") -- that was wrong for exactly the highest-stakes case:
+        real footage showed the seeded walk has NO data precisely at the
+        release frame (motion blur), which is also exactly when the
+        unseeded raw pass is most likely to lock onto a bystander. If
+        NOTHING in the whole df within range has a usable reference, the
+        raw patch must be REJECTED (never fabricate an identity), not
+        silently accepted."""
         df = pd.DataFrame([{"frame": 20, "NOSE_x": float("nan"), "NOSE_y": float("nan"),
                              "LEFT_HIP_x": float("nan"), "RIGHT_HIP_x": float("nan"),
                              "LEFT_HIP_y": float("nan"), "RIGHT_HIP_y": float("nan")}])
@@ -107,8 +113,36 @@ class TestRefineSkeletonWindowRawIdentityConsistency:
             result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 20, 20)
 
         row = result[result["frame"] == 20].iloc[0]
-        assert row["NOSE_x"] == 0.5
-        assert row["NOSE_y"] == 0.5
+        assert pd.isna(row["NOSE_x"])  # rejected -- no reference anywhere to trust it against
+
+    def test_a_frame_with_no_reference_of_its_own_falls_back_to_a_nearby_frame(self):
+        """The exact real-world case this fallback exists for: the frame
+        being refined (e.g. the release frame itself) has no seeded data
+        of its own (motion blur), but a NEARBY frame in the same seeded
+        walk does -- that nearby frame's identity should still be used to
+        validate the raw patch, rather than either giving up (rejecting
+        good data) or blindly accepting (the original bug)."""
+        df = pd.DataFrame([
+            {"frame": 18, "NOSE_x": 0.25, "NOSE_y": 0.55,
+             "LEFT_HIP_x": 0.24, "RIGHT_HIP_x": 0.26, "LEFT_HIP_y": 0.60, "RIGHT_HIP_y": 0.60},
+            {"frame": 20, "NOSE_x": float("nan"), "NOSE_y": float("nan"),
+             "LEFT_HIP_x": float("nan"), "RIGHT_HIP_x": float("nan"),
+             "LEFT_HIP_y": float("nan"), "RIGHT_HIP_y": float("nan")},
+        ])
+        # A genuine same-person refinement at frame 20, close to frame 18's
+        # known-good position.
+        raw = {20: {"NOSE": (0.252, 0.548, 1.0)}}
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 20, 20)
+        row = result[result["frame"] == 20].iloc[0]
+        assert row["NOSE_x"] == 0.252  # validated against frame 18 and accepted
+
+        # A bystander at frame 20 instead -- far from frame 18's known position.
+        raw_wrong = {20: {"NOSE": (0.70, 0.55, 1.0)}}
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw_wrong):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 20, 20)
+        row = result[result["frame"] == 20].iloc[0]
+        assert pd.isna(row["NOSE_x"])  # rejected -- inconsistent with frame 18's identity
 
     def test_extraction_failure_returns_original_df_unchanged(self):
         df = _base_df([10, 11])

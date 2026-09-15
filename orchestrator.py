@@ -1063,10 +1063,10 @@ IDENTITY_CONSISTENCY_MAX_DIST = 0.15
 
 def _raw_reference_point(existing_row, raw_landmarks: dict):
     """
-    A stable point to compare a raw re-extraction against the already-
-    seeded/correct value at the same frame — NOSE first, falling back to
-    mid-hip (only if BOTH hips are present on both sides) when NOSE isn't
-    available on either side for this frame. Returns
+    A stable point to compare a raw re-extraction against an already-
+    seeded/correct reference row — NOSE first, falling back to mid-hip
+    (only if BOTH hips are present on both sides) when NOSE isn't
+    available on either side. Returns
     ((raw_x, raw_y), (existing_x, existing_y)), or (None, None) if
     neither reference is usable (nothing to check against).
     """
@@ -1085,18 +1085,72 @@ def _raw_reference_point(existing_row, raw_landmarks: dict):
     return None, None
 
 
-def _raw_pass_is_identity_consistent(existing_row, raw_landmarks: dict) -> bool:
+_IDENTITY_REFERENCE_MAX_FRAME_SEARCH = 30
+
+
+def _nearest_reference_row(df: pd.DataFrame, frame_idx: int, max_frame_search: int = _IDENTITY_REFERENCE_MAX_FRAME_SEARCH):
     """
-    True if this frame's raw re-extraction is close enough to the already-
-    seeded value to trust as a genuine same-instant REFINEMENT rather than
-    a different person entirely. True (permissive) when there's nothing to
-    check against (no reference available on either side) — that means
-    the seeded walk had nothing already-correct at this frame either, so
-    there's nothing to protect and the raw data is the only option.
+    The nearest frame to frame_idx (by frame-index distance, either
+    direction, within max_frame_search frames) in df that has a usable
+    NOSE or mid-hip reading. The seeded walk's own continuity covers a
+    short gap even when THIS exact frame has no data of its own — a
+    real, common case (confirmed on real footage): MediaPipe frequently
+    loses the bowler for a few frames at the fastest, most motion-
+    blurred part of the action, which includes the release frame
+    itself — exactly the instant this identity check matters most.
+    Returns None if nothing within range has a usable reference at all.
     """
-    raw_pt, existing_pt = _raw_reference_point(existing_row, raw_landmarks)
+    if df is None or df.empty or "frame" not in df.columns:
+        return None
+    nearby = df[(df["frame"] >= frame_idx - max_frame_search) & (df["frame"] <= frame_idx + max_frame_search)]
+    if nearby.empty:
+        return None
+    nearby = nearby.assign(_dist=(nearby["frame"] - frame_idx).abs()).sort_values("_dist")
+    for _, row in nearby.iterrows():
+        if pd.notna(row.get("NOSE_x")) and pd.notna(row.get("NOSE_y")):
+            return row
+        hip_names = ("LEFT_HIP", "RIGHT_HIP")
+        if all(pd.notna(row.get(f"{n}_x")) and pd.notna(row.get(f"{n}_y")) for n in hip_names):
+            return row
+    return None
+
+
+def _raw_pass_is_identity_consistent(df: pd.DataFrame, frame_idx: int, raw_landmarks: dict) -> bool:
+    """
+    True only if this frame's raw re-extraction is close enough to a
+    known-good seeded reference to trust as a genuine same-instant
+    REFINEMENT, never a different person entirely.
+
+    Checks the reference at frame_idx itself first, then searches nearby
+    frames (_nearest_reference_row) when this exact frame has no seeded
+    data of its own — the release/contact instant is exactly where
+    motion blur most often costs the seeded walk its own reading, so
+    refusing to check at all there would defeat the point of this gate
+    at the highest-stakes moment.
+
+    FAILS CLOSED (2026-09-15, real coach-reported regression found by
+    re-testing on the actual clip): the first version of this gate was
+    permissive (returned True) whenever THIS exact frame had no seeded
+    reference, reasoning "nothing already-correct to protect." That
+    reasoning was wrong for exactly the case that matters most — the
+    release frame is frequently the one frame in the whole window the
+    seeded walk couldn't confirm (motion blur), which is also exactly
+    when an unseeded single-pose pass is most likely to lock onto a
+    confidently-detected bystander instead. Verified directly: on the
+    coach's real clip, the seeded walk had no data at the BR frame
+    itself, and the permissive fallback let the bystander's landmarks
+    through untouched. Now rejects (keeps no reading, never guesses an
+    identity) when nothing usable is found anywhere within
+    _IDENTITY_REFERENCE_MAX_FRAME_SEARCH frames — matching this
+    project's "never fabricate, disclose instead" rule: an honest gap
+    is better than a confidently wrong person.
+    """
+    ref_row = _nearest_reference_row(df, frame_idx)
+    if ref_row is None:
+        return False
+    raw_pt, existing_pt = _raw_reference_point(ref_row, raw_landmarks)
     if raw_pt is None or existing_pt is None:
-        return True
+        return False
     dist = ((raw_pt[0] - existing_pt[0]) ** 2 + (raw_pt[1] - existing_pt[1]) ** 2) ** 0.5
     return dist <= IDENTITY_CONSISTENCY_MAX_DIST
 
@@ -1155,8 +1209,7 @@ def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
         if not frame_data:
             return None
         if df is not None:
-            existing = df[df["frame"] == int(frame_idx)]
-            if not existing.empty and not _raw_pass_is_identity_consistent(existing.iloc[0], frame_data):
+            if not _raw_pass_is_identity_consistent(df, int(frame_idx), frame_data):
                 monitoring.capture(Exception(
                     f"_refine_release_landmarks_raw: rejected frame {frame_idx} — raw "
                     f"re-extraction landed on a position too far from the seeded walk's "
@@ -1227,8 +1280,7 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
         mask = window["frame"] == frame_idx
         if not mask.any():
             continue
-        existing_row = window.loc[mask].iloc[0]
-        if not _raw_pass_is_identity_consistent(existing_row, landmarks):
+        if not _raw_pass_is_identity_consistent(df, frame_idx, landmarks):
             skipped_frames.append(frame_idx)
             continue
         for name, (x, y, _vis) in landmarks.items():
@@ -1333,8 +1385,7 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
         mask = patched["frame"] == frame_idx
         if not mask.any():
             continue
-        existing_row = patched.loc[mask].iloc[0]
-        if not _raw_pass_is_identity_consistent(existing_row, landmarks):
+        if not _raw_pass_is_identity_consistent(df, frame_idx, landmarks):
             skipped_frames.append(frame_idx)
             continue
         for name, (x, y, _vis) in landmarks.items():
