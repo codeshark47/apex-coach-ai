@@ -1043,8 +1043,66 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
         }
 
 
+# IDENTITY-CONSISTENCY GATE (2026-09-15, real coach-reported bug — see
+# _refine_skeleton_window_raw's docstring below for the full story):
+# shared by all three raw-re-extraction functions in this file
+# (_refine_release_landmarks_raw, _refine_head_stability_window_raw,
+# _refine_skeleton_window_raw). Each of them re-extracts landmarks with
+# main.extract_raw_landmarks_window, which runs its OWN completely
+# separate, UNSEEDED, single-pose MediaPipe pass — it has no idea which
+# person the coach's seed clicks identified, and in a multi-person scene
+# can lock onto a different, more consistently-detected person entirely
+# independently of the correctly-seeded main identity walk. Every one of
+# these functions used to blindly patch whatever that pass found straight
+# over already-correct seeded values. Verified directly: reproduced with
+# 4 genuinely correct seed clicks (real detected bowler positions, no
+# misclick) and the release-window skeleton AND numeric metrics still
+# reflected a stationary bystander instead of the bowler.
+IDENTITY_CONSISTENCY_MAX_DIST = 0.15
+
+
+def _raw_reference_point(existing_row, raw_landmarks: dict):
+    """
+    A stable point to compare a raw re-extraction against the already-
+    seeded/correct value at the same frame — NOSE first, falling back to
+    mid-hip (only if BOTH hips are present on both sides) when NOSE isn't
+    available on either side for this frame. Returns
+    ((raw_x, raw_y), (existing_x, existing_y)), or (None, None) if
+    neither reference is usable (nothing to check against).
+    """
+    if "NOSE" in raw_landmarks and pd.notna(existing_row.get("NOSE_x")) and pd.notna(existing_row.get("NOSE_y")):
+        rx, ry, _ = raw_landmarks["NOSE"]
+        return (rx, ry), (float(existing_row["NOSE_x"]), float(existing_row["NOSE_y"]))
+    hip_names = ("LEFT_HIP", "RIGHT_HIP")
+    if all(n in raw_landmarks for n in hip_names) and all(
+        pd.notna(existing_row.get(f"{n}_x")) and pd.notna(existing_row.get(f"{n}_y")) for n in hip_names
+    ):
+        rx = (raw_landmarks["LEFT_HIP"][0] + raw_landmarks["RIGHT_HIP"][0]) / 2
+        ry = (raw_landmarks["LEFT_HIP"][1] + raw_landmarks["RIGHT_HIP"][1]) / 2
+        ex = (float(existing_row["LEFT_HIP_x"]) + float(existing_row["RIGHT_HIP_x"])) / 2
+        ey = (float(existing_row["LEFT_HIP_y"]) + float(existing_row["RIGHT_HIP_y"])) / 2
+        return (rx, ry), (ex, ey)
+    return None, None
+
+
+def _raw_pass_is_identity_consistent(existing_row, raw_landmarks: dict) -> bool:
+    """
+    True if this frame's raw re-extraction is close enough to the already-
+    seeded value to trust as a genuine same-instant REFINEMENT rather than
+    a different person entirely. True (permissive) when there's nothing to
+    check against (no reference available on either side) — that means
+    the seeded walk had nothing already-correct at this frame either, so
+    there's nothing to protect and the raw data is the only option.
+    """
+    raw_pt, existing_pt = _raw_reference_point(existing_row, raw_landmarks)
+    if raw_pt is None or existing_pt is None:
+        return True
+    dist = ((raw_pt[0] - existing_pt[0]) ** 2 + (raw_pt[1] - existing_pt[1]) ** 2) ** 0.5
+    return dist <= IDENTITY_CONSISTENCY_MAX_DIST
+
+
 def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
-                                   br_frame: int, height_ref_frame: int):
+                                   br_frame: int, height_ref_frame: int, df: pd.DataFrame = None):
     """
     Re-extracts RAW (unsmoothed) landmark positions directly from the
     source video for the EXACT br_frame/height_ref_frame the existing
@@ -1061,13 +1119,19 @@ def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
     which have exactly the same problem. See main.extract_raw_landmarks_
     window's docstring for the full reasoning.
 
+    df (2026-09-15): the existing smoothed/seeded dataframe, used ONLY for
+    the identity-consistency check above — see IDENTITY_CONSISTENCY_MAX_DIST's
+    comment. Optional (defaults to None, skipping the check) purely so any
+    caller not yet passing it keeps working; every real call site in this
+    file passes it.
+
     Returns (br_row, height_row) as pd.Series with the same column names
     calculate_release_height_ratio_safe already expects, built ONLY from
-    frames/landmarks a real detection actually confirmed — or (None, None)
-    if raw re-extraction didn't yield usable data for either needed frame,
-    in which case the caller must fall back to the existing smoothed-CSV
-    rows. Never fabricates a reading for a frame/landmark it couldn't
-    actually detect.
+    frames/landmarks a real detection actually confirmed AND identity-
+    consistent with the seeded walk — or (None, None) if raw re-extraction
+    didn't yield usable data for either needed frame, in which case the
+    caller must fall back to the existing smoothed-CSV rows. Never
+    fabricates a reading for a frame/landmark it couldn't actually detect.
     """
     lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
     trail_side = "RIGHT" if lead_side == "LEFT" else "LEFT"
@@ -1090,6 +1154,15 @@ def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
         frame_data = raw.get(int(frame_idx))
         if not frame_data:
             return None
+        if df is not None:
+            existing = df[df["frame"] == int(frame_idx)]
+            if not existing.empty and not _raw_pass_is_identity_consistent(existing.iloc[0], frame_data):
+                monitoring.capture(Exception(
+                    f"_refine_release_landmarks_raw: rejected frame {frame_idx} — raw "
+                    f"re-extraction landed on a position too far from the seeded walk's "
+                    f"own identity to trust."
+                ))
+                return None
         row = {}
         for name in needed:
             if name in frame_data:
@@ -1124,6 +1197,17 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
     frames on real clips seen this project) — re-extracting it costs a
     real but bounded amount of time, not the hundreds of frames the wide
     early-run-up baseline would need.
+
+    IDENTITY CHECK (2026-09-15): same real coach-reported bug and same
+    fix as _refine_skeleton_window_raw's docstring — extract_raw_landmarks_
+    window is an unseeded, single-pose pass that can lock onto a different
+    person (e.g. a stationary bystander) than the seeded walk. A frame
+    whose raw NOSE lands far from the already-seeded NOSE at that same
+    frame is rejected (kept at its original smoothed value) rather than
+    patched, using _raw_pass_is_identity_consistent — this metric is
+    exactly the "HEAD STABILITY" number a coach sees, so silently mixing
+    two people's head positions into one variance calculation would
+    fabricate a misleadingly large (or small) instability reading.
     """
     try:
         raw = extract_raw_landmarks_window(
@@ -1138,13 +1222,26 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
         return df
 
     window = df[(df["frame"] >= start_frame) & (df["frame"] <= end_frame)].copy()
+    skipped_frames = []
     for frame_idx, landmarks in raw.items():
         mask = window["frame"] == frame_idx
         if not mask.any():
             continue
+        existing_row = window.loc[mask].iloc[0]
+        if not _raw_pass_is_identity_consistent(existing_row, landmarks):
+            skipped_frames.append(frame_idx)
+            continue
         for name, (x, y, _vis) in landmarks.items():
             window.loc[mask, f"{name}_x"] = x
             window.loc[mask, f"{name}_y"] = y
+    if skipped_frames:
+        monitoring.capture(
+            Exception(
+                f"_refine_head_stability_window_raw: skipped {len(skipped_frames)} frame(s) "
+                f"{skipped_frames[:10]}{'...' if len(skipped_frames) > 10 else ''} — raw re-extraction "
+                f"landed on a position too far from the seeded walk's own identity to trust."
+            )
+        )
     return window
 
 
@@ -1200,14 +1297,57 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
     if not raw:
         return df
 
+    # BUG FIX (2026-09-15, real coach-reported failure, root-caused after
+    # the coach correctly pushed back that their seed clicks WERE on the
+    # bowler): extract_raw_landmarks_window runs its OWN completely
+    # separate, UNSEEDED, single-pose (num_poses=1) MediaPipe pass over
+    # this window — it has no idea which person the coach's seed clicks
+    # identified as the bowler, and in a multi-person scene can lock onto
+    # a different, more consistently-detected person (a stationary
+    # bystander) entirely independently of the correctly-seeded walk
+    # above. This function used to blindly PATCH that person's landmarks
+    # straight over the already-correct seeded ones — meaning even a
+    # perfectly-clicked seed couldn't prevent the diagnostic freeze-frame/
+    # annotated-video skeleton from silently swapping onto the wrong
+    # person during exactly the release window a coach cares about most.
+    # Verified directly: reproduced end-to-end with 4 genuinely correct
+    # seed clicks (real detected bowler positions, no misclick) and the
+    # Ball Release freeze-frame still showed a bystander — confirmed this
+    # function, not seed accuracy, was the cause.
+    #
+    # Fix: this function's whole PURPOSE is refining an ALREADY-KNOWN
+    # identity's position, not detecting a fresh one — so before trusting
+    # a frame's raw re-extraction, check it's still plausibly the SAME
+    # person the seeded walk already placed there, via the shared
+    # _raw_pass_is_identity_consistent gate (NOSE primary, mid-hip
+    # fallback — see its docstring above). A genuine same-instant
+    # refinement should land within a few percent of frame size of the
+    # already-known position, not the 30-50%+ gap a completely different
+    # person in this app's real footage has shown. A frame that fails
+    # this check keeps its original (less sharp, but correctly-identified)
+    # smoothed values — sharper-but-wrong is worse than smoother-but-right
+    # for exactly the diagnostic purpose this exists for.
     patched = df.copy()
+    skipped_frames = []
     for frame_idx, landmarks in raw.items():
         mask = patched["frame"] == frame_idx
         if not mask.any():
             continue
+        existing_row = patched.loc[mask].iloc[0]
+        if not _raw_pass_is_identity_consistent(existing_row, landmarks):
+            skipped_frames.append(frame_idx)
+            continue
         for name, (x, y, _vis) in landmarks.items():
             patched.loc[mask, f"{name}_x"] = x
             patched.loc[mask, f"{name}_y"] = y
+    if skipped_frames:
+        monitoring.capture(
+            Exception(
+                f"_refine_skeleton_window_raw: skipped {len(skipped_frames)} frame(s) "
+                f"{skipped_frames[:10]}{'...' if len(skipped_frames) > 10 else ''} — raw re-extraction "
+                f"landed on a position too far from the seeded walk's own identity to trust."
+            )
+        )
     return patched
 
 
@@ -2209,7 +2349,7 @@ def run_complete_bowling_analysis(video_path: str,
         try:
             _height_ref_frame = int(height_reference_row.get("frame", events["BR"]))
             _raw_br_row, _raw_height_row = _refine_release_landmarks_raw(
-                video_path, fps, bowling_arm, events["BR"], _height_ref_frame
+                video_path, fps, bowling_arm, events["BR"], _height_ref_frame, df
             )
         except Exception as e:
             monitoring.capture(e)
