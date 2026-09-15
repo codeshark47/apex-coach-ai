@@ -2537,6 +2537,19 @@ else:
         uploaded_rear = None
 
 
+# REAL, MEASURED THRESHOLD (2026-09-15) — checked directly against a real
+# clip where the fix below was needed: cross-person appearance similarity
+# (this bowler vs. the bystanders who caused the real bug) measured 0.005;
+# genuine same-person self-similarity measured 0.38-0.42+. 0.15 sits
+# comfortably in the gap between them — nowhere near either real measured
+# value, so normal appearance noise (lighting/pose/motion blur) between
+# two real photos of the SAME person shouldn't trip it, while two
+# genuinely different people reliably will. See
+# _compute_seed_appearance_mismatch's docstring for the bug this exists
+# to catch.
+_SEED_APPEARANCE_MISMATCH_FLOOR = 0.15
+
+
 @st.cache_resource
 def _get_seed_check_landmarker():
     """
@@ -2565,7 +2578,7 @@ def _get_seed_check_landmarker():
     return vision.PoseLandmarker.create_from_options(options)
 
 
-def _seed_click_found_a_person(pil_img, click_xy) -> bool:
+def _seed_click_match_info(pil_img, click_xy):
     """
     REAL GAP FOUND (2026-09-13, traced on a real coach-reported failure):
     the seed-click UI silently accepted ANY click and only main.py's
@@ -2585,12 +2598,32 @@ def _seed_click_found_a_person(pil_img, click_xy) -> bool:
     separate copy that could drift) directly on this one still frame —
     gives the coach an honest, immediate answer to "did this click just
     work," instead of a silent accept that only fails later, invisibly.
-    Returns True/False, or None if the model isn't available to check
+
+    Also returns the matched candidate's own appearance histogram (2026-
+    09-15, a SECOND real bug found by re-testing with realistic, not
+    pixel-perfect, seed clicks): even when every individual click finds
+    A real person, several of a coach's 4 clicks can innocently land near
+    a DIFFERENT real person (e.g. bystanders who stand still and are
+    easy to click near, vs. a bowler who's moving and only briefly
+    detectable) — confirmed directly that when 3 of 4 clicks land near
+    the same bystander and only 1 correctly lands on the bowler, the
+    cross-seed majority-vote safeguard (built for the FIRST version of
+    this bug) does the WRONG thing: it trusts the 3 mutually-consistent
+    wrong clicks and discards the 1 correct one as the "outlier",
+    locking the whole walk onto the bystander. A majority vote can only
+    ever be as right as the majority actually is — nothing downstream
+    can safely out-guess that after the fact. The real fix is catching
+    the mistake AT THE CLICK, while the coach can still just look at the
+    video and know they're wrong — see the cross-seed appearance check
+    in render_bowler_seed_ui, which uses this histogram for exactly that.
+
+    Returns (detected: True|False|None, histogram_or_None). detected is
+    None (histogram also None) when the model isn't available to check
     (caller must not block on that — see _get_seed_check_landmarker).
     """
     landmarker = _get_seed_check_landmarker()
     if landmarker is None:
-        return None
+        return None, None
     import numpy as np
     import mediapipe as mp
     frame_rgb = np.array(pil_img.convert("RGB"))
@@ -2598,14 +2631,59 @@ def _seed_click_found_a_person(pil_img, click_xy) -> bool:
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
     result = landmarker.detect(mp_image)
     if not result.pose_landmarks:
-        return False
+        return False, None
     click_x_norm, click_y_norm = click_xy[0] / width, click_xy[1] / height
+    best_landmarks, best_dist = None, None
     for landmarks in result.pose_landmarks:
         cx, cy = main._centroid_xy(landmarks)
         dist = ((cx - click_x_norm) ** 2 + (cy - click_y_norm) ** 2) ** 0.5
-        if dist <= main.SEED_MATCH_TOLERANCE:
-            return True
-    return False
+        if dist <= main.SEED_MATCH_TOLERANCE and (best_dist is None or dist < best_dist):
+            best_landmarks, best_dist = landmarks, dist
+    if best_landmarks is None:
+        return False, None
+    frame_bgr = frame_rgb[:, :, ::-1]  # main._compute_appearance_histogram expects BGR (cv2 convention)
+    hist = main._compute_appearance_histogram(frame_bgr, best_landmarks)
+    return True, hist
+
+
+def _compute_seed_appearance_mismatch(new_hist, sibling_hists: dict):
+    """
+    REAL BUG (2026-09-15, found by re-testing with realistic, imprecise
+    seed clicks instead of pixel-perfect ones): even when every individual
+    seed click finds A real person, several of a coach's 4 clicks can
+    innocently land near a DIFFERENT real person than the others — on a
+    real clip, bystanders stand still and are easy to click near, while
+    the actual bowler moves and is only briefly detectable. Confirmed
+    directly: 3 of 4 clicks landing near the same bystander and 1
+    correctly on the bowler makes the cross-seed MAJORITY-vote safeguard
+    (main._seed_appearance_majority_ok, built for the earlier version of
+    this bug) do the WRONG thing — it trusts the 3 mutually-consistent
+    wrong clicks and discards the 1 correct one, locking the whole walk
+    onto the bystander. A majority vote can only ever be as right as the
+    majority actually is; nothing downstream of the clicks can safely
+    out-guess that. The real fix is catching the mistake AT THE CLICK,
+    while the coach can still just look at the video and know they're
+    wrong.
+
+    sibling_hists: {other_key_prefix: histogram} for every OTHER seed slot
+    for this same stream that currently has a real matched click (this
+    slot's own entry must already be excluded by the caller).
+
+    Returns None if there's nothing to compare against yet (first real
+    seed, or the model was unavailable for a sibling) or the best match is
+    within _SEED_APPEARANCE_MISMATCH_FLOOR — i.e. no problem found.
+    Otherwise returns the best (still-too-low) similarity score, for the
+    caller to show alongside a warning naming which slot(s) disagree.
+    """
+    if new_hist is None or not sibling_hists:
+        return None
+    real_hists = [h for h in sibling_hists.values() if h is not None]
+    if not real_hists:
+        return None
+    best_sim = max(main._hist_similarity(new_hist, h) for h in real_hists)
+    if best_sim >= _SEED_APPEARANCE_MISMATCH_FLOOR:
+        return None
+    return best_sim
 
 
 def _find_nearest_frame_with_detection(ref_path: str, frame_idx: int, click_xy: tuple,
@@ -2632,11 +2710,17 @@ def _find_nearest_frame_with_detection(ref_path: str, frame_idx: int, click_xy: 
     identity-tracking fix was built to close — the coach looking at the
     suggested frame before accepting it is the safeguard, not a detail.
 
-    Returns (nearby_frame_idx, nearby_point_px) for the closest match, or
-    None if nothing turned up within max_offset frames either direction.
-    nearby_point_px is the MATCHED CANDIDATE's own detected position on
-    that frame (not the stale original click) — the whole premise is
-    that the person may have moved between frames.
+    Returns (nearby_frame_idx, nearby_point_px, histogram) for the closest
+    match, or None if nothing turned up within max_offset frames either
+    direction. nearby_point_px is the MATCHED CANDIDATE's own detected
+    position on that frame (not the stale original click) — the whole
+    premise is that the person may have moved between frames. histogram
+    is that same candidate's appearance histogram (2026-09-15), so
+    accepting a suggestion feeds the same cross-seed appearance check
+    (_compute_seed_appearance_mismatch) a direct click does — a suggested
+    frame is still just one of the coach's 4 seeds, and can be just as
+    wrong a person as a direct misclick if it happens to be near a
+    bystander instead of the bowler.
     """
     landmarker = _get_seed_check_landmarker()
     if landmarker is None:
@@ -2665,7 +2749,9 @@ def _find_nearest_frame_with_detection(ref_path: str, frame_idx: int, click_xy: 
                 cx, cy = main._centroid_xy(landmarks)
                 dist = ((cx - click_x_norm) ** 2 + (cy - click_y_norm) ** 2) ** 0.5
                 if dist <= main.SEED_MATCH_TOLERANCE:
-                    return candidate_idx, (int(round(cx * width)), int(round(cy * height)))
+                    frame_bgr = frame[:, :, ::-1]  # main._compute_appearance_histogram expects BGR
+                    hist = main._compute_appearance_histogram(frame_bgr, landmarks)
+                    return candidate_idx, (int(round(cx * width)), int(round(cy * height))), hist
     return None
 
 
@@ -2705,6 +2791,11 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
     identity_key = f"{key_prefix}_seed_identity"
     detected_key = f"{key_prefix}_seed_click_detected"
     suggestion_key = f"{key_prefix}_seed_click_suggestion"
+    mismatch_key = f"{key_prefix}_seed_click_mismatch"
+    # Shared ACROSS every seed slot for this stream (keyed by save_key, not
+    # key_prefix) — see the cross-seed appearance check below. {key_prefix:
+    # histogram} for every slot that currently has a real, matched click.
+    shared_hists_key = f"_{save_key}_all_seed_hists"
     shared_ref_identity_key = f"_{save_key}_shared_seed_ref_identity"
     # Deliberately the SAME name the old key_prefix-scoped version used
     # (e.g. "single_seed_ref_path") — several places further down the
@@ -2729,6 +2820,11 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             st.stop()
         st.session_state[shared_ref_identity_key] = file_identity
         st.session_state[shared_ref_path_key] = ref_path
+        # A genuinely new video for this stream invalidates every slot's
+        # previously-matched appearance too — a stale histogram from the
+        # OLD video comparing against a click on the NEW one would be
+        # meaningless.
+        st.session_state[shared_hists_key] = {}
 
     if st.session_state.get(identity_key) != file_identity:
         # Still per-slot: a genuinely new file must reset THIS slot's own
@@ -2739,6 +2835,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
         st.session_state[frame_key] = 0
         st.session_state[detected_key] = None
         st.session_state[suggestion_key] = None
+        st.session_state[mismatch_key] = None
 
     ref_path = st.session_state[shared_ref_path_key]
     total_frames = cal.get_frame_count(ref_path)
@@ -2790,6 +2887,8 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             st.session_state[point_key] = None
             st.session_state[detected_key] = None
             st.session_state[suggestion_key] = None
+            st.session_state[mismatch_key] = None
+            st.session_state.get(shared_hists_key, {}).pop(key_prefix, None)
             st.session_state[f"_{key_prefix}_last_frame_idx"] = frame_idx
 
         if frame is not None:
@@ -2811,7 +2910,7 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                     )
                     suggestion = st.session_state.get(suggestion_key)
                     if suggestion is not None:
-                        nearby_frame_idx, nearby_point = suggestion
+                        nearby_frame_idx, nearby_point, nearby_hist = suggestion
                         offset = nearby_frame_idx - frame_idx
                         direction = "later" if offset > 0 else "earlier"
                         st.info(
@@ -2830,13 +2929,33 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                             st.session_state[detected_key] = True
                             st.session_state[suggestion_key] = None
                             st.session_state[f"_{key_prefix}_last_frame_idx"] = nearby_frame_idx
+                            # Same cross-seed appearance check a direct
+                            # click gets — a suggestion accept is still
+                            # registering a real seed (see
+                            # _find_nearest_frame_with_detection's docstring).
+                            siblings = {k: v for k, v in st.session_state.setdefault(shared_hists_key, {}).items()
+                                        if k != key_prefix}
+                            st.session_state[mismatch_key] = _compute_seed_appearance_mismatch(nearby_hist, siblings)
+                            st.session_state[shared_hists_key][key_prefix] = nearby_hist
                             st.rerun()
                 elif detected is True:
-                    st.caption(
-                        "✅ A real person is detected right at this click — this frame will "
-                        "anchor the tracker. (This only confirms someone is there, not that "
-                        "it's the bowler — that part is still on you.)"
-                    )
+                    mismatch_sim = st.session_state.get(mismatch_key)
+                    if mismatch_sim is not None:
+                        st.warning(
+                            f"⚠️ A real person is detected here, but they look DIFFERENT from "
+                            f"your other confirmation(s) for this video (similarity "
+                            f"{mismatch_sim:.2f}, expected a much closer match for the same "
+                            f"person). If the bowler moved between clicks this can be a false "
+                            f"alarm from lighting/motion blur — but if this click landed on a "
+                            f"different player (a bystander, teammate) than your other clicks, "
+                            f"fix it now: it's much easier to catch here than in the final report."
+                        )
+                    else:
+                        st.caption(
+                            "✅ A real person is detected right at this click — this frame will "
+                            "anchor the tracker. (This only confirms someone is there, not that "
+                            "it's the bowler — that part is still on you.)"
+                        )
                 else:
                     # Model unavailable to check, or not yet computed for this
                     # exact point — don't claim more confidence than we have.
@@ -2849,9 +2968,9 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             if new_point is not None and st.session_state.get(point_key) != new_point:
                 st.session_state[point_key] = new_point
                 st.session_state[frame_key] = frame_idx
-                # See _seed_click_found_a_person's docstring — computed once,
+                # See _seed_click_match_info's docstring — computed once,
                 # right when this click is registered, not on every rerun.
-                just_detected = _seed_click_found_a_person(pil_img, new_point)
+                just_detected, just_hist = _seed_click_match_info(pil_img, new_point)
                 st.session_state[detected_key] = just_detected
                 if just_detected is False:
                     # See _find_nearest_frame_with_detection's docstring —
@@ -2860,8 +2979,19 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                     with st.spinner("No one detected exactly there — checking nearby frames..."):
                         st.session_state[suggestion_key] = _find_nearest_frame_with_detection(
                             ref_path, frame_idx, new_point, total_frames)
+                    st.session_state[mismatch_key] = None
+                    st.session_state.setdefault(shared_hists_key, {}).pop(key_prefix, None)
                 else:
                     st.session_state[suggestion_key] = None
+                    # See _compute_seed_appearance_mismatch's docstring —
+                    # checked against every OTHER seed slot's own matched
+                    # click for this same stream, catching a click that
+                    # found a real (but wrong) person before it can quietly
+                    # out-vote the coach's correct clicks later.
+                    siblings = {k: v for k, v in st.session_state.setdefault(shared_hists_key, {}).items()
+                                if k != key_prefix}
+                    st.session_state[mismatch_key] = _compute_seed_appearance_mismatch(just_hist, siblings)
+                    st.session_state[shared_hists_key][key_prefix] = just_hist
                 st.rerun()
 
             if st.session_state.get(point_key) is not None:
@@ -2869,6 +2999,8 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                     st.session_state[point_key] = None
                     st.session_state[detected_key] = None
                     st.session_state[suggestion_key] = None
+                    st.session_state[mismatch_key] = None
+                    st.session_state.setdefault(shared_hists_key, {}).pop(key_prefix, None)
                     st.rerun()
         else:
             st.error("Could not read a frame from that video.")
