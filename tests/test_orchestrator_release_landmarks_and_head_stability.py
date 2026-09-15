@@ -205,3 +205,25 @@ class TestRefineHeadStabilityWindowRawIdentityConsistency:
         with patch("orchestrator.extract_raw_landmarks_window", side_effect=Exception("boom")):
             result = o._refine_head_stability_window_raw("fake.mp4", 30.0, df, 10, 11)
         pd.testing.assert_frame_equal(result, df)
+
+    def test_hip_fallback_recovers_a_candidate_with_no_nose(self):
+        """REGRESSION (2026-09-15, found by an independent adversarial
+        review): this function's own requested landmarks used to be
+        NOSE/LEFT_SHOULDER/RIGHT_SHOULDER only -- no hips -- so a
+        genuinely correct candidate detected with NOSE below the
+        visibility cutoff (exactly the motion-blur case this whole window
+        exists to help) had NOTHING for _raw_reference_point to check
+        against (no NOSE, no hip pair either) and was silently rejected.
+        Hips are now requested too, purely to give the identity check a
+        second usable reference -- calculate_head_stability itself still
+        never reads them."""
+        df = _base_df([10, 11, 12])
+        raw = {
+            11: [{"LEFT_SHOULDER": (0.201, 0.451, 1.0), "RIGHT_SHOULDER": (0.301, 0.451, 1.0),
+                  "LEFT_HIP": (0.241, 0.601, 1.0), "RIGHT_HIP": (0.261, 0.601, 1.0)}],  # no NOSE at all
+        }
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_head_stability_window_raw("fake.mp4", 30.0, df, 10, 12)
+
+        row11 = result[result["frame"] == 11].iloc[0]
+        assert row11["LEFT_SHOULDER_x"] == 0.201  # recovered via the hip-pair reference fallback

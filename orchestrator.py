@@ -1073,6 +1073,28 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
 # assumptions (this app supports multiple camera angles/framings, and a
 # bowler can legitimately pause or bowl from wide of the crease); an
 # identity-based selection stays general across all of them.
+#
+# KNOWN LIMITATION, flagged by an independent adversarial review
+# (2026-09-15), not yet re-derived from real footage: this is a FIXED
+# normalized [0,1]-frame-fraction distance, so its real-world meaning
+# shifts with camera zoom — the only real measured calibration point in
+# this codebase is a FAR bystander (~0.45 away, nearly opposite sides of
+# frame; see this file's tests). There is no measured case yet for a
+# CLOSE bystander (a teammate, umpire, or non-striker standing right
+# next to the bowler) in a wide run-up shot, where 0.15 of frame
+# width/height could plausibly be a small real-world gap. Deliberately
+# NOT tightening this now: doing so without real close-bystander footage
+# to validate against risks the opposite, already-experienced regression
+# (rejecting a genuine same-person match — see the fail-closed-permissive
+# bug fixed earlier the same day) for a scenario that hasn't actually
+# been observed on any real clip yet. Same standard already applied to
+# the rejected Gemini spatial-corridor suggestion above: tune from real
+# measured footage, never a guess. If a coach ever reports a wrong-person
+# lock with a bystander standing CLOSE to the bowler (not far away, like
+# every case fixed so far), that's the real data point to re-derive this
+# number from — ideally scaled by the tracked person's own detected body
+# size (e.g. video_overlay._torso_height) rather than a fixed frame
+# fraction, so it stays valid across this app's different camera zooms.
 IDENTITY_CONSISTENCY_MAX_DIST = 0.15
 
 
@@ -1386,6 +1408,34 @@ def _refine_bfc_row_raw(video_path: str, fps: float, df: pd.DataFrame,
     if selected is None:
         return fallback_row
 
+    # BUG FIX (2026-09-15, found by an independent adversarial review):
+    # fallback_row can come from a DIFFERENT frame than bfc_frame
+    # (_nearest_complete_row's own +/-10-frame search of the smoothed
+    # df). extract_raw_landmarks_window includes a candidate as soon as
+    # it has ANY landmark, not necessarily the full `needed` set — so a
+    # PARTIAL raw candidate (missing, say, the trail ankle: a real,
+    # common single-frame occlusion right at foot-plant) merged onto a
+    # different-frame fallback would silently blend two different
+    # instants of an actively-moving leg into one "row": some landmarks
+    # from the true BFC instant, others from up to 10 frames away. That
+    # produces a fully plausible-LOOKING but physically wrong angle —
+    # worse than the honest "Tracking Drop" the pre-fix code returned
+    # here. Only trust the merge when either (a) the raw candidate is
+    # COMPLETE for what the consuming metrics actually read (so it
+    # stands alone as one genuine same-instant reading), or (b)
+    # fallback_row is from this SAME frame (merging two views of the
+    # identical instant is safe). Otherwise keep the different-frame
+    # fallback UNCHANGED rather than mixing frames.
+    consumed = [f"{trail_upper}_HIP", f"{trail_upper}_KNEE", f"{trail_upper}_ANKLE",
+                "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+    is_complete = all(name in selected for name in consumed)
+    fallback_is_same_frame = (
+        fallback_row is not None and pd.notna(fallback_row.get("frame"))
+        and int(fallback_row["frame"]) == int(bfc_frame)
+    )
+    if fallback_row is not None and not fallback_is_same_frame and not is_complete:
+        return fallback_row
+
     patched = fallback_row.copy() if fallback_row is not None else pd.Series({"frame": bfc_frame}, dtype=object)
     for name, (x, y, _vis) in selected.items():
         patched[f"{name}_x"] = x
@@ -1429,10 +1479,24 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
     silently mixing two people's head positions into one variance
     calculation would fabricate a misleadingly large (or small)
     instability reading.
+
+    BUG FIX (2026-09-15, found by an independent adversarial review):
+    LEFT_HIP/RIGHT_HIP added to the requested landmarks below — without
+    them, _raw_reference_point's mid-hip fallback could never fire for
+    this function's own candidates (it needs BOTH the reference row AND
+    the candidate to have a usable point), leaving NOSE as the ONLY
+    possible reference. A genuinely correct bowler candidate detected
+    with visible shoulders but NOSE below the 0.5-visibility cutoff
+    (exactly the motion-blur scenario this whole window exists to
+    recover) would be silently rejected for lack of anything to check it
+    against — precisely at the highest-motion-blur frames this feature
+    is meant to help most. Hips are not otherwise used by
+    calculate_head_stability; they exist here purely to give the
+    identity check a second usable reference.
     """
     try:
         raw = extract_raw_landmarks_window(
-            video_path, fps, ["NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER"],
+            video_path, fps, ["NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"],
             int(start_frame), int(end_frame),
         )
     except Exception as e:
@@ -2660,6 +2724,29 @@ def run_complete_bowling_analysis(video_path: str,
         _swing_end = min(int(df["frame"].max()), _br_frame_for_video + int(round(fps * 0.3)))
         if _swing_start < _swing_end:
             _skeleton_df = _refine_skeleton_window_raw(video_path, fps, df, _swing_start, _swing_end)
+    except Exception as e:
+        monitoring.capture(e)
+
+    # Patch the BFC frame specifically too (2026-09-15, found by an
+    # independent adversarial review): _skeleton_df's own raw-refinement
+    # window above is [FFC, BR+buffer] — it structurally never includes
+    # BFC (BFC always precedes FFC in this app's event ordering), so even
+    # when bfc_row above recovered trail-leg/shoulder data via
+    # _refine_bfc_row_raw, the BFC diagnostic freeze-frame image (which
+    # reads straight from _skeleton_df) wouldn't see it — a coach could
+    # see a real rear_knee_angle/rear_hip_flexion number in the report
+    # text with no matching callout on the accompanying BFC picture.
+    # .copy() first regardless of path above: when the refine call didn't
+    # run (or failed), _skeleton_df is still the SAME object as df, and
+    # patching in place would silently mutate df too.
+    try:
+        _skeleton_df = _skeleton_df.copy()
+        if bfc_row is not None:
+            _bfc_mask = _skeleton_df["frame"] == events["BFC"]
+            if _bfc_mask.any():
+                for _col in bfc_row.index:
+                    if _col != "frame" and (_col.endswith("_x") or _col.endswith("_y")):
+                        _skeleton_df.loc[_bfc_mask, _col] = bfc_row[_col]
     except Exception as e:
         monitoring.capture(e)
 

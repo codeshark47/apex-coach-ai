@@ -102,6 +102,38 @@ class TestRefineBfcRowRaw:
         assert "RIGHT_SHOULDER" in captured["needed"]
 
 
+    def test_partial_candidate_with_different_frame_fallback_is_not_merged(self):
+        """REGRESSION (2026-09-15, found by an independent adversarial
+        review): fallback_row from a DIFFERENT frame (here: frame 25, via
+        _nearest_complete_row's own +/-10 search) must NOT be patched with
+        a PARTIAL raw candidate (missing the ankle here) -- that would
+        silently blend two different instants of an actively-moving leg
+        into one row. Must return fallback_row completely unchanged."""
+        df = _base_df([25, 30])
+        fallback = df.iloc[0]  # frame 25 -- a DIFFERENT frame than bfc_frame=30
+        raw = {30: [{"NOSE": (0.25, 0.35, 1.0), "RIGHT_HIP": (0.261, 0.601, 1.0),
+                     "RIGHT_KNEE": (0.261, 0.751, 1.0)}]}  # missing RIGHT_ANKLE and shoulders -- partial
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "right", fallback)
+        assert result["RIGHT_HIP_x"] == 0.26  # unchanged -- the partial raw patch was rejected
+        assert result["frame"] == 25  # still the original different-frame fallback, untouched
+
+    def test_complete_candidate_with_different_frame_fallback_is_merged(self):
+        """A COMPLETE raw candidate (every landmark the consuming metrics
+        actually read) stands alone as one genuine same-instant reading,
+        so it's safe to use even though fallback_row is from a different
+        frame -- this must NOT be blocked by the frame-mixing guard."""
+        df = _base_df([25, 30])
+        fallback = df.iloc[0]  # frame 25
+        raw = {30: [{"NOSE": (0.25, 0.35, 1.0), "RIGHT_HIP": (0.261, 0.601, 1.0),
+                     "RIGHT_KNEE": (0.261, 0.751, 1.0), "RIGHT_ANKLE": (0.261, 0.901, 1.0),
+                     "LEFT_SHOULDER": (0.241, 0.401, 1.0), "RIGHT_SHOULDER": (0.281, 0.401, 1.0)}]}
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "right", fallback)
+        assert result["RIGHT_HIP_x"] == 0.261  # merged -- complete candidate is trustworthy on its own
+        assert result["RIGHT_ANKLE_x"] == 0.261
+
+
 class TestNearestCompleteRowIncludesShoulders:
     def test_a_row_missing_shoulders_is_not_treated_as_complete(self):
         """REGRESSION: the old required_cols list for bfc_row only checked
