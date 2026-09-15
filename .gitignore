@@ -6,6 +6,9 @@
 output/
 input/
 
+# Local monitoring fallback log (may contain athlete-derived data)
+logs/
+
 # Python cache
 __pycache__/
 *.pyc

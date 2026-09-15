@@ -1332,6 +1332,67 @@ def _refine_stage4_rows_raw(video_path: str, fps: float, df: pd.DataFrame,
     return _patched(ffc_frame, ffc_row), _patched(br_frame, br_row)
 
 
+def _refine_bfc_row_raw(video_path: str, fps: float, df: pd.DataFrame,
+                         bfc_frame: int, trail_side: str, fallback_row):
+    """
+    Same raw-re-extraction + identity-consistent candidate selection
+    pattern as _refine_stage4_rows_raw (see its docstring for the real
+    coach-reported bug this whole family of fixes closes), applied to
+    the trail-leg + shoulder landmarks calculate_rear_knee_angle and
+    calculate_rear_hip_flexion need at BFC — the LAST of the 7 bowling
+    metrics that still read ONLY the smoothed df with no chance of a
+    fresh, identity-validated look at the source video.
+
+    fallback_row: the row _nearest_complete_row already found (its own
+    +/-10-frame search of the SMOOTHED df), or None if nothing there was
+    complete. This is attempted REGARDLESS of whether fallback_row is
+    None — a severe tracking gap can mean nothing within +/-10 frames of
+    BFC is complete in the smoothed data at all, while a raw pass
+    (validated against the seeded walk's own identity via
+    _select_identity_consistent_candidate, which itself searches up to
+    30 frames for a reference — see _nearest_reference_row) can still
+    recover it. If fallback_row is None and a validated candidate IS
+    found, a fresh row is built from just "frame" + the recovered
+    landmarks (calculate_rear_knee_angle/calculate_rear_hip_flexion only
+    ever read the trail HIP/KNEE/ANKLE and both SHOULDER columns, all of
+    which this function requests).
+
+    Returns the patched row, or fallback_row unchanged (including None)
+    if nothing could be validated. Never fabricates a landmark it
+    couldn't confirm.
+    """
+    trail_upper = "LEFT" if trail_side == "left" else "RIGHT"
+    # NOSE included even though neither consuming function reads it — it's
+    # the PRIMARY reference _raw_reference_point checks (see its
+    # docstring), and this function only ever fetches ONE side's hip
+    # (trail), never a full LEFT+RIGHT pair — so without NOSE here,
+    # _select_identity_consistent_candidate would have no usable
+    # reference for ANY candidate and could never recover anything. A
+    # real bug caught by this function's own regression tests, not
+    # footage — worth remembering for any future _refine_*_raw variant
+    # that fetches only one side of a paired landmark.
+    needed = ["NOSE", f"{trail_upper}_HIP", f"{trail_upper}_KNEE", f"{trail_upper}_ANKLE",
+              "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+    try:
+        raw = extract_raw_landmarks_window(video_path, fps, needed, int(bfc_frame), int(bfc_frame))
+    except Exception as e:
+        monitoring.capture(e)
+        return fallback_row
+
+    candidates = raw.get(int(bfc_frame))
+    if not candidates:
+        return fallback_row
+    selected = _select_identity_consistent_candidate(df, int(bfc_frame), candidates)
+    if selected is None:
+        return fallback_row
+
+    patched = fallback_row.copy() if fallback_row is not None else pd.Series({"frame": bfc_frame}, dtype=object)
+    for name, (x, y, _vis) in selected.items():
+        patched[f"{name}_x"] = x
+        patched[f"{name}_y"] = y
+    return patched
+
+
 def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFrame,
                                        start_frame: int, end_frame: int) -> pd.DataFrame:
     """
@@ -2424,12 +2485,34 @@ def run_complete_bowling_analysis(video_path: str,
     # missing FFC/BR row does, since these two new metrics are the ONLY
     # things that need this row. Falls back to None (both new metrics
     # then read as "Tracking Drop"/unavailable) rather than failing.
+    #
+    # BUG FIX (2026-09-15, found while auditing every raw-refinement gap
+    # after a real coach-reported failure where rear_knee_angle AND
+    # rear_hip_flexion both went N/A together): this completeness check
+    # only ever verified the trail HIP/KNEE/ANKLE columns, but calculate_
+    # rear_hip_flexion also needs BOTH shoulders (mid-shoulder to trail-
+    # hip vector) — a row with complete trail-leg data but NaN shoulders
+    # would pass this check, then still silently fail inside calculate_
+    # rear_hip_flexion itself. Added shoulders so "complete" actually
+    # means complete for both consuming functions.
     bfc_row = _nearest_complete_row(
         df, events["BFC"],
         [f"{_trail_upper}_HIP_x", f"{_trail_upper}_HIP_y",
          f"{_trail_upper}_KNEE_x", f"{_trail_upper}_KNEE_y",
-         f"{_trail_upper}_ANKLE_x", f"{_trail_upper}_ANKLE_y"],
+         f"{_trail_upper}_ANKLE_x", f"{_trail_upper}_ANKLE_y",
+         "LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y"],
     )
+    # RAW RE-EXTRACTION (2026-09-15): same pattern as _refine_stage4_rows_
+    # raw — see that function's docstring for the real coach-reported gap
+    # this whole family of fixes closes. rear_knee_angle/rear_hip_flexion
+    # were the LAST of the 7 bowling metrics still reading ONLY the
+    # smoothed df with no chance of a fresh, identity-validated look at
+    # the source video. Attempted regardless of whether the search above
+    # found a row — a severe tracking gap can mean nothing within +/-10
+    # frames of BFC is complete in the SMOOTHED data, while a raw pass
+    # (validated against the seeded walk's own identity, searching up to
+    # 30 frames for a reference) can still recover it.
+    bfc_row = _refine_bfc_row_raw(video_path, fps, df, events["BFC"], trail_side, bfc_row)
 
     # STAGE 4 — METRIC CALCULATIONS
     # RAW RE-EXTRACTION (2026-09-15, real coach-reported gap, found after
