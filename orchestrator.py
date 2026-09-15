@@ -1265,6 +1265,73 @@ def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
     return _row_from_raw(br_frame), _row_from_raw(height_ref_frame)
 
 
+def _refine_stage4_rows_raw(video_path: str, fps: float, df: pd.DataFrame,
+                             ffc_frame: int, br_frame: int, lead_side: str):
+    """
+    Same raw-re-extraction + identity-consistent candidate selection
+    pattern as _refine_release_landmarks_raw (see that function's and
+    _select_identity_consistent_candidate's docstrings for the full real-
+    bug background), applied to the FFC/BR rows calculate_knee_bracing,
+    calculate_trunk_lean, and calculate_hip_shoulder_separation use.
+
+    WHY (2026-09-15, real coach-reported gap, found after correctly
+    rejecting an external-AI suggestion that misdiagnosed WHICH function
+    was responsible): these three metrics read straight from the seeded
+    walk's own smoothed df and never got the same sharpening release_
+    height/head_stability/the annotated skeleton already have — so a
+    frame where the seeded walk's OWN continuity briefly lost a needed
+    landmark (a real, common MediaPipe recall gap during the fastest part
+    of a delivery stride) reported "Tracking Drop" even when a fresh,
+    identity-validated look at that exact frame could have recovered it.
+    Verified directly: extract_raw_landmarks_window/_select_identity_
+    consistent_candidate are NEVER called anywhere in the code path that
+    computes these three metrics before this fix — the claim that
+    loosening _select_identity_consistent_candidate's threshold would
+    fix their N/A readings does not hold, since that function was never
+    in this path at all.
+
+    Returns (patched_ffc_row, patched_br_row) -- each the ORIGINAL row
+    from df with only VALIDATED raw columns merged in (never a whole
+    fabricated row), or None if df has no row at that frame at all. A
+    frame/landmark raw re-extraction can't confidently and consistently
+    recover simply keeps its original smoothed value — this can only
+    strengthen a reading, never fabricate or lose one.
+    """
+    lead_upper = "LEFT" if lead_side == "left" else "RIGHT"
+    needed = ["LEFT_HIP", "RIGHT_HIP", "LEFT_SHOULDER", "RIGHT_SHOULDER",
+              f"{lead_upper}_KNEE", f"{lead_upper}_ANKLE"]
+
+    ffc_rows = df[df["frame"] == ffc_frame]
+    br_rows = df[df["frame"] == br_frame]
+    ffc_row = ffc_rows.iloc[0] if not ffc_rows.empty else None
+    br_row = br_rows.iloc[0] if not br_rows.empty else None
+
+    start = int(min(ffc_frame, br_frame))
+    end = int(max(ffc_frame, br_frame))
+    try:
+        raw = extract_raw_landmarks_window(video_path, fps, needed, start, end)
+    except Exception as e:
+        monitoring.capture(e)
+        return ffc_row, br_row
+
+    def _patched(frame_idx, original_row):
+        if original_row is None:
+            return None
+        candidates = raw.get(int(frame_idx))
+        if not candidates:
+            return original_row
+        selected = _select_identity_consistent_candidate(df, int(frame_idx), candidates)
+        if selected is None:
+            return original_row
+        patched = original_row.copy()
+        for name, (x, y, _vis) in selected.items():
+            patched[f"{name}_x"] = x
+            patched[f"{name}_y"] = y
+        return patched
+
+    return _patched(ffc_frame, ffc_row), _patched(br_frame, br_row)
+
+
 def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFrame,
                                        start_frame: int, end_frame: int) -> pd.DataFrame:
     """
@@ -2365,6 +2432,24 @@ def run_complete_bowling_analysis(video_path: str,
     )
 
     # STAGE 4 — METRIC CALCULATIONS
+    # RAW RE-EXTRACTION (2026-09-15, real coach-reported gap, found after
+    # correctly rejecting an external-AI suggestion that misdiagnosed
+    # WHICH function was responsible for N/A readings here — see
+    # _refine_stage4_rows_raw's docstring): knee_bracing/trunk_lean/
+    # hip_shoulder_separation used to read ONLY the smoothed df, with no
+    # chance to recover a frame where the seeded walk's own continuity
+    # briefly dropped a needed landmark — unlike release_height/head_
+    # stability/the annotated skeleton, which already get this same
+    # sharpening. Falls back to the original rows on any failure, so
+    # this can only strengthen a reading, never block the analysis.
+    ffc_row_refined, br_row_refined = _refine_stage4_rows_raw(
+        video_path, fps, df, events["FFC"], events["BR"], lead_side
+    )
+    if ffc_row_refined is not None:
+        ffc_row = ffc_row_refined
+    if br_row_refined is not None:
+        br_row = br_row_refined
+
     knee_analysis = calculate_knee_bracing(ffc_row, lead_side=lead_side)
     knee_at_release = calculate_knee_bracing(br_row, lead_side=lead_side)
     lean_analysis = calculate_trunk_lean(br_row)
@@ -2382,7 +2467,10 @@ def run_complete_bowling_analysis(video_path: str,
     # strengthen the reading, never block the analysis.
     _head_stability_df = _refine_head_stability_window_raw(video_path, fps, df, events["BFC"], events["BR"])
     head_stability = calculate_head_stability(_head_stability_df, events["BFC"], events["BR"])
-    hip_separation = calculate_hip_shoulder_separation(df, events["FFC"])
+    # ffc_row may now be the raw-refined version from above — wrap it in a
+    # single-row df so calculate_hip_shoulder_separation's own
+    # frame-lookup finds the sharpened values too, not the unpatched df.
+    hip_separation = calculate_hip_shoulder_separation(pd.DataFrame([ffc_row]), events["FFC"])
     # Anchored on BR (the release frame — coach-confirmable, see the
     # Streamlit release-frame-confirmation step), not FFC. FFC's own
     # detected TIMING can be wrong for leaping bowlers (see
