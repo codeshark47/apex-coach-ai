@@ -292,6 +292,28 @@ class TestPriorProfileWarmStart:
             prior_profile=[_HIST_A, _HIST_A, _HIST_A])
         assert result[1] is not None
 
+    def test_a_short_prior_profile_still_rejects_a_wrong_candidate(self):
+        """REGRESSION (2026-09-19, real coach-reported failure, traced
+        directly from an actual session's landmarks.csv): every OTHER
+        test in this class warm-starts with exactly 3 entries — meeting
+        APPEARANCE_MIN_PROFILE by coincidence, never actually exercising
+        the common real case where a coach has only 1-2 OTHER
+        successfully-matched seeds (this clip's own narrow detection
+        window makes that the norm, not the exception). With fewer than
+        3 prior_profile entries, the OLD code still fell through to
+        position-only picking (len(profile) < APPEARANCE_MIN_PROFILE)
+        for this zone's first 1-2 confirmed matches, even though real,
+        already-trusted evidence was available from frame 1. A single
+        real prior_profile entry must be enough to activate the
+        appearance gate immediately — it already passed the caller's
+        own cross-seed majority check before ever reaching here."""
+        frame_candidates = [[], [_torso_landmarks(0.50, 0.50)]]
+        frame_hists = [[], [_HIST_B]]
+        result, _ = main._walk_from_seed(
+            0, (0.50, 0.50), frame_candidates, frame_hists, fps=30, lo_bound=0, hi_bound=1,
+            prior_profile=[_HIST_A])  # just ONE entry -- fewer than APPEARANCE_MIN_PROFILE
+        assert result[1] is None
+
     def test_a_real_seed_match_takes_priority_over_prior_profile(self):
         """If this seed's OWN exact-frame match succeeded, that real
         histogram seeds the profile — prior_profile must never override

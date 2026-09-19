@@ -313,6 +313,34 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
     MAX_GAP_FRAMES = max(3, int(round(fps * 0.5)))
     APPEARANCE_PROFILE_LEN = 8
     APPEARANCE_MIN_PROFILE = 3
+    # BUG FOUND (2026-09-19, real coach-reported failure, traced directly
+    # from an actual session's landmarks.csv, NOT a misclick): APPEARANCE_
+    # MIN_PROFILE=3 gates the appearance check on ANY profile, regardless
+    # of where its entries came from — but prior_profile (see its own
+    # docstring below) seeds the profile with ALREADY-TRUSTED evidence
+    # from the coach's OTHER confirmed seeds, which passed the cross-seed
+    # majority check before ever reaching here. If the coach has fewer
+    # than 3 OTHER successfully-matched seeds (a common, unremarkable
+    # case — most coaches place 2-4 seeds total, and this clip's own
+    # narrow detection window means it's normal for only 1-2 of them to
+    # get a direct match), prior_profile supplies only 1-2 entries —
+    # still LESS than APPEARANCE_MIN_PROFILE=3 — so the gate stayed OFF
+    # (pure nearest-position pick, no appearance check at all) for this
+    # zone's first 1-2 confirmed matches, exactly long enough for a
+    # nearby bystander to get "confirmed" and start contaminating the
+    # profile, even though real, trustworthy appearance evidence for the
+    # correct person was already available from frame 1. Confirmed
+    # directly: a real session tracked the bowler correctly through one
+    # seed's zone, then a SEPARATE seed (whose own click frame had no
+    # detection — "low quality" in the UI, not a misclick) locked onto a
+    # near-static bystander instead, with the walk's own MAX_GAP_FRAMES
+    # ceiling ruling out this being the first seed simply drifting.
+    # Externally-verified evidence deserves trust regardless of how few
+    # entries it has (it already survived the majority-vote check the
+    # caller runs before ever building prior_profile); self-accumulated
+    # evidence still needs real corroboration before it's trusted, so
+    # THAT case keeps the original, higher bar.
+    has_prior_profile = bool(prior_profile)
 
     def pick_closest(cands, hists, anchor_xy, max_dist, profile, gap_frames):
         in_range = []
@@ -325,7 +353,8 @@ def _walk_from_seed(seed_idx, seed_xy, frame_candidates, frame_hists, fps, lo_bo
             return None, None
         in_range.sort(key=lambda t: t[0])
 
-        if len(profile) < APPEARANCE_MIN_PROFILE:
+        min_profile_needed = 1 if has_prior_profile else APPEARANCE_MIN_PROFILE
+        if len(profile) < min_profile_needed:
             _, best_cand, best_hist = in_range[0]
             return best_cand, best_hist
 
