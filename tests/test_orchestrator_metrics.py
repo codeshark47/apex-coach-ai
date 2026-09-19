@@ -956,6 +956,105 @@ class TestDetectDeliveryEventsTooShortClip:
         assert "error" not in result
 
 
+class TestDetectDeliveryEventsHonestlyFlagsADeadZoneWithoutBlockingConfirmation:
+    """
+    REAL INVESTIGATION (2026-09-19, traced directly from a coach's actual
+    session): a clip can have real, valid landmark tracking for its
+    first portion (the run-up) and then a genuine, total MediaPipe
+    detection failure for the rest (the delivery stride and release,
+    verified directly by running the real detector against the real
+    clip at the app's own settings — the bowler simply isn't detected
+    there at all, any confidence threshold, any candidate count).
+
+    An EARLIER version of this fix made FFC/BR return None in this case,
+    reasoning that argmax/argmin over fabricated forward-filled data
+    shouldn't produce a confident-looking frame number. That was reverted
+    after tracing the full pipeline: this frame number is only ever a
+    STARTING SUGGESTION for the coach's own MANDATORY frame-by-frame
+    confirmation step in streamlit_app.py (the whole analysis is blocked
+    until BFC/FFC/BR are human-confirmed, specifically because
+    auto-detection is known to be unreliable). That confirmation
+    slider only renders when this function returns a real integer —
+    returning None removes the coach's only way to manually scrub to and
+    confirm the TRUE frame, exactly the workflow that successfully
+    produced a correct, coach-confirmed Release Height on the real clip
+    that surfaced this whole investigation.
+
+    The correct fix: keep returning a best-effort integer always (so the
+    confirmation UI keeps working), while br_confidence/
+    br_plausible_fraction (already existing) honestly disclose when that
+    number has zero real evidence behind it.
+    """
+
+    def _dead_zone_df(self, total_frames=40, real_until=20):
+        rows = []
+        for i in range(total_frames):
+            if i < real_until:
+                rows.append({
+                    "frame": i,
+                    "RIGHT_WRIST_y": 0.9 - i * 0.01,
+                    "RIGHT_WRIST_x": 0.5, "RIGHT_ELBOW_x": 0.5, "RIGHT_ELBOW_y": 0.6,
+                    "RIGHT_SHOULDER_x": 0.5, "RIGHT_SHOULDER_y": 0.3,
+                    # A moving run-up stride -- no plateau/plant anywhere
+                    # in the real portion, so FFC has no qualifying_runs/
+                    # stable_runs to fall back on legitimately.
+                    "LEFT_ANKLE_y": 0.8 - (i % 4) * 0.05,
+                    "RIGHT_ANKLE_y": 0.8 - ((i + 2) % 4) * 0.05,
+                })
+            else:
+                # The genuine, total detection failure -- every landmark
+                # column NaN, matching the real session's landmarks.csv
+                # exactly (confirmed: 89 straight frames of nothing).
+                rows.append({
+                    "frame": i,
+                    "RIGHT_WRIST_y": float("nan"), "RIGHT_WRIST_x": float("nan"),
+                    "RIGHT_ELBOW_x": float("nan"), "RIGHT_ELBOW_y": float("nan"),
+                    "RIGHT_SHOULDER_x": float("nan"), "RIGHT_SHOULDER_y": float("nan"),
+                    "LEFT_ANKLE_y": float("nan"), "RIGHT_ANKLE_y": float("nan"),
+                })
+        return pd.DataFrame(rows)
+
+    def test_a_total_dead_zone_still_returns_usable_frames_for_manual_confirmation(self):
+        df = self._dead_zone_df()
+        result = o.detect_delivery_events(df, fps=30, bowling_arm="right")
+        # Must NOT be None -- that would block the coach's mandatory
+        # confirmation slider from rendering at all (streamlit_app.py:
+        # "if br_auto is None: st.error(...)" with no slider offered).
+        assert result["BFC"] is not None
+        assert result["FFC"] is not None
+        assert result["BR"] is not None
+        assert "error" not in result
+        # But the confidence signal must be honest about the zero real
+        # evidence behind that number -- this is what actually protects
+        # against silently trusting a number nobody looked at.
+        assert result["BR_confidence"] == "low"
+        assert result["BR_plausible_fraction"] == 0.0
+
+    def test_real_data_throughout_still_detects_normally(self):
+        """The fix must not make detection more conservative than
+        necessary -- a clip with real data everywhere must still detect
+        real events via the fallback paths, not regress to None. Same
+        data shape as TestDetectDeliveryEventsTooShortClip's own boundary
+        test above (proven to reach the fallback paths and detect
+        successfully), just longer."""
+        rows = []
+        for i in range(40):
+            rows.append({
+                "frame": i,
+                "RIGHT_WRIST_y": 0.9 - i * 0.02,
+                "RIGHT_WRIST_x": 0.5, "RIGHT_ELBOW_x": 0.5, "RIGHT_ELBOW_y": 0.6,
+                "RIGHT_SHOULDER_x": 0.5, "RIGHT_SHOULDER_y": 0.3,
+                "LEFT_ANKLE_y": 0.8,
+                "RIGHT_ANKLE_y": 0.8 - min(i, 8) * 0.02,
+            })
+        df = pd.DataFrame(rows)
+        result = o.detect_delivery_events(df, fps=30, bowling_arm="right")
+        assert result["BFC"] is not None
+        assert result["FFC"] is not None
+        assert result["BR"] is not None
+        assert "error" not in result
+
+
 class TestExtractAndDetectEventsPropagatesTooShortClip:
     def test_caller_reports_failure_instead_of_proceeding_with_null_events(self, tmp_path, monkeypatch):
         """extract_and_detect_events must catch detect_delivery_events'

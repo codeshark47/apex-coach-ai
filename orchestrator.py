@@ -655,6 +655,27 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
     qualifying_runs = [r for r in stable_runs
                        if (r[1] - r[0] + 1) >= MIN_PLANT_FRAMES and _run_span(r) <= span_floor]
 
+    # NOTE (2026-09-19): a version of this fallback once returned an
+    # early, hard "couldn't detect" failure when the search region had
+    # zero real (non-gap-filled) detections, reasoning that argmax() over
+    # fabricated forward-filled data shouldn't produce a confident-
+    # looking frame number. Reverted after tracing the full pipeline:
+    # unlike a silently-trusted value, this specific number is only ever
+    # a STARTING SUGGESTION for the coach's own mandatory frame-by-frame
+    # confirmation step in streamlit_app.py (the whole analysis is
+    # blocked until BFC/FFC/BR are human-confirmed, specifically because
+    # auto-detection is known to be unreliable — see that UI's own
+    # comments). That confirmation slider only renders AT ALL when this
+    # function returns a real integer; returning None here doesn't make
+    # the report more honest, it removes the coach's only way to
+    # manually scrub to and confirm the TRUE frame — exactly the
+    # workflow that successfully produced a correct, coach-confirmed
+    # Release Height on the real clip that surfaced this whole
+    # investigation. br_confidence/br_plausible_fraction already
+    # disclose low/zero real evidence honestly without blocking that
+    # workflow; FFC/BFC have no equivalent confirmed-vs-auto distinction
+    # in the UI today, so the same "always return a starting point"
+    # approach applies here for consistency.
     if qualifying_runs or stable_runs:
         # Prefer the last run that's a genuine sustained hold; only fall
         # back to a short/noisy one if literally nothing else was found,
@@ -919,14 +940,29 @@ def detect_delivery_events(df: pd.DataFrame, fps: int, bowling_arm: str = "right
         else:
             br_idx = ffc_idx + int(np.argmin(br_slice))
     elif len(br_slice) > 0:
+        # See this function's own note above (near the FFC fallback) for
+        # why this stays a best-effort estimate rather than an early
+        # "couldn't detect" failure: it's only ever a STARTING SUGGESTION
+        # for the coach's mandatory manual confirmation step, and
+        # br_confidence/br_plausible_fraction (computed above) already
+        # honestly disclose when this window had no real detection —
+        # returning None here would remove the coach's only way to
+        # manually scrub to and confirm the true release frame.
         br_idx = ffc_idx + int(np.argmin(br_slice))
     else:
         br_idx = min(ffc_idx + 1, total_frames - 1)
 
     bfc_lookback = max(0, ffc_idx - int(fps * 0.5))
     bfc_window = back_ankle_y[bfc_lookback:ffc_idx]
+    # Same real-detection gate as FFC/BR above — back_ankle_y can be
+    # forward-filled stale data in this lookback window even when ffc_idx
+    # itself is real (e.g. FFC came from the back-half fallback, which
+    # only guarantees SOME real detection somewhere after `half`, not
+    # specifically in the ~0.5s immediately before it).
+    back_had_real = (~df[f"{bowl_side}_ANKLE_y"].isna()).values
+    bfc_real_window = back_had_real[bfc_lookback:ffc_idx]
 
-    if len(bfc_window) > 0:
+    if len(bfc_window) > 0 and bfc_real_window.any():
         bfc_idx = bfc_lookback + int(np.argmax(bfc_window))
     else:
         bfc_idx = max(0, ffc_idx - int(fps * 0.2))
