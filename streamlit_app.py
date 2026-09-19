@@ -2951,12 +2951,48 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
             else:
                 detected = st.session_state.get(detected_key)
                 if detected is False:
-                    st.warning(
-                        "⚠️ No person detected right at this click — this frame likely won't "
-                        "anchor the tracker (the bowler may be too small, blurred, or "
-                        "mid-motion here). Try scrubbing to a nearby frame where he's clearly "
-                        "visible and standing/running normally, then click again."
+                    # CONTEXT-AWARE MESSAGE (2026-09-19, real coach
+                    # feedback: a coach with a genuinely correct click on
+                    # a motion-blurred frame kept hunting for a "clean"
+                    # frame across two extra-seed slots, reading this
+                    # warning as a hard blocker). It used to say the same
+                    # thing regardless of whether a fallback already
+                    # existed. As of the prior_profile fix (main.py,
+                    # 2026-09-19), a single OTHER confirmed seed for this
+                    # same stream is now enough to appearance-gate this
+                    # zone from frame 1 — so when that's true, this click
+                    # is NOT stuck: the raw position is still kept as an
+                    # anchor and the walk will use the other seed's
+                    # already-verified appearance to track correctly
+                    # through this exact blurred moment. Only tell the
+                    # coach to go hunting for a clean frame when there is
+                    # genuinely no fallback yet (this is their first/only
+                    # real evidence for this stream) — that case still
+                    # needs it, since there's nothing to fall back on.
+                    has_sibling_evidence = any(
+                        v is not None for k, v in st.session_state.get(shared_hists_key, {}).items()
+                        if k != key_prefix
                     )
+                    if has_sibling_evidence:
+                        st.warning(
+                            "⚠️ No person detected right at this exact frame — a real, common "
+                            "gap during fast motion (blur), not a problem with your click. "
+                            "This is OK to leave as-is: your click position is still kept, and "
+                            "since you already have another confirmed seed for this video, the "
+                            "tracker will use what that seed showed it the bowler looks like to "
+                            "correctly follow him through this blurred moment too. You do NOT "
+                            "need to keep hunting for a perfectly clear frame here — only do so "
+                            "if you'd prefer a sharper anchor point."
+                        )
+                    else:
+                        st.warning(
+                            "⚠️ No person detected right at this click — this frame likely won't "
+                            "anchor the tracker (the bowler may be too small, blurred, or "
+                            "mid-motion here). Since this is your first confirmed seed for this "
+                            "video, there's nothing yet for the tracker to fall back on here — "
+                            "try scrubbing to a nearby frame where he's clearly visible and "
+                            "standing/running normally, then click again."
+                        )
                     suggestion = st.session_state.get(suggestion_key)
                     if suggestion is not None:
                         nearby_frame_idx, nearby_point, nearby_hist = suggestion
