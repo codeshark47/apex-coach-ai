@@ -2686,6 +2686,55 @@ def _compute_seed_appearance_mismatch(new_hist, sibling_hists: dict):
     return best_sim
 
 
+def _apply_seed_mismatch_check(key_prefix: str, new_hist, shared_hists_key: str):
+    """
+    Computes and stores the appearance-mismatch state for a seed slot
+    that was just confirmed (a direct click or an accepted nearby-frame
+    suggestion), AND retroactively flags any EXISTING sibling slot this
+    new click disagrees with.
+
+    REAL BUG (2026-09-19, traced on an actual coach session, not a
+    hypothetical): the mismatch check previously only ever updated the
+    slot being clicked RIGHT NOW, comparing it against whichever siblings
+    were already confirmed. With only two seeds filled in, that means
+    whichever slot is confirmed FIRST is never checked at all (nothing to
+    compare against yet) — if the coach clicks the WRONG person first and
+    the correct bowler second, _compute_seed_appearance_mismatch fires on
+    the SECOND click (the correct one), not the first (the wrong one).
+    A coach reading "this looks different from your other confirmation"
+    on their obviously-correct bowler click reasonably ignores it or
+    second-guesses the right click — while the actually-wrong click sits
+    with no warning at all, exactly backwards from what's needed.
+    Confirmed directly: a real session's output/landmarks.csv showed
+    precisely this shape — a seed correctly tracking the bowler through
+    frames 40-54, then a SEPARATE seed's own zone confidently locked onto
+    a near-static bystander from frame 80 on (x barely moved, ~0.03 over
+    16 frames), with no warning anywhere in the UI that would have caught
+    it before the coach ran the full analysis.
+
+    Fix: when THIS slot's click disagrees with an existing sibling, mark
+    that SIBLING as mismatched too, not just this new slot — a real
+    two-seed disagreement now always shows a warning on BOTH sides, so
+    the coach has to look at both and judge which one is actually the
+    bowler, instead of the warning landing arbitrarily on whichever slot
+    happened to be confirmed second (or never appearing at all if the
+    wrong click came first).
+    """
+    siblings = {k: v for k, v in st.session_state.setdefault(shared_hists_key, {}).items()
+                if k != key_prefix}
+    this_mismatch = _compute_seed_appearance_mismatch(new_hist, siblings)
+    st.session_state[f"{key_prefix}_seed_click_mismatch"] = this_mismatch
+    st.session_state[shared_hists_key][key_prefix] = new_hist
+
+    if this_mismatch is not None:
+        for sib_key, sib_hist in siblings.items():
+            if sib_hist is None:
+                continue
+            sib_sim = main._hist_similarity(new_hist, sib_hist)
+            if sib_sim < _SEED_APPEARANCE_MISMATCH_FLOOR:
+                st.session_state[f"{sib_key}_seed_click_mismatch"] = sib_sim
+
+
 def _find_nearest_frame_with_detection(ref_path: str, frame_idx: int, click_xy: tuple,
                                         total_frames: int, max_offset: int = 10):
     """
@@ -2933,10 +2982,10 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                             # click gets — a suggestion accept is still
                             # registering a real seed (see
                             # _find_nearest_frame_with_detection's docstring).
-                            siblings = {k: v for k, v in st.session_state.setdefault(shared_hists_key, {}).items()
-                                        if k != key_prefix}
-                            st.session_state[mismatch_key] = _compute_seed_appearance_mismatch(nearby_hist, siblings)
-                            st.session_state[shared_hists_key][key_prefix] = nearby_hist
+                            # Also flags any sibling THIS click disagrees
+                            # with, not just this slot — see
+                            # _apply_seed_mismatch_check's docstring.
+                            _apply_seed_mismatch_check(key_prefix, nearby_hist, shared_hists_key)
                             st.rerun()
                 elif detected is True:
                     mismatch_sim = st.session_state.get(mismatch_key)
@@ -2987,11 +3036,11 @@ def render_bowler_seed_ui(uploaded_file, key_prefix: str, label: str, save_key: 
                     # checked against every OTHER seed slot's own matched
                     # click for this same stream, catching a click that
                     # found a real (but wrong) person before it can quietly
-                    # out-vote the coach's correct clicks later.
-                    siblings = {k: v for k, v in st.session_state.setdefault(shared_hists_key, {}).items()
-                                if k != key_prefix}
-                    st.session_state[mismatch_key] = _compute_seed_appearance_mismatch(just_hist, siblings)
-                    st.session_state[shared_hists_key][key_prefix] = just_hist
+                    # out-vote the coach's correct clicks later. Also
+                    # flags any sibling THIS click disagrees with, not
+                    # just this slot — see _apply_seed_mismatch_check's
+                    # docstring for the real session this fixes.
+                    _apply_seed_mismatch_check(key_prefix, just_hist, shared_hists_key)
                 st.rerun()
 
             if st.session_state.get(point_key) is not None:
