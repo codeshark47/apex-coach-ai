@@ -36,8 +36,8 @@ class TestModelDownloadValidation:
         assert "download" in result["error_message"].lower()
         # The poisoned partial file must not be left behind for the next
         # run to silently trust.
-        assert not os.path.exists(os.path.join("models", "pose_landmarker_full.task"))
-        assert not os.path.exists(os.path.join("models", "pose_landmarker_full.task.part"))
+        assert not os.path.exists(os.path.join("models", "pose_landmarker_heavy.task"))
+        assert not os.path.exists(os.path.join("models", "pose_landmarker_heavy.task.part"))
 
     def test_a_genuinely_valid_model_download_is_accepted_and_kept(self, tmp_path, monkeypatch):
         """A real, valid model download must be moved into place and kept
@@ -46,7 +46,7 @@ class TestModelDownloadValidation:
         fake_video = tmp_path / "corrupt.mp4"
         fake_video.write_bytes(b"garbage -- just needs to make it past the model-download step")
         real_model_path = os.path.join(
-            os.path.dirname(os.path.abspath(main.__file__)), "models", "pose_landmarker_full.task"
+            os.path.dirname(os.path.abspath(main.__file__)), "models", "pose_landmarker_heavy.task"
         )
         real_model_bytes = open(real_model_path, "rb").read()
 
@@ -56,7 +56,7 @@ class TestModelDownloadValidation:
         # The "video" itself is garbage, so this still ends in an error --
         # but a DIFFERENT one (unreadable video), proving the model itself
         # downloaded, validated, and loaded successfully.
-        model_path = os.path.join("models", "pose_landmarker_full.task")
+        model_path = os.path.join("models", "pose_landmarker_heavy.task")
         assert os.path.exists(model_path)
         assert not os.path.exists(model_path + ".part")
         assert "model" not in (result.get("error_message") or "").lower()

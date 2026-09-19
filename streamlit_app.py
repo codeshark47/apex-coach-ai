@@ -2562,7 +2562,11 @@ def _get_seed_check_landmarker():
     per click. Returns None if the model file isn't available yet — the
     caller treats that as "can't check," not "check failed."
     """
-    model_path = os.path.join("models", "pose_landmarker_full.task")
+    # "heavy" (2026-09-19) — MUST stay in lockstep with main.py's own
+    # model choice (see this docstring's own claim above); see
+    # extract_video_landmarks' docstring for the real, measured recall
+    # improvement this swap is based on.
+    model_path = os.path.join("models", "pose_landmarker_heavy.task")
     if not os.path.exists(model_path):
         return None
     from mediapipe.tasks import python

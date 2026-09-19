@@ -112,7 +112,11 @@ def _extract_raw_wrist_window(video_path: str, wrist_name: str, br_idx: int,
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
 
-    model_path = os.path.join("models", "pose_landmarker_full.task")
+    # "heavy" (2026-09-19) — kept consistent with main.py's model choice;
+    # see extract_video_landmarks' docstring for the real, measured
+    # recall improvement this is based on (fast, motion-blurred
+    # deliveries losing detection entirely on the "full" model).
+    model_path = os.path.join("models", "pose_landmarker_heavy.task")
     landmark_index = 16 if wrist_name == "RIGHT_WRIST" else 15
 
     base_options = python.BaseOptions(model_asset_path=model_path)

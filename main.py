@@ -492,11 +492,22 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         return {"status": "error", "error_message": f"Input video file not found: {video_path}"}
 
     model_dir = "models"
-    model_path = os.path.join(model_dir, "pose_landmarker_full.task")
+    # UPGRADED to "heavy" (2026-09-19, real coach-reported failure):
+    # verified directly against the actual clip that reproduced this bug
+    # (a fast, motion-blurred delivery stride) that "full" loses the
+    # bowler entirely — zero detections, any confidence threshold down to
+    # 0.1, any candidate count up to 5 — for the ENTIRE delivery/release
+    # window after the run-up. "heavy" recovers real (if still partial)
+    # detections in part of that same window where "full" found nothing
+    # at all. Not a complete fix for every clip (heavy's recall still has
+    # real limits on severe blur), but a measured, genuine improvement,
+    # not a guess — worth the larger download and slower inference for a
+    # coaching tool where correctness matters more than speed.
+    model_path = os.path.join(model_dir, "pose_landmarker_heavy.task")
     os.makedirs(model_dir, exist_ok=True)
 
     if not os.path.exists(model_path):
-        model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+        model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
         # BUG FIX (2026-09-13, robustness audit): urlretrieve used to write
         # straight to model_path — a network drop mid-transfer, or a
         # redirect to an HTML error page saved as if it were the model,
@@ -506,10 +517,11 @@ def extract_video_landmarks(video_path: str, output_csv_path: str,
         # this function (PoseLandmarker.create_from_options) on every
         # single call until someone manually deleted the file. Now
         # downloads to a temp path first, validates a minimum real size
-        # (the genuine model is ~9.4MB; a truncated/error-page download is
-        # nowhere close), and only moves it into place once confirmed —
-        # cleaning up the temp file on any failure so the next run gets a
-        # clean retry instead of a permanently poisoned cache.
+        # (the genuine "heavy" model is ~30MB; a truncated/error-page
+        # download is nowhere close), and only moves it into place once
+        # confirmed — cleaning up the temp file on any failure so the
+        # next run gets a clean retry instead of a permanently poisoned
+        # cache.
         MIN_MODEL_SIZE_BYTES = 1_000_000
         tmp_model_path = model_path + ".part"
         try:
@@ -987,7 +999,12 @@ def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: li
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
 
-    model_path = os.path.join("models", "pose_landmarker_full.task")
+    # "heavy" (2026-09-19) — see extract_video_landmarks' docstring for
+    # the real, measured recall improvement this model swap is based on;
+    # kept consistent with the primary walk's own model choice so a raw
+    # re-extraction pass isn't silently using a WEAKER detector than the
+    # seeded walk it's supposed to sharpen.
+    model_path = os.path.join("models", "pose_landmarker_heavy.task")
     landmark_indices = {name: LANDMARK_NAMES.index(name) for name in landmark_names}
 
     base_options = python.BaseOptions(model_asset_path=model_path)
