@@ -70,6 +70,30 @@ class TestRefineBfcRowRaw:
         assert result["RIGHT_HIP_x"] == 0.261
         assert result["frame"] == 30
 
+    def test_a_partial_candidate_with_no_fallback_still_has_every_expected_column(self):
+        """REGRESSION (2026-09-19, found via a real end-to-end pipeline
+        run with the ROI-crop fallback active): a candidate missing one
+        landmark (e.g. the knee cropped out of an ROI search) used to
+        produce a row where that column was entirely ABSENT, not NaN --
+        kinematics.py's bracket-style access (row["RIGHT_KNEE_x"]) then
+        raised a raw KeyError instead of gracefully reading NaN, showing
+        the coach a confusing "Data Deficit" instead of the honest
+        "Tracking Drop" a genuinely missing landmark should produce."""
+        df = _base_df([25, 35])  # nothing near frame 30 -- fallback_row will be None
+        # NOSE + hip only -- no RIGHT_KNEE, no RIGHT_ANKLE, no shoulders.
+        raw = {30: [{"NOSE": (0.25, 0.35, 1.0), "RIGHT_HIP": (0.261, 0.601, 1.0)}]}
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "right", None)
+        assert result is not None
+        # Every column calculate_rear_knee_angle/calculate_rear_hip_flexion
+        # read via bracket access must exist (as NaN), never be absent.
+        import pandas as pd
+        for col in ("RIGHT_KNEE_x", "RIGHT_KNEE_y", "RIGHT_ANKLE_x", "RIGHT_ANKLE_y",
+                    "LEFT_SHOULDER_x", "LEFT_SHOULDER_y", "RIGHT_SHOULDER_x", "RIGHT_SHOULDER_y"):
+            assert col in result.index
+            assert pd.isna(result[col])
+        assert result["RIGHT_HIP_x"] == 0.261  # the real, found landmark is still there
+
     def test_no_candidate_and_no_fallback_returns_none(self):
         df = _base_df([25, 35])
         raw = {}

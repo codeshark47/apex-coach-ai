@@ -5,7 +5,7 @@ import numpy as np
 import cv2
 
 import monitoring
-from main import extract_video_landmarks, extract_raw_landmarks_window
+from main import extract_video_landmarks, extract_raw_landmarks_window, extract_raw_landmarks_at_frame_roi
 from kinematics import (
     calculate_knee_bracing,
     calculate_trunk_lean,
@@ -1119,19 +1119,41 @@ def calculate_hip_shoulder_separation(df: pd.DataFrame, ffc_frame: int) -> dict:
 # CLOSE bystander (a teammate, umpire, or non-striker standing right
 # next to the bowler) in a wide run-up shot, where 0.15 of frame
 # width/height could plausibly be a small real-world gap. Deliberately
-# NOT tightening this now: doing so without real close-bystander footage
-# to validate against risks the opposite, already-experienced regression
-# (rejecting a genuine same-person match — see the fail-closed-permissive
-# bug fixed earlier the same day) for a scenario that hasn't actually
-# been observed on any real clip yet. Same standard already applied to
-# the rejected Gemini spatial-corridor suggestion above: tune from real
-# measured footage, never a guess. If a coach ever reports a wrong-person
-# lock with a bystander standing CLOSE to the bowler (not far away, like
-# every case fixed so far), that's the real data point to re-derive this
-# number from — ideally scaled by the tracked person's own detected body
-# size (e.g. video_overlay._torso_height) rather than a fixed frame
-# fraction, so it stays valid across this app's different camera zooms.
+# NOT tightening the BASE tolerance below: doing so without real close-
+# bystander footage to validate against risks the opposite, already-
+# experienced regression (rejecting a genuine same-person match — see
+# the fail-closed-permissive bug fixed earlier the same day) for a
+# scenario that hasn't actually been observed on any real clip yet. If a
+# coach ever reports a wrong-person lock with a bystander standing CLOSE
+# to the bowler (not far away, like every case fixed so far), that's the
+# real data point to re-derive this base number from — ideally scaled by
+# the tracked person's own detected body size (e.g. video_overlay.
+# _torso_height) rather than a fixed frame fraction.
 IDENTITY_CONSISTENCY_MAX_DIST = 0.15
+
+# GROWTH WITH GAP LENGTH (2026-09-19, real measured data, not a guess):
+# the base tolerance above alone doesn't distinguish "a different person
+# nearby right now" from "the SAME person, legitimately further from
+# their last confirmed position because more time has passed" — and a
+# real person genuinely moves further the longer a tracking gap runs.
+# Confirmed directly on the coach's real clip: a real, continuously-
+# moving detection recovered by the ROI-crop fallback at the coach's own
+# confirmed FFC/BR frames (21-24 frames from the nearest reference) sat
+# at 0.169-0.181 — just OVER the fixed 0.15 base and incorrectly
+# rejected — while a genuine bystander in this same investigation has
+# always measured around 0.45, a completely different order of
+# magnitude. This mirrors a principle already used elsewhere in this
+# exact codebase: main._walk_from_seed's own position-matching radius
+# grows with how many frames since the last confirmed match
+# (MAX_DIST_PER_SECOND=0.6 normalized-units/second, capped at
+# MAX_DIST_CAP=0.25) — reusing that SAME physical "how far can a person
+# move" rate here, at 0.6/fps normalized-units per frame, is a principled,
+# already-validated number, not a new one invented for this fix. Capped
+# well below the measured bystander distance, so this still can't
+# mistake a genuinely different, similarly-positioned person for a
+# match — it only recovers the SAME person over a longer real gap.
+IDENTITY_CONSISTENCY_GROWTH_PER_SECOND = 0.6
+IDENTITY_CONSISTENCY_MAX_DIST_CAP = 0.30
 
 
 def _raw_reference_point(existing_row, raw_landmarks: dict):
@@ -1188,7 +1210,8 @@ def _nearest_reference_row(df: pd.DataFrame, frame_idx: int, max_frame_search: i
     return None
 
 
-def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, candidates: list):
+def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, candidates: list,
+                                           fps: float = 30.0):
     """
     Among EVERY candidate MediaPipe detected at this frame (extract_raw_
     landmarks_window now returns all of them — see that function's
@@ -1227,22 +1250,136 @@ def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, cand
     FAILS CLOSED: returns None (no candidate selected) when nothing
     within _IDENTITY_REFERENCE_MAX_FRAME_SEARCH frames has a usable
     seeded reference to compare against, or when no candidate is within
-    IDENTITY_CONSISTENCY_MAX_DIST of it — an honest gap in the sharpened
+    the effective tolerance of it — an honest gap in the sharpened
     reading, never a guessed identity. See _refine_skeleton_window_raw's
     docstring for the original bug this whole gate exists to close.
+
+    fps: used only to convert IDENTITY_CONSISTENCY_GROWTH_PER_SECOND into
+    a per-frame growth rate for the tolerance below (see that constant's
+    own docstring for why a fixed tolerance isn't enough on its own).
+    Defaults to a reasonable assumption for any caller not passing it —
+    every real call site in this file does.
     """
     ref_row = _nearest_reference_row(df, frame_idx)
     if ref_row is None:
         return None
+    frames_away = abs(int(frame_idx) - int(ref_row["frame"]))
+    effective_max_dist = min(
+        IDENTITY_CONSISTENCY_MAX_DIST_CAP,
+        IDENTITY_CONSISTENCY_MAX_DIST + (IDENTITY_CONSISTENCY_GROWTH_PER_SECOND / fps) * frames_away,
+    )
     best_candidate, best_dist = None, None
     for candidate in candidates:
         raw_pt, existing_pt = _raw_reference_point(ref_row, candidate)
         if raw_pt is None or existing_pt is None:
             continue
         dist = ((raw_pt[0] - existing_pt[0]) ** 2 + (raw_pt[1] - existing_pt[1]) ** 2) ** 0.5
-        if dist <= IDENTITY_CONSISTENCY_MAX_DIST and (best_dist is None or dist < best_dist):
+        if dist <= effective_max_dist and (best_dist is None or dist < best_dist):
             best_candidate, best_dist = candidate, dist
     return best_candidate
+
+
+# ROI-CROP FALLBACK (2026-09-19, real coach-reported failure, evaluated
+# against an external-AI suggestion): a full-frame raw re-extraction pass
+# can find ZERO candidates at a frame during a fast, motion-blurred
+# delivery even when the subject is genuinely there — confirmed directly
+# on this app's real reproduction clip. Also confirmed directly (not a
+# guess): re-running detection on a TIGHT crop centered on roughly where
+# the subject should be recovers a real, continuously-plausible
+# detection at several of those exact frames — the crop changes the
+# scale/context the detector sees, which measurably helps independent of
+# blur. This is a genuine re-detection on real pixels, gated through the
+# SAME _select_identity_consistent_candidate validation as every other
+# candidate — it only widens WHERE candidates are searched for, never
+# weakens which one is trusted. Explicitly rejected the alternative
+# (interpolating joint positions across the gap) — see
+# main.smooth_without_resurrecting_gaps' docstring for the real bug that
+# approach already caused once in this exact codebase.
+_ROI_FALLBACK_BASE_RADIUS = 0.08
+_ROI_FALLBACK_GROWTH_PER_FRAME = 0.01
+_ROI_FALLBACK_MAX_RADIUS_X = 0.35
+_ROI_FALLBACK_RADIUS_Y = 0.25
+
+
+def _roi_fallback_candidates(video_path: str, fps: float, df: pd.DataFrame,
+                              frame_idx: int, landmark_names: list) -> list:
+    """
+    Only tried when a full-frame raw extraction found NOTHING at all for
+    this frame (see call sites below) — crops around the seeded walk's
+    own nearest already-confirmed position (_nearest_reference_row, the
+    SAME reference the identity-consistency check itself uses) and tries
+    ONE targeted re-detection there. The crop center is a real,
+    already-tracked position — never a deep interpolation across the
+    gap — and the crop radius grows modestly with how many frames away
+    that reference is, matching a short physical extrapolation (a person
+    can't teleport) rather than predicting a pose.
+
+    Returns a list of candidates (possibly empty) in the exact same
+    shape extract_raw_landmarks_window's per-frame value has, ready to
+    pass straight into _select_identity_consistent_candidate — no
+    special-casing needed by callers beyond trying this when the primary
+    pass came back empty.
+    """
+    ref_row = _nearest_reference_row(df, frame_idx)
+    if ref_row is None:
+        return []
+    ref_x, ref_y = None, None
+    if pd.notna(ref_row.get("NOSE_x")) and pd.notna(ref_row.get("NOSE_y")):
+        ref_x, ref_y = float(ref_row["NOSE_x"]), float(ref_row["NOSE_y"])
+    else:
+        hip_names = ("LEFT_HIP", "RIGHT_HIP")
+        if all(pd.notna(ref_row.get(f"{n}_x")) and pd.notna(ref_row.get(f"{n}_y")) for n in hip_names):
+            ref_x = (float(ref_row["LEFT_HIP_x"]) + float(ref_row["RIGHT_HIP_x"])) / 2
+            ref_y = (float(ref_row["LEFT_HIP_y"]) + float(ref_row["RIGHT_HIP_y"])) / 2
+    if ref_x is None:
+        return []
+    frames_away = abs(int(frame_idx) - int(ref_row["frame"]))
+    radius_x = min(_ROI_FALLBACK_MAX_RADIUS_X,
+                    _ROI_FALLBACK_BASE_RADIUS + frames_away * _ROI_FALLBACK_GROWTH_PER_FRAME)
+    try:
+        return extract_raw_landmarks_at_frame_roi(
+            video_path, fps, landmark_names, int(frame_idx),
+            (ref_x, ref_y), radius_x, _ROI_FALLBACK_RADIUS_Y,
+        )
+    except Exception as e:
+        monitoring.capture(e)
+        return []
+
+
+def _select_candidate_with_roi_fallback(video_path: str, fps: float, df: pd.DataFrame,
+                                         frame_idx: int, landmark_names: list,
+                                         full_frame_candidates: list):
+    """
+    Tries to validate a candidate from the full-frame pass first; only
+    when that fails — either NO candidates were found at all, OR real
+    candidates were found but NONE of them passed identity validation
+    (the common real case: the full-frame pass confidently finds the
+    static bystander, which correctly gets rejected) — retries with a
+    targeted ROI-crop re-detection before giving up.
+
+    BUG FIX (2026-09-19, found via a real end-to-end pipeline run): the
+    first version of this fallback only tried the ROI crop when
+    full_frame_candidates was completely EMPTY. On the real clip that
+    drove this investigation, the full-frame pass almost always found
+    SOMETHING at the coach's confirmed BFC/FFC/BR frames (typically the
+    stationary bystander) — correctly rejected by identity validation,
+    but that non-empty (just wrong) candidate list meant the ROI
+    fallback never even got tried as a second attempt. Fixed by trying
+    the ROI crop whenever validation of the full-frame result comes back
+    None, not just when there was nothing to validate in the first
+    place.
+
+    Returns the validated candidate dict, or None if nothing from either
+    pass validates.
+    """
+    selected = None
+    if full_frame_candidates:
+        selected = _select_identity_consistent_candidate(df, frame_idx, full_frame_candidates, fps=fps)
+    if selected is None:
+        roi_candidates = _roi_fallback_candidates(video_path, fps, df, frame_idx, landmark_names)
+        if roi_candidates:
+            selected = _select_identity_consistent_candidate(df, frame_idx, roi_candidates, fps=fps)
+    return selected
 
 
 def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
@@ -1296,15 +1433,20 @@ def _refine_release_landmarks_raw(video_path: str, fps: float, bowling_arm: str,
 
     def _row_from_raw(frame_idx):
         candidates = raw.get(int(frame_idx))
-        if not candidates:
+        if not candidates and df is None:
             return None
         if df is not None:
-            frame_data = _select_identity_consistent_candidate(df, int(frame_idx), candidates)
+            # ROI-CROP FALLBACK (2026-09-19) — see
+            # _select_candidate_with_roi_fallback's docstring: tried
+            # whenever the full-frame pass's candidates (if any) don't
+            # validate, not just when there were none at all.
+            frame_data = _select_candidate_with_roi_fallback(
+                video_path, fps, df, int(frame_idx), needed, candidates)
             if frame_data is None:
                 monitoring.capture(Exception(
                     f"_refine_release_landmarks_raw: rejected frame {frame_idx} — no "
-                    f"detected candidate matched the seeded walk's own identity closely "
-                    f"enough to trust."
+                    f"detected candidate (full-frame or ROI-crop) matched the seeded "
+                    f"walk's own identity closely enough to trust."
                 ))
                 return None
         else:
@@ -1376,9 +1518,12 @@ def _refine_stage4_rows_raw(video_path: str, fps: float, df: pd.DataFrame,
         if original_row is None:
             return None
         candidates = raw.get(int(frame_idx))
-        if not candidates:
-            return original_row
-        selected = _select_identity_consistent_candidate(df, int(frame_idx), candidates)
+        # ROI-CROP FALLBACK (2026-09-19) — see
+        # _select_candidate_with_roi_fallback's docstring: tried whenever
+        # the full-frame pass's candidates (if any) don't validate, not
+        # just when there were none at all.
+        selected = _select_candidate_with_roi_fallback(
+            video_path, fps, df, int(frame_idx), needed, candidates)
         if selected is None:
             return original_row
         patched = original_row.copy()
@@ -1438,9 +1583,12 @@ def _refine_bfc_row_raw(video_path: str, fps: float, df: pd.DataFrame,
         return fallback_row
 
     candidates = raw.get(int(bfc_frame))
-    if not candidates:
-        return fallback_row
-    selected = _select_identity_consistent_candidate(df, int(bfc_frame), candidates)
+    # ROI-CROP FALLBACK (2026-09-19) — see
+    # _select_candidate_with_roi_fallback's docstring: tried whenever the
+    # full-frame pass's candidates (if any) don't validate, not just when
+    # there were none at all.
+    selected = _select_candidate_with_roi_fallback(
+        video_path, fps, df, int(bfc_frame), needed, candidates)
     if selected is None:
         return fallback_row
 
@@ -1472,7 +1620,25 @@ def _refine_bfc_row_raw(video_path: str, fps: float, df: pd.DataFrame,
     if fallback_row is not None and not fallback_is_same_frame and not is_complete:
         return fallback_row
 
-    patched = fallback_row.copy() if fallback_row is not None else pd.Series({"frame": bfc_frame}, dtype=object)
+    # BUG FIX (2026-09-19, found via a real end-to-end pipeline run once
+    # the ROI-crop fallback started finding genuinely partial candidates
+    # — a candidate with, say, NOSE+HIP but no KNEE visible in the crop):
+    # building a fresh Series with ONLY "frame" then overlaying `selected`
+    # means any landmark `selected` DIDN'T include is not just NaN, the
+    # COLUMN ITSELF is absent — kinematics.py's bracket access
+    # (row["RIGHT_KNEE_x"]) raises a raw KeyError instead of getting a
+    # gracefully-NaN value, surfacing as a confusing "Data Deficit" tier
+    # instead of the honest "Tracking Drop" a genuinely missing landmark
+    # should produce. Pre-fill every expected column as NaN first so a
+    # partial candidate can only ever leave SOME of them NaN, never
+    # remove the column entirely.
+    if fallback_row is not None:
+        patched = fallback_row.copy()
+    else:
+        patched = pd.Series({"frame": bfc_frame}, dtype=object)
+        for name in needed:
+            patched[f"{name}_x"] = float("nan")
+            patched[f"{name}_y"] = float("nan")
     for name, (x, y, _vis) in selected.items():
         patched[f"{name}_x"] = x
         patched[f"{name}_y"] = y
@@ -1539,16 +1705,33 @@ def _refine_head_stability_window_raw(video_path: str, fps: float, df: pd.DataFr
         monitoring.capture(e)
         return df
 
-    if not raw:
-        return df
+    # NOTE (2026-09-19): no longer early-returns when `raw` is empty — a
+    # window where the full-frame pass found NOTHING for every single
+    # frame is exactly the case the per-frame ROI-crop fallback below
+    # exists to recover from (real, confirmed on this app's actual
+    # reproduction: the coach's exact BFC/FFC/BR frames all came back
+    # empty from the full-frame pass). Bailing out here would skip that
+    # fallback entirely for precisely the frames that need it most.
 
     window = df[(df["frame"] >= start_frame) & (df["frame"] <= end_frame)].copy()
     skipped_frames = []
-    for frame_idx, candidates in raw.items():
+    # Iterate every frame in the window, not just raw.keys() — a frame
+    # where the full-frame pass found ZERO candidates at all is simply
+    # absent from `raw`, but that's exactly the case the ROI-crop
+    # fallback below exists for (2026-09-19). Iterating raw.items() alone
+    # would silently skip trying the fallback on precisely those frames.
+    needed_names = ["NOSE", "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"]
+    for frame_idx in range(int(start_frame), int(end_frame) + 1):
         mask = window["frame"] == frame_idx
         if not mask.any():
             continue
-        selected = _select_identity_consistent_candidate(df, frame_idx, candidates)
+        candidates = raw.get(frame_idx)
+        # ROI-CROP FALLBACK (2026-09-19) — see
+        # _select_candidate_with_roi_fallback's docstring: tried whenever
+        # the full-frame pass's candidates (if any) don't validate, not
+        # just when there were none at all.
+        selected = _select_candidate_with_roi_fallback(
+            video_path, fps, df, frame_idx, needed_names, candidates)
         if selected is None:
             skipped_frames.append(frame_idx)
             continue
@@ -1615,8 +1798,14 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
         monitoring.capture(e)
         return df
 
-    if not raw:
-        return df
+    # NOTE (2026-09-19): no longer early-returns when `raw` is empty — a
+    # window where the full-frame pass found NOTHING for every single
+    # frame is exactly the case the per-frame ROI-crop fallback below
+    # exists to recover from (real, confirmed on this app's actual
+    # reproduction: the coach's exact BFC/FFC/BR frames all came back
+    # empty from the full-frame pass). Bailing out here would skip that
+    # fallback entirely for precisely the frames a coach looks at most
+    # closely (the diagnostic freeze-frames).
 
     # BUG FIX (2026-09-15, real coach-reported failure, root-caused after
     # the coach correctly pushed back that their seed clicks WERE on the
@@ -1657,11 +1846,24 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
     # for.
     patched = df.copy()
     skipped_frames = []
-    for frame_idx, candidates in raw.items():
+    # Iterate every frame in the window, not just raw.keys() — a frame
+    # where the full-frame pass found ZERO candidates at all is simply
+    # absent from `raw`, but that's exactly the case the ROI-crop
+    # fallback below exists for (2026-09-19). Iterating raw.items() alone
+    # would silently skip trying the fallback on precisely those frames
+    # — including the diagnostic freeze-frame moments a coach looks at
+    # most closely.
+    for frame_idx in range(int(start_frame), int(end_frame) + 1):
         mask = patched["frame"] == frame_idx
         if not mask.any():
             continue
-        selected = _select_identity_consistent_candidate(df, frame_idx, candidates)
+        candidates = raw.get(frame_idx)
+        # ROI-CROP FALLBACK (2026-09-19) — see
+        # _select_candidate_with_roi_fallback's docstring: tried whenever
+        # the full-frame pass's candidates (if any) don't validate, not
+        # just when there were none at all.
+        selected = _select_candidate_with_roi_fallback(
+            video_path, fps, df, frame_idx, _SKELETON_LANDMARK_NAMES, candidates)
         if selected is None:
             skipped_frames.append(frame_idx)
             continue

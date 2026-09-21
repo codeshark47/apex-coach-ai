@@ -1053,6 +1053,118 @@ def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: li
     return positions
 
 
+def extract_raw_landmarks_at_frame_roi(video_path: str, fps: float, landmark_names: list,
+                                        frame_idx: int, center_xy_norm: tuple,
+                                        radius_x_norm: float, radius_y_norm: float,
+                                        num_poses: int = 2) -> list:
+    """
+    Detects landmarks within a CROPPED region of ONE frame, centered on
+    center_xy_norm (normalized 0-1 x,y) with the given radii, returning
+    results transformed back to FULL-FRAME normalized coordinates.
+
+    WHY THIS EXISTS (2026-09-19, real coach-reported failure, evaluated
+    against an external-AI suggestion): a full-frame extract_raw_
+    landmarks_window pass can find ZERO candidates at a frame during a
+    fast, motion-blurred delivery even when a person is genuinely there
+    -- confirmed directly on this app's real reproduction clip. Also
+    confirmed directly (NOT a guess): re-running detection on a TIGHT
+    crop around roughly where the subject should be recovers a real,
+    continuously-plausible detection at several of those exact frames
+    where the full-frame pass found nothing -- the crop doesn't
+    "de-blur" the pixels, it changes the scale/context the detector
+    sees (the subject occupies a much larger share of the model's
+    input), which measurably matters for MediaPipe's own confidence
+    scoring independent of blur.
+
+    This is a real re-detection on real pixels, not an estimate — it can
+    return nothing (empty list) exactly like a full-frame pass can, and
+    every candidate it does return still goes through this project's
+    existing identity-consistency validation before being trusted (see
+    orchestrator._select_identity_consistent_candidate) — this function
+    only widens WHERE candidates are searched for, never weakens the
+    check for WHICH one is trusted. Explicitly NOT the same idea as
+    interpolating joint positions across the gap (rejected -- see
+    smooth_without_resurrecting_gaps' docstring for the exact real bug
+    that approach already caused once in this codebase): this recovers
+    genuine detections on real video frames, never guesses a position
+    from before/after the gap.
+
+    center_xy_norm: where to center the crop -- callers should pass the
+    nearest already-confirmed real position (e.g. from the seeded walk's
+    own df), NOT a deeply-interpolated future estimate. A short, cheap
+    extrapolation is fine (a person can't teleport), but this function
+    itself does no prediction — it just crops and re-detects.
+
+    Returns a list of candidate landmark dicts in the same shape as
+    extract_raw_landmarks_window's per-frame value
+    ({landmark_name: (x_norm, y_norm, visibility)}, full-frame
+    normalized), or [] if nothing was found even in the crop.
+    """
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    cap = cv2.VideoCapture(video_path)
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx)))
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame_w <= 0 or frame_h <= 0:
+        return []
+
+    cx, cy = center_xy_norm
+    x0 = max(0, int(round((cx - radius_x_norm) * frame_w)))
+    x1 = min(frame_w, int(round((cx + radius_x_norm) * frame_w)))
+    y0 = max(0, int(round((cy - radius_y_norm) * frame_h)))
+    y1 = min(frame_h, int(round((cy + radius_y_norm) * frame_h)))
+    if x1 <= x0 or y1 <= y0:
+        return []
+    crop = frame[y0:y1, x0:x1]
+    crop_h, crop_w = crop.shape[:2]
+    if crop_h == 0 or crop_w == 0:
+        return []
+
+    model_path = os.path.join("models", "pose_landmarker_heavy.task")
+    landmark_indices = {name: LANDMARK_NAMES.index(name) for name in landmark_names}
+    base_options = python.BaseOptions(model_asset_path=model_path)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        output_segmentation_masks=False,
+        num_poses=num_poses,
+        min_pose_detection_confidence=0.1,
+        min_pose_presence_confidence=0.1,
+    )
+    landmarker = vision.PoseLandmarker.create_from_options(options)
+    try:
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop_rgb))
+        result = landmarker.detect(img)
+    finally:
+        landmarker.close()
+
+    if not result.pose_landmarks:
+        return []
+
+    candidates = []
+    for candidate_landmarks in result.pose_landmarks:
+        frame_landmarks = {}
+        for name, lm_idx in landmark_indices.items():
+            lm = candidate_landmarks[lm_idx]
+            if lm.visibility is not None and lm.visibility < 0.5:
+                continue
+            # Transform crop-relative (0-1 within the crop) back to
+            # full-frame normalized coordinates.
+            full_x = (x0 + lm.x * crop_w) / frame_w
+            full_y = (y0 + lm.y * crop_h) / frame_h
+            frame_landmarks[name] = (full_x, full_y, lm.visibility)
+        if frame_landmarks:
+            candidates.append(frame_landmarks)
+    return candidates
+
+
 if __name__ == "__main__":
     print("=== STARTING KINEMATIC EXTRACTION STATE ===")
     extraction_state = extract_video_landmarks("input/input_video.mp4", "output/landmarks.csv")
