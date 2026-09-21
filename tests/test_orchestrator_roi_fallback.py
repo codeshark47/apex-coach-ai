@@ -132,6 +132,42 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         row11 = result[result["frame"] == 11].iloc[0]
         assert row11["NOSE_x"] == 0.301  # recovered via the ROI fallback
 
+    def test_roi_fallback_tried_when_full_frame_candidate_validates_but_is_incomplete(self):
+        """REGRESSION (2026-09-21, found via a real end-to-end pipeline
+        run): the full-frame pass can find a candidate that genuinely
+        VALIDATES (it's the right person) but is missing some requested
+        landmarks (real footage: nose/hip/shoulder detected across the
+        whole frame, but knee/ankle too small/blurred at that scale) --
+        while the SAME instant's ROI crop (zoomed in, better scale for
+        the detector) finds all of them. A validated-but-partial
+        full-frame hit must not block a more complete ROI reading from
+        ever being tried."""
+        df = _base_df([10, 11, 12])
+        needed = ["NOSE", "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "LEFT_ANKLE"]
+        # Full-frame pass finds the RIGHT person, but only nose+hips --
+        # no knee/ankle. This candidate WOULD validate (close position).
+        raw_full_frame = {11: [{"NOSE": (0.301, 0.521, 0.99),
+                                 "LEFT_HIP": (0.29, 0.60, 0.99), "RIGHT_HIP": (0.31, 0.60, 0.99)}]}
+
+        def _fake_roi(video_path, fps, landmark_names, frame_idx, center_xy_norm, radius_x, radius_y, num_poses=2):
+            if frame_idx == 11:
+                # The ROI crop finds the SAME person, fully -- including
+                # the knee/ankle the full-frame pass missed.
+                return [{"NOSE": (0.302, 0.522, 0.99),
+                         "LEFT_HIP": (0.291, 0.601, 0.99), "RIGHT_HIP": (0.311, 0.601, 0.99),
+                         "LEFT_KNEE": (0.30, 0.75, 0.99), "LEFT_ANKLE": (0.30, 0.90, 0.99)}]
+            return []
+
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw_full_frame), \
+             patch("orchestrator.extract_raw_landmarks_at_frame_roi", side_effect=_fake_roi):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
+
+        row11 = result[result["frame"] == 11].iloc[0]
+        # The MORE COMPLETE (ROI) reading was used, not the partial
+        # full-frame one -- knee/ankle are now present, not NaN.
+        assert row11["LEFT_KNEE_x"] == 0.30
+        assert row11["LEFT_ANKLE_x"] == 0.30
+
     def test_roi_fallback_tried_when_full_frame_pass_found_a_wrong_person(self):
         """REGRESSION (2026-09-19, found via a real end-to-end pipeline
         run): the full-frame pass very often finds SOMETHING at a hard

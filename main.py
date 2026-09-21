@@ -1056,7 +1056,7 @@ def extract_raw_landmarks_window(video_path: str, fps: float, landmark_names: li
 def extract_raw_landmarks_at_frame_roi(video_path: str, fps: float, landmark_names: list,
                                         frame_idx: int, center_xy_norm: tuple,
                                         radius_x_norm: float, radius_y_norm: float,
-                                        num_poses: int = 2) -> list:
+                                        num_poses: int = 3) -> list:
     """
     Detects landmarks within a CROPPED region of ONE frame, centered on
     center_xy_norm (normalized 0-1 x,y) with the given radii, returning
@@ -1094,6 +1094,17 @@ def extract_raw_landmarks_at_frame_roi(video_path: str, fps: float, landmark_nam
     own df), NOT a deeply-interpolated future estimate. A short, cheap
     extrapolation is fine (a person can't teleport), but this function
     itself does no prediction — it just crops and re-detects.
+
+    num_poses defaults to 3, not 1 or 2 (2026-09-21, real measured gap):
+    a real bowler's own hip/shoulder were often findable in the crop but
+    a specific limb (e.g. the lead knee/ankle at front-foot-contact)
+    only showed up as the model's 3rd-ranked candidate, not its 1st or
+    2nd — confirmed directly that num_poses=2 silently missed a MORE
+    complete detection of the SAME person that num_poses=3 found in the
+    exact same crop. Every extra candidate still goes through the same
+    identity + completeness selection in
+    orchestrator._select_candidate_with_roi_fallback, so this only
+    widens what's considered, never what's trusted.
 
     Returns a list of candidate landmark dicts in the same shape as
     extract_raw_landmarks_window's per-frame value

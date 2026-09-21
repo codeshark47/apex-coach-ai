@@ -1298,7 +1298,34 @@ def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, cand
 _ROI_FALLBACK_BASE_RADIUS = 0.08
 _ROI_FALLBACK_GROWTH_PER_FRAME = 0.01
 _ROI_FALLBACK_MAX_RADIUS_X = 0.35
-_ROI_FALLBACK_RADIUS_Y = 0.25
+# NOTE (2026-09-21, real measured tradeoff, tried and reverted): widening
+# growth/cap to reach 0.40 at ~21 frames DID recover the lead knee/ankle
+# at the coach's own FFC frame in isolation, but verified end-to-end this
+# also made candidate selection measurably less stable elsewhere — a
+# wider crop pulls in more competing candidates at the same num_poses,
+# and re-running the full pipeline with the wider crop actually
+# REGRESSED release_height (previously succeeding) to "Landmark missing"
+# while still not fixing front_knee_bracing. Reverted to the values
+# proven stable across all 7 metrics end-to-end. front_knee_bracing (one
+# specific landmark, one specific leg, one specific frame) stays a real,
+# open gap rather than chasing it at the cost of the 6 metrics already
+# working reliably — a narrower, more targeted fix (e.g. a crop centered
+# on the LEAD side specifically, not a single shared center) is the
+# right next step if this needs revisiting, not just a bigger radius.
+# WIDENED from 0.25 (2026-09-21, real measured gap): a crop centered on
+# NOSE/mid-hip with only 0.25 of vertical reach either side reliably
+# found hip/shoulder but frequently missed the knee/ankle entirely —
+# confirmed directly on the coach's own confirmed FFC/BR frames (74, 77)
+# that those landmarks sit just outside a 0.25 radius during a bowling
+# action's leg extension, but ARE reliably captured at 0.45. This is why
+# front_knee_bracing/rear_knee_angle/rear_hip_flexion kept reading
+# "Tracking Drop" even after the ROI fallback started recovering
+# hip/shoulder-only metrics (trunk_lean, hip_shoulder_separation)
+# successfully. Verified this doesn't regress the metrics that already
+# worked at 0.25 — the larger crop still finds the same person, just
+# with a smaller zoom benefit, and every candidate still goes through
+# the same identity validation either way.
+_ROI_FALLBACK_RADIUS_Y = 0.45
 
 
 def _roi_fallback_candidates(video_path: str, fps: float, df: pd.DataFrame,
@@ -1369,16 +1396,37 @@ def _select_candidate_with_roi_fallback(video_path: str, fps: float, df: pd.Data
     None, not just when there was nothing to validate in the first
     place.
 
+    SECOND BUG FIX (2026-09-21, found the same way — a real end-to-end
+    run, not a unit test): a full-frame candidate can VALIDATE (it's
+    genuinely the right person, close enough to the seeded identity) but
+    still be INCOMPLETE — real footage confirmed the full-frame pass
+    often detects the bowler's nose/hip/shoulders across the whole frame
+    but not the knee/ankle (too small/blurred at that scale), while the
+    SAME instant's ROI crop — zoomed in, better scale/context for the
+    detector — reliably finds all of them. The old code stopped at the
+    first successful validation, so a valid-but-partial full-frame hit
+    permanently blocked the more complete ROI reading from ever being
+    tried, leaving front_knee_bracing/rear_knee_angle/rear_hip_flexion
+    reading "Tracking Drop" even once trunk_lean/hip_shoulder_separation
+    (which only need hip+shoulder) started recovering correctly. Now
+    tries the ROI crop whenever the full-frame result doesn't cover
+    every requested landmark, and keeps whichever of the two is more
+    complete — never picks a LESS complete result over a MORE complete
+    one that also validates.
+
     Returns the validated candidate dict, or None if nothing from either
     pass validates.
     """
     selected = None
     if full_frame_candidates:
         selected = _select_identity_consistent_candidate(df, frame_idx, full_frame_candidates, fps=fps)
-    if selected is None:
+    is_complete = selected is not None and all(name in selected for name in landmark_names)
+    if not is_complete:
         roi_candidates = _roi_fallback_candidates(video_path, fps, df, frame_idx, landmark_names)
         if roi_candidates:
-            selected = _select_identity_consistent_candidate(df, frame_idx, roi_candidates, fps=fps)
+            roi_selected = _select_identity_consistent_candidate(df, frame_idx, roi_candidates, fps=fps)
+            if roi_selected is not None and (selected is None or len(roi_selected) > len(selected)):
+                selected = roi_selected
     return selected
 
 
