@@ -1909,6 +1909,12 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
     # for.
     patched = df.copy()
     skipped_frames = []
+    # frame_idx -> {name: (x, y)}, only for frames that passed identity
+    # validation this pass — used for the smoothing step below. Kept
+    # separate from `patched` itself so smoothing can look at a frame's
+    # immediate neighbors without caring whether they've already been
+    # overwritten in `patched`.
+    validated_positions = {}
     # Iterate every frame in the window, not just raw.keys() — a frame
     # where the full-frame pass found ZERO candidates at all is simply
     # absent from `raw`, but that's exactly the case the ROI-crop
@@ -1930,7 +1936,34 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
         if selected is None:
             skipped_frames.append(frame_idx)
             continue
-        for name, (x, y, _vis) in selected.items():
+        validated_positions[frame_idx] = {name: (x, y) for name, (x, y, _vis) in selected.items()}
+
+    # LIGHT TEMPORAL SMOOTHING (2026-09-23, real coach-reported jitter):
+    # every position above was independently re-detected and identity-
+    # validated on its own frame — unlike the rest of this app's
+    # landmark data (Hampel-filtered + 5-frame rolling-mean smoothed),
+    # this window deliberately skips that smoothing (see this function's
+    # own docstring: "sharper-but-wrong is worse than smoother-but-
+    # right") so a wrong-person swap can never hide inside an average.
+    # That correctly prevents identity errors, but it also leaves
+    # ordinary frame-to-frame detection noise on the SAME correctly-
+    # identified person — a few pixels either way — fully visible as
+    # jitter, with nothing smoothing it out. Fix: average each landmark
+    # with its immediate neighbors, but ONLY when the previous AND next
+    # frame ALSO independently passed identity validation. This can
+    # never blend across a skipped (rejected) frame or bridge an
+    # identity gap — it only ever averages frames already individually
+    # confirmed to be the same person.
+    for frame_idx, positions in validated_positions.items():
+        prev_positions = validated_positions.get(frame_idx - 1)
+        next_positions = validated_positions.get(frame_idx + 1)
+        mask = patched["frame"] == frame_idx
+        for name, (x, y) in positions.items():
+            if (prev_positions is not None and name in prev_positions
+                    and next_positions is not None and name in next_positions):
+                px, py = prev_positions[name]
+                nx, ny = next_positions[name]
+                x, y = (px + x + nx) / 3.0, (py + y + ny) / 3.0
             patched.loc[mask, f"{name}_x"] = x
             patched.loc[mask, f"{name}_y"] = y
     if skipped_frames:

@@ -191,6 +191,68 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         row11 = result[result["frame"] == 11].iloc[0]
         assert row11["NOSE_x"] == 0.301  # recovered via ROI fallback despite a wrong full-frame hit
 
+    def test_a_middle_frame_with_both_neighbors_validated_is_averaged(self):
+        """REGRESSION (2026-09-23, real coach-reported jitter): a middle
+        frame flanked by two other independently-validated same-identity
+        frames should be smoothed toward their average, not left as its
+        own raw, independently-noisy detection."""
+        df = _base_df([10, 11, 12])
+        raw_full_frame = {
+            10: [{"NOSE": (0.300, 0.520, 0.99)}],
+            11: [{"NOSE": (0.310, 0.520, 0.99)}],  # a noisy outlier vs. its neighbors
+            12: [{"NOSE": (0.302, 0.520, 0.99)}],
+        }
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw_full_frame), \
+             patch("orchestrator.extract_raw_landmarks_at_frame_roi", return_value=[]):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
+
+        row11 = result[result["frame"] == 11].iloc[0]
+        expected = (0.300 + 0.310 + 0.302) / 3.0
+        assert abs(row11["NOSE_x"] - expected) < 1e-9
+
+    def test_smoothing_never_crosses_a_rejected_frame(self):
+        """A frame right next to a REJECTED (skipped) neighbor must keep
+        its own raw validated value unsmoothed -- averaging across a
+        skipped frame would either fabricate a position for the gap or
+        quietly blend in data from whatever the rejected candidate was,
+        both worse than just showing that one frame's honest reading."""
+        df = _base_df([10, 11, 12])
+        raw_full_frame = {
+            10: [{"NOSE": (0.300, 0.520, 0.99)}],
+            # frame 11: full-frame finds only a bystander, ROI finds nothing -- rejected/skipped
+            11: [{"NOSE": (0.75, 0.55, 0.99)}],
+            12: [{"NOSE": (0.302, 0.520, 0.99)}],
+        }
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw_full_frame), \
+             patch("orchestrator.extract_raw_landmarks_at_frame_roi", return_value=[]):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
+
+        row10 = result[result["frame"] == 10].iloc[0]
+        row12 = result[result["frame"] == 12].iloc[0]
+        # Both kept their own raw value -- frame 11 (rejected) never
+        # contributed to either neighbor's position.
+        assert row10["NOSE_x"] == 0.300
+        assert row12["NOSE_x"] == 0.302
+
+    def test_a_boundary_frame_with_only_one_validated_neighbor_is_not_smoothed(self):
+        """The first/last frame of a window (or a frame next to a gap)
+        only ever has one validated neighbor, not two -- it must keep
+        its own raw value rather than averaging with just one side,
+        which would just be a different, still-arbitrary noisy result."""
+        df = _base_df([10, 11])
+        raw_full_frame = {
+            10: [{"NOSE": (0.300, 0.520, 0.99)}],
+            11: [{"NOSE": (0.310, 0.520, 0.99)}],
+        }
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw_full_frame), \
+             patch("orchestrator.extract_raw_landmarks_at_frame_roi", return_value=[]):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 11)
+
+        row10 = result[result["frame"] == 10].iloc[0]
+        row11 = result[result["frame"] == 11].iloc[0]
+        assert row10["NOSE_x"] == 0.300
+        assert row11["NOSE_x"] == 0.310
+
     def test_a_wrong_person_found_via_roi_is_still_rejected(self):
         """The ROI fallback finding SOMETHING doesn't bypass identity
         validation -- a bystander found via the crop must still be
