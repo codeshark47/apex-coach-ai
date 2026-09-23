@@ -24,9 +24,63 @@ candidate.
 
 from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
 
 import orchestrator as o
+
+
+def _solid_frame(height=200, width=200, color=(255, 0, 0)):
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:, :] = color
+    return frame
+
+
+def _two_tone_frame(height=200, width=200, left_color=(255, 0, 0), right_color=(0, 255, 0)):
+    """Left half one solid color, right half another -- lets a test place
+    two candidates' clothing-crop regions in genuinely different-looking
+    parts of the same frame without needing a real photo."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:, :width // 2] = left_color
+    frame[:, width // 2:] = right_color
+    return frame
+
+
+def _candidate_at(cx, cy, half=0.06):
+    """A candidate dict with all 4 appearance-bbox landmarks clustered
+    tightly around (cx, cy) -- small enough that the whole crop lands on
+    one side of a two-tone frame."""
+    return {
+        "LEFT_SHOULDER": (cx - half, cy - half, 0.99),
+        "RIGHT_SHOULDER": (cx + half, cy - half, 0.99),
+        "LEFT_HIP": (cx - half, cy + half, 0.99),
+        "RIGHT_HIP": (cx + half, cy + half, 0.99),
+    }
+
+
+class TestAppearanceHistogramFromCandidate:
+    def test_returns_none_when_a_needed_landmark_is_missing(self):
+        candidate = {"LEFT_SHOULDER": (0.3, 0.3, 0.9), "RIGHT_SHOULDER": (0.4, 0.3, 0.9)}
+        result = o._appearance_histogram_from_candidate(_solid_frame(), candidate)
+        assert result is None
+
+    def test_returns_none_when_frame_is_none(self):
+        candidate = _candidate_at(0.3, 0.3)
+        assert o._appearance_histogram_from_candidate(None, candidate) is None
+
+    def test_same_color_regions_score_highly_similar(self):
+        frame = _solid_frame(color=(180, 90, 40))
+        hist_a = o._appearance_histogram_from_candidate(frame, _candidate_at(0.25, 0.3))
+        hist_b = o._appearance_histogram_from_candidate(frame, _candidate_at(0.28, 0.32))
+        sim = o._appearance_hist_similarity(hist_a, hist_b)
+        assert sim > 0.9
+
+    def test_different_color_regions_score_dissimilar(self):
+        frame = _two_tone_frame()
+        hist_left = o._appearance_histogram_from_candidate(frame, _candidate_at(0.15, 0.5))
+        hist_right = o._appearance_histogram_from_candidate(frame, _candidate_at(0.85, 0.5))
+        sim = o._appearance_hist_similarity(hist_left, hist_right)
+        assert sim < o.APPEARANCE_SIMILARITY_MIN
 
 
 def _base_df(frames):
@@ -39,6 +93,70 @@ def _base_df(frames):
             "LEFT_HIP_y": 0.60, "RIGHT_HIP_y": 0.60,
         })
     return pd.DataFrame(rows)
+
+
+class TestSelectIdentityConsistentCandidateAppearanceCheck:
+    """REGRESSION (2026-09-23, real coach-reported failure, confirmed
+    with real measured data on the actual failing clip/frame): position
+    alone let a bystander standing close to the reference through --
+    measured directly, the real bystander candidate at the coach's Front
+    Foot Contact frame scored 0.0496 appearance similarity to the real
+    bowler's own reference crop, yet still passed the position check
+    (only 5 frames from the nearest reference, well inside the growing
+    tolerance). These tests use a synthetic two-tone frame in place of
+    real footage, same idea, controlled and reproducible."""
+
+    def _df_with_reference(self, frame, cx, cy):
+        """A real seeded-walk row provides both NOSE (position reference)
+        and the 4 appearance-bbox landmarks (appearance reference)."""
+        row = {"frame": frame, "NOSE_x": cx, "NOSE_y": cy - 0.1}
+        for name, (x, y, _vis) in _candidate_at(cx, cy).items():
+            row[f"{name}_x"] = x
+            row[f"{name}_y"] = y
+        return pd.DataFrame([row])
+
+    def test_a_position_valid_but_wrong_looking_candidate_is_rejected_when_video_path_given(self):
+        df = self._df_with_reference(frame=50, cx=0.15, cy=0.5)  # reference on the LEFT (color A)
+        frame = _two_tone_frame()
+        # Build a candidate whose NOSE is close in position (passes the
+        # distance check) but whose shoulder/hip crop sits on the RIGHT
+        # (different-colored) half -- mirrors the real bug: a bystander
+        # near the reference position, dressed differently.
+        wrong_looking = _candidate_at(0.15, 0.5)
+        wrong_looking["NOSE"] = (0.16, 0.4, 0.99)
+        # Shift the appearance-bbox points only, keeping NOSE close, so
+        # this candidate's crop actually lands on the RIGHT half.
+        for k in ("LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"):
+            x, y, vis = wrong_looking[k]
+            wrong_looking[k] = (x + 0.65, y, vis)  # now visually on the right (color B) half
+
+        with patch("diagnostic_frames._read_frame_bgr", return_value=frame):
+            selected = o._select_identity_consistent_candidate(
+                df, 55, [wrong_looking], fps=30.0, video_path="fake.mp4")
+        assert selected is None  # position was close enough, appearance was not
+
+    def test_a_position_and_appearance_consistent_candidate_is_accepted(self):
+        df = self._df_with_reference(frame=50, cx=0.15, cy=0.5)
+        frame = _two_tone_frame()
+        genuine = _candidate_at(0.16, 0.5)
+        genuine["NOSE"] = (0.16, 0.4, 0.99)
+        with patch("diagnostic_frames._read_frame_bgr", return_value=frame):
+            selected = o._select_identity_consistent_candidate(
+                df, 55, [genuine], fps=30.0, video_path="fake.mp4")
+        assert selected is not None
+
+    def test_no_video_path_keeps_old_position_only_behavior(self):
+        """Every existing caller that doesn't pass video_path must be
+        completely unaffected -- a wrong-looking-but-close candidate is
+        still accepted on position alone, exactly as before this fix."""
+        df = self._df_with_reference(frame=50, cx=0.15, cy=0.5)
+        wrong_looking = _candidate_at(0.15, 0.5)
+        wrong_looking["NOSE"] = (0.16, 0.4, 0.99)
+        for k in ("LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP"):
+            x, y, vis = wrong_looking[k]
+            wrong_looking[k] = (x + 0.65, y, vis)
+        selected = o._select_identity_consistent_candidate(df, 55, [wrong_looking], fps=30.0)
+        assert selected is not None  # no video_path -- position-only, unchanged
 
 
 class TestRoiFallbackCandidates:

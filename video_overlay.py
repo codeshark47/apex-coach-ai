@@ -708,14 +708,27 @@ def render_annotated_video(video_path: str, output_path: str,
     # CAMERA-ANGLE MODULE: which metric is the hero (live chart + badge +
     # bone highlight) — see the docstring above for why this is a 2-way
     # split, and why each side gets the metric it can actually measure.
+    # LABEL FIX (2026-09-23, real coach-reported confusion): this chart
+    # plots hero_arr's value at EVERY frame (interpolated), scrubbing
+    # live as the video plays — a genuinely different reading from the
+    # same-named metric in the report/PDF/diagnostic freeze-frames,
+    # which is locked to one specific event frame (e.g. Front Foot
+    # Contact). Both numbers are individually correct for what they
+    # measure, but showing them under the identical, unqualified label
+    # with no visual distinction reads as the app disagreeing with
+    # itself. "(LIVE)" here, on both the chart title and (implicitly)
+    # the scrubbing value drawn from it, is the fix — the badge at
+    # BFC/FFC/BR (hero_badge_label, drawn separately, already reads the
+    # value AT that locked event frame) is deliberately left unlabeled,
+    # since IT already matches the report.
     if camera_angle == "front_or_rear":
         hero_key, hero_arr, hero_label, hero_badge_label = (
             "hip_shoulder_separation", hip_shoulder_arr,
-            "HIP-SHOULDER SEPARATION", "HIP-SHOULDER",
+            "HIP-SHOULDER SEPARATION (LIVE, this frame)", "HIP-SHOULDER",
         )
     else:
         hero_key, hero_arr, hero_label, hero_badge_label = (
-            "front_knee_bracing", knee_arr, "LEAD KNEE ANGLE", "KNEE",
+            "front_knee_bracing", knee_arr, "LEAD KNEE ANGLE (LIVE, this frame)", "KNEE",
         )
 
     # --- RELEASE HEIGHT % at BR ---

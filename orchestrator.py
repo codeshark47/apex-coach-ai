@@ -1210,8 +1210,96 @@ def _nearest_reference_row(df: pd.DataFrame, frame_idx: int, max_frame_search: i
     return None
 
 
+# APPEARANCE VERIFICATION (2026-09-23, real coach-reported failure,
+# confirmed with real measured data): _select_identity_consistent_
+# candidate below has always accepted a candidate on POSITION alone —
+# how close it is to a trusted reference. main._walk_from_seed (the
+# original seeded walk) has always used position AND a clothing-color
+# appearance histogram together, precisely because position alone can't
+# tell a bowler apart from someone standing close by. This raw-
+# re-extraction family never inherited that second check. Measured
+# directly on the exact real clip/frame that produced this bug (Front
+# Foot Contact, a 5-frame gap from the nearest reference): the single
+# full-frame candidate there was a bystander at 0.0496 appearance
+# similarity to the true bowler's own reference crop — a real, wrong
+# candidate that STILL passed the position check, because 5 frames'
+# worth of growing tolerance was wide enough to reach him. The ROI-crop
+# fallback, centered on the same reference, found the real bowler
+# (appearance similarity 0.32 against a deliberately approximate test
+# reference — production's real reference crop should score higher).
+# This mirrors main._compute_appearance_histogram exactly (shoulders +
+# hips only, no margin, shrunk to the central 70% — see that function's
+# own docstring for why: the nose pulls in skin tone, a full box pulls
+# in background, both dilute the signal) so it inherits the SAME
+# already-tuned, already-measured separation instead of a fresh guess.
+_APPEARANCE_BBOX_NAMES = ("LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_HIP", "RIGHT_HIP")
+# Matches _seed_appearance_majority_ok's own "0.25 absolute gap"
+# reasoning in main.py — real measured cross-person similarity on this
+# app's footage runs 0.005-0.25, real same-person similarity 0.32-0.96
+# (both ranges independently measured on real clips, not guessed).
+APPEARANCE_SIMILARITY_MIN = 0.25
+
+
+def _appearance_histogram_from_candidate(frame_bgr, candidate: dict):
+    """
+    HSV clothing-histogram fingerprint for a candidate in this module's
+    {name: (x, y, visibility)} shape, reusing the exact crop geometry
+    main._compute_appearance_histogram already proved on real footage.
+    Returns None (never fabricates a fingerprint) if the frame couldn't
+    be read or the candidate is missing any of the 4 needed points —
+    e.g. a partial ROI detection that only found a knee/ankle. Callers
+    must treat None as "appearance can't be checked here," not as a
+    mismatch.
+    """
+    if frame_bgr is None or any(n not in candidate for n in _APPEARANCE_BBOX_NAMES):
+        return None
+    height, width = frame_bgr.shape[:2]
+    xs = [candidate[n][0] for n in _APPEARANCE_BBOX_NAMES]
+    ys = [candidate[n][1] for n in _APPEARANCE_BBOX_NAMES]
+    min_x, max_x = max(0.0, min(xs)), min(1.0, max(xs))
+    min_y, max_y = max(0.0, min(ys)), min(1.0, max(ys))
+    # Shrink to the central 70% (shrink=0.3) — same proven parameter as
+    # main._bbox_from_landmarks, no margin (a wide margin/full rectangle
+    # around 4 sparse points pulls in background a real silhouette
+    # never has).
+    cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
+    half_w = (max_x - min_x) / 2 * 0.7
+    half_h = (max_y - min_y) / 2 * 0.7
+    x1 = int((cx - half_w) * width)
+    y1 = int((cy - half_h) * height)
+    x2 = int((cx + half_w) * width)
+    y2 = int((cy + half_h) * height)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    return hist
+
+
+def _appearance_hist_similarity(hist_a, hist_b) -> float:
+    if hist_a is None or hist_b is None:
+        return 0.0
+    return float(cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL))
+
+
+def _read_frame_bgr_cached(video_path: str, frame_idx: int, cache: dict):
+    """Tiny per-call cache so a window processing many frames doesn't
+    re-open/re-seek the video file for the SAME reference frame over
+    and over — a long gap's every frame shares the same nearest
+    reference until a new one is confirmed."""
+    if frame_idx not in cache:
+        from diagnostic_frames import _read_frame_bgr
+        cache[frame_idx] = _read_frame_bgr(video_path, frame_idx)
+    return cache[frame_idx]
+
+
 def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, candidates: list,
-                                           fps: float = 30.0):
+                                           fps: float = 30.0, video_path: str = None,
+                                           _frame_cache: dict = None):
     """
     Among EVERY candidate MediaPipe detected at this frame (extract_raw_
     landmarks_window now returns all of them — see that function's
@@ -1259,6 +1347,20 @@ def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, cand
     own docstring for why a fixed tolerance isn't enough on its own).
     Defaults to a reasonable assumption for any caller not passing it —
     every real call site in this file does.
+
+    video_path (2026-09-23, see APPEARANCE_SIMILARITY_MIN's own comment
+    above for the real bug and real measured numbers this closes):
+    optional. When given, a candidate that passes the position check
+    above must ALSO clear an appearance-similarity floor against the
+    reference frame's own clothing-color histogram — position alone
+    measurably let a bystander standing close to the reference through
+    on real footage. When omitted (every existing direct/test caller
+    that doesn't pass it), behavior is UNCHANGED — position-only, exactly
+    as before — so this is purely additive, never a stricter default for
+    code that hasn't opted in. Degrades gracefully to position-only even
+    when video_path IS given, if either side's frame can't be read or is
+    missing a needed landmark (partial detections still get a fair shot
+    on position alone, same as always).
     """
     ref_row = _nearest_reference_row(df, frame_idx)
     if ref_row is None:
@@ -1268,14 +1370,34 @@ def _select_identity_consistent_candidate(df: pd.DataFrame, frame_idx: int, cand
         IDENTITY_CONSISTENCY_MAX_DIST_CAP,
         IDENTITY_CONSISTENCY_MAX_DIST + (IDENTITY_CONSISTENCY_GROWTH_PER_SECOND / fps) * frames_away,
     )
+
+    ref_hist = None
+    if video_path:
+        frame_cache = _frame_cache if _frame_cache is not None else {}
+        ref_frame_bgr = _read_frame_bgr_cached(video_path, int(ref_row["frame"]), frame_cache)
+        ref_candidate = {
+            name: (ref_row.get(f"{name}_x"), ref_row.get(f"{name}_y"), None)
+            for name in _APPEARANCE_BBOX_NAMES
+        }
+        if all(pd.notna(v[0]) and pd.notna(v[1]) for v in ref_candidate.values()):
+            ref_hist = _appearance_histogram_from_candidate(ref_frame_bgr, ref_candidate)
+
     best_candidate, best_dist = None, None
     for candidate in candidates:
         raw_pt, existing_pt = _raw_reference_point(ref_row, candidate)
         if raw_pt is None or existing_pt is None:
             continue
         dist = ((raw_pt[0] - existing_pt[0]) ** 2 + (raw_pt[1] - existing_pt[1]) ** 2) ** 0.5
-        if dist <= effective_max_dist and (best_dist is None or dist < best_dist):
-            best_candidate, best_dist = candidate, dist
+        if dist > effective_max_dist or (best_dist is not None and dist >= best_dist):
+            continue
+        if ref_hist is not None and video_path:
+            cur_frame_bgr = _read_frame_bgr_cached(video_path, int(frame_idx), frame_cache)
+            cand_hist = _appearance_histogram_from_candidate(cur_frame_bgr, candidate)
+            if cand_hist is not None:
+                sim = _appearance_hist_similarity(cand_hist, ref_hist)
+                if sim < APPEARANCE_SIMILARITY_MIN:
+                    continue
+        best_candidate, best_dist = candidate, dist
     return best_candidate
 
 
@@ -1417,14 +1539,21 @@ def _select_candidate_with_roi_fallback(video_path: str, fps: float, df: pd.Data
     Returns the validated candidate dict, or None if nothing from either
     pass validates.
     """
+    # Shared across both attempts below (2026-09-23, appearance check
+    # added to _select_identity_consistent_candidate) so re-validating
+    # the same reference/current frame's pixels for the ROI attempt
+    # doesn't re-open and re-seek the video a second time.
+    _frame_cache = {}
     selected = None
     if full_frame_candidates:
-        selected = _select_identity_consistent_candidate(df, frame_idx, full_frame_candidates, fps=fps)
+        selected = _select_identity_consistent_candidate(
+            df, frame_idx, full_frame_candidates, fps=fps, video_path=video_path, _frame_cache=_frame_cache)
     is_complete = selected is not None and all(name in selected for name in landmark_names)
     if not is_complete:
         roi_candidates = _roi_fallback_candidates(video_path, fps, df, frame_idx, landmark_names)
         if roi_candidates:
-            roi_selected = _select_identity_consistent_candidate(df, frame_idx, roi_candidates, fps=fps)
+            roi_selected = _select_identity_consistent_candidate(
+                df, frame_idx, roi_candidates, fps=fps, video_path=video_path, _frame_cache=_frame_cache)
             if roi_selected is not None and (selected is None or len(roi_selected) > len(selected)):
                 selected = roi_selected
     return selected
