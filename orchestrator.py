@@ -1915,6 +1915,33 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
     # immediate neighbors without caring whether they've already been
     # overwritten in `patched`.
     validated_positions = {}
+    # BLANK THE WHOLE WINDOW UPFRONT (2026-09-23, real coach-reported
+    # regression, second structural cause found investigating it): this
+    # window's own reference for validating frame_idx is `patched` (see
+    # below), which starts as a copy of `df` — but _nearest_reference_row
+    # searches BOTH directions and has no concept of "already processed
+    # this pass," so at the moment frame_idx is first evaluated, its OWN
+    # row (distance 0, still carrying whatever `df` originally had) and
+    # every LATER not-yet-processed frame in this window are just as
+    # eligible a "reference" as an earlier, already-validated one. A
+    # not-yet-vetted frame trivially agreeing with a raw candidate drawn
+    # from that exact same unverified value isn't validation at all —
+    # confirmed directly: a candidate identical to the original df's own
+    # (wrong) value at that same frame "validated" against itself every
+    # time. Blanking every frame in [start_frame, end_frame] before the
+    # loop starts means the only rows _nearest_reference_row can find are
+    # (a) frames OUTSIDE this window, untouched and presumably already
+    # trustworthy (e.g. the run-up before this window begins), or (b)
+    # frames INSIDE it that THIS loop has already actually validated —
+    # never frame_idx's own unprocessed value or a later frame it hasn't
+    # reached yet.
+    for _blank_frame in range(int(start_frame), int(end_frame) + 1):
+        _blank_mask = patched["frame"] == _blank_frame
+        if not _blank_mask.any():
+            continue
+        for name in _SKELETON_LANDMARK_NAMES:
+            patched.loc[_blank_mask, f"{name}_x"] = float("nan")
+            patched.loc[_blank_mask, f"{name}_y"] = float("nan")
     # Iterate every frame in the window, not just raw.keys() — a frame
     # where the full-frame pass found ZERO candidates at all is simply
     # absent from `raw`, but that's exactly the case the ROI-crop
@@ -1931,12 +1958,31 @@ def _refine_skeleton_window_raw(video_path: str, fps: float, df: pd.DataFrame,
         # _select_candidate_with_roi_fallback's docstring: tried whenever
         # the full-frame pass's candidates (if any) don't validate, not
         # just when there were none at all.
+        #
+        # Reference is `patched` (this window's own progressively-built
+        # result, blanked upfront — see above), NOT the original `df`
+        # (2026-09-23, real coach-reported regression this closes
+        # together with this window's own extension above): once this
+        # window covers deep into the follow-through, the ORIGINAL df's
+        # value at a not-yet-processed frame may itself already be a
+        # wrong-person lock — validating against it would just confirm
+        # the same error again. Anchoring on `patched` instead means
+        # every frame's identity check is grounded only in a position
+        # THIS function has already validated (or a frame outside this
+        # window entirely), so a trusted anchor propagates forward and a
+        # rejected — or simply not-yet-reached — frame can never poison
+        # another one's reference.
         selected = _select_candidate_with_roi_fallback(
-            video_path, fps, df, frame_idx, _SKELETON_LANDMARK_NAMES, candidates)
+            video_path, fps, patched, frame_idx, _SKELETON_LANDMARK_NAMES, candidates)
         if selected is None:
             skipped_frames.append(frame_idx)
+            # Already blanked above — stays honestly NaN rather than
+            # reviving the original (possibly wrong) df value.
             continue
         validated_positions[frame_idx] = {name: (x, y) for name, (x, y, _vis) in selected.items()}
+        for name, (x, y) in validated_positions[frame_idx].items():
+            patched.loc[mask, f"{name}_x"] = x
+            patched.loc[mask, f"{name}_y"] = y
 
     # LIGHT TEMPORAL SMOOTHING (2026-09-23, real coach-reported jitter):
     # every position above was independently re-detected and identity-
@@ -3055,7 +3101,23 @@ def run_complete_bowling_analysis(video_path: str,
         _br_frame_for_video = int(events["BR"])
         _swing_start = events.get("FFC")
         _swing_start = int(_swing_start) if _swing_start is not None else max(0, _br_frame_for_video - int(round(fps * 0.3)))
-        _swing_end = min(int(df["frame"].max()), _br_frame_for_video + int(round(fps * 0.3)))
+        # EXTENDED (2026-09-23, real coach-reported regression): used to
+        # stop at BR + ~0.3s -- a real coach's freshly-uploaded clip
+        # showed the annotated video's skeleton correctly on the bowler
+        # right through release, then confidently lock onto a STANDING,
+        # STATIONARY bystander for the entire rest of the follow-through
+        # (60+ consecutive frames, visually confirmed by extracting and
+        # inspecting the actual rendered video frame-by-frame) -- because
+        # every frame past that short buffer fell back to the plain
+        # seeded-walk df with none of this function's identity
+        # validation applied at all. Now covers every remaining frame in
+        # the clip, so the same per-frame identity check already proven
+        # correct through BR (a rejected frame is skipped, never drawn
+        # wrong -- see this function's own docstring) protects the whole
+        # visible follow-through instead of stopping right where a
+        # bowler's fast final movement makes a real detection gap (and a
+        # nearby, unmoving bystander) most likely.
+        _swing_end = int(df["frame"].max())
         if _swing_start < _swing_end:
             _skeleton_df = _refine_skeleton_window_raw(video_path, fps, df, _swing_start, _swing_end)
     except Exception as e:

@@ -111,14 +111,27 @@ class TestRoiFallbackCandidates:
 class TestRoiFallbackWiredIntoSkeletonRefinement:
     """Confirms the fallback is actually TRIED when the full-frame pass
     finds nothing at a frame -- not just that the helper function itself
-    works in isolation."""
+    works in isolation.
+
+    Every df here includes frame 9, one frame BEFORE the window passed
+    to _refine_skeleton_window_raw (always start_frame=10) -- this
+    matters since 2026-09-23 (see the "blank the whole window upfront"
+    fix): the window's own frames are blanked before processing begins,
+    so frame 9 is what lets frame 10 (the window's own first frame)
+    bootstrap off a real, already-trustworthy reference, exactly like
+    real run-up footage sitting just before FFC in an actual clip."""
 
     def test_a_frame_absent_from_the_full_frame_pass_still_gets_patched_via_roi(self):
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         # Full-frame pass finds NOTHING at frame 11 (absent from the dict
         # entirely -- not an empty list, genuinely missing, matching a
-        # real zero-candidate frame).
-        raw_full_frame = {}
+        # real zero-candidate frame). Frames 10/12 get a genuine
+        # same-position candidate so they validate and can anchor frame
+        # 11's own check.
+        raw_full_frame = {
+            10: [{"NOSE": (0.300, 0.520, 0.99)}],
+            12: [{"NOSE": (0.300, 0.520, 0.99)}],
+        }
 
         def _fake_roi(video_path, fps, landmark_names, frame_idx, center_xy_norm, radius_x, radius_y, num_poses=2):
             if frame_idx == 11:
@@ -130,7 +143,10 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
             result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
 
         row11 = result[result["frame"] == 11].iloc[0]
-        assert row11["NOSE_x"] == 0.301  # recovered via the ROI fallback
+        # Recovered via the ROI fallback -- averaged with its now-also-
+        # validated neighbors by the smoothing step (see that step's own
+        # tests), not left as the raw, unsmoothed 0.301.
+        assert abs(row11["NOSE_x"] - (0.300 + 0.301 + 0.300) / 3.0) < 1e-9
 
     def test_roi_fallback_tried_when_full_frame_candidate_validates_but_is_incomplete(self):
         """REGRESSION (2026-09-21, found via a real end-to-end pipeline
@@ -142,12 +158,16 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         the detector) finds all of them. A validated-but-partial
         full-frame hit must not block a more complete ROI reading from
         ever being tried."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         needed = ["NOSE", "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "LEFT_ANKLE"]
         # Full-frame pass finds the RIGHT person, but only nose+hips --
         # no knee/ankle. This candidate WOULD validate (close position).
-        raw_full_frame = {11: [{"NOSE": (0.301, 0.521, 0.99),
-                                 "LEFT_HIP": (0.29, 0.60, 0.99), "RIGHT_HIP": (0.31, 0.60, 0.99)}]}
+        raw_full_frame = {
+            10: [{"NOSE": (0.300, 0.520, 0.99)}],
+            11: [{"NOSE": (0.301, 0.521, 0.99),
+                  "LEFT_HIP": (0.29, 0.60, 0.99), "RIGHT_HIP": (0.31, 0.60, 0.99)}],
+            12: [{"NOSE": (0.300, 0.520, 0.99)}],
+        }
 
         def _fake_roi(video_path, fps, landmark_names, frame_idx, center_xy_norm, radius_x, radius_y, num_poses=2):
             if frame_idx == 11:
@@ -175,9 +195,13 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         not nothing at all. That non-empty (just wrong) candidate list
         must not prevent the ROI-crop fallback from being tried as a
         second attempt once the wrong candidate is rejected."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         # Full-frame pass DOES find something at frame 11 -- the bystander.
-        raw_full_frame = {11: [{"NOSE": (0.75, 0.55, 0.99)}]}
+        raw_full_frame = {
+            10: [{"NOSE": (0.300, 0.520, 0.99)}],
+            11: [{"NOSE": (0.75, 0.55, 0.99)}],
+            12: [{"NOSE": (0.300, 0.520, 0.99)}],
+        }
 
         def _fake_roi(video_path, fps, landmark_names, frame_idx, center_xy_norm, radius_x, radius_y, num_poses=2):
             if frame_idx == 11:
@@ -189,14 +213,17 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
             result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
 
         row11 = result[result["frame"] == 11].iloc[0]
-        assert row11["NOSE_x"] == 0.301  # recovered via ROI fallback despite a wrong full-frame hit
+        # Recovered via ROI fallback despite a wrong full-frame hit --
+        # averaged with its now-also-validated neighbors by the smoothing
+        # step, not left as the raw, unsmoothed 0.301.
+        assert abs(row11["NOSE_x"] - (0.300 + 0.301 + 0.300) / 3.0) < 1e-9
 
     def test_a_middle_frame_with_both_neighbors_validated_is_averaged(self):
         """REGRESSION (2026-09-23, real coach-reported jitter): a middle
         frame flanked by two other independently-validated same-identity
         frames should be smoothed toward their average, not left as its
         own raw, independently-noisy detection."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         raw_full_frame = {
             10: [{"NOSE": (0.300, 0.520, 0.99)}],
             11: [{"NOSE": (0.310, 0.520, 0.99)}],  # a noisy outlier vs. its neighbors
@@ -216,7 +243,7 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         skipped frame would either fabricate a position for the gap or
         quietly blend in data from whatever the rejected candidate was,
         both worse than just showing that one frame's honest reading."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         raw_full_frame = {
             10: [{"NOSE": (0.300, 0.520, 0.99)}],
             # frame 11: full-frame finds only a bystander, ROI finds nothing -- rejected/skipped
@@ -239,7 +266,7 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         only ever has one validated neighbor, not two -- it must keep
         its own raw value rather than averaging with just one side,
         which would just be a different, still-arbitrary noisy result."""
-        df = _base_df([10, 11])
+        df = _base_df([9, 10, 11])
         raw_full_frame = {
             10: [{"NOSE": (0.300, 0.520, 0.99)}],
             11: [{"NOSE": (0.310, 0.520, 0.99)}],
@@ -253,12 +280,87 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
         assert row10["NOSE_x"] == 0.300
         assert row11["NOSE_x"] == 0.310
 
+    def test_validation_uses_this_windows_own_progress_not_a_stale_original_df(self):
+        """REGRESSION (2026-09-23, real coach-reported failure): the
+        annotated video correctly showed the bowler through Ball Release,
+        then confidently locked onto a standing, stationary bystander for
+        the rest of the follow-through -- visually confirmed by extracting
+        the real rendered video frame-by-frame. Root cause: this window
+        used to end shortly after BR, so everything past that had NO
+        identity validation applied at all. Extending the window (see its
+        call site) only helps if each frame's check is grounded in
+        something trustworthy -- if it still validated against the
+        ORIGINAL (pre-refinement) df, a frame the original seeded walk had
+        ALREADY gotten wrong would just confirm itself as its own "proof"
+        it's correct. This test builds exactly that trap: the original df
+        is already sitting on the bystander at frame 11, and frame 12's
+        candidate is a near-bystander position that would pass if
+        validated against that stale, wrong value -- it must instead be
+        judged against frame 10's real, correct position and rejected."""
+        df = pd.DataFrame([
+            # One frame BEFORE the window (start_frame=10 below) -- real,
+            # untouched, pre-window context (e.g. run-up footage), needed
+            # so frame 10 itself (blanked upfront along with the rest of
+            # the window -- see _refine_skeleton_window_raw's own
+            # docstring on that) has something real to bootstrap from.
+            {"frame": 9, "NOSE_x": 0.30, "NOSE_y": 0.52,
+             "LEFT_HIP_x": 0.29, "RIGHT_HIP_x": 0.31, "LEFT_HIP_y": 0.60, "RIGHT_HIP_y": 0.60},
+            {"frame": 10, "NOSE_x": 0.30, "NOSE_y": 0.52,
+             "LEFT_HIP_x": 0.29, "RIGHT_HIP_x": 0.31, "LEFT_HIP_y": 0.60, "RIGHT_HIP_y": 0.60},
+            # The seeded walk has ALREADY drifted onto the bystander here,
+            # before this function ever runs -- exactly what a real
+            # upstream tracking failure looks like.
+            {"frame": 11, "NOSE_x": 0.75, "NOSE_y": 0.55,
+             "LEFT_HIP_x": 0.74, "RIGHT_HIP_x": 0.76, "LEFT_HIP_y": 0.63, "RIGHT_HIP_y": 0.63},
+            {"frame": 12, "NOSE_x": 0.751, "NOSE_y": 0.55,
+             "LEFT_HIP_x": 0.74, "RIGHT_HIP_x": 0.76, "LEFT_HIP_y": 0.63, "RIGHT_HIP_y": 0.63},
+        ])
+        raw_full_frame = {
+            # A genuine, correctly-validating candidate at frame 10's own
+            # already-known position -- this becomes the trusted anchor
+            # frame 12 must be judged against.
+            10: [{"NOSE": (0.30, 0.52, 0.99)}],
+            # No genuine detection of the real bowler at 11 -- correctly rejected/blanked.
+            11: [{"NOSE": (0.75, 0.55, 0.99)}],
+            # A near-bystander detection at 12 -- close to the STALE
+            # original df value, far from frame 10's real position.
+            12: [{"NOSE": (0.751, 0.551, 0.99)}],
+        }
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw_full_frame), \
+             patch("orchestrator.extract_raw_landmarks_at_frame_roi", return_value=[]):
+            result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
+
+        row11 = result[result["frame"] == 11].iloc[0]
+        row12 = result[result["frame"] == 12].iloc[0]
+        assert pd.isna(row11["NOSE_x"])  # rejected, blanked -- never a trusted reference
+        assert pd.isna(row12["NOSE_x"])  # must ALSO be rejected against frame 10's real position
+
     def test_a_wrong_person_found_via_roi_is_still_rejected(self):
         """The ROI fallback finding SOMETHING doesn't bypass identity
         validation -- a bystander found via the crop must still be
-        rejected exactly like a bystander found via the full-frame pass."""
-        df = _base_df([10, 11, 12])
-        raw_full_frame = {}
+        rejected exactly like a bystander found via the full-frame pass.
+
+        BEHAVIOR CHANGE (2026-09-23, real coach-reported regression): a
+        rejected frame used to keep the ORIGINAL df's value unchanged --
+        safe when this window only covered a short BR+0.3s buffer, since
+        the original value there was proven correct. Now that this
+        window can extend across the whole rest of a clip (see this
+        window's own extension at its call site), the original df's
+        value at a frame this function hasn't reached yet can ALREADY be
+        a wrong-person lock -- keeping it would let it survive as a
+        false "trusted" reference for the next frame's own check, and
+        would still render with full confidence. A rejected frame must
+        now come back as NaN -- honestly blank, never confidently
+        wrong."""
+        df = _base_df([9, 10, 11, 12])
+        # Frames 10/12 get a genuine, correctly-validating candidate at
+        # their own already-known position -- isolates this test to just
+        # frame 11's rejection, rather than also exercising "no candidate
+        # found at all" (a different, already-covered case).
+        raw_full_frame = {
+            10: [{"NOSE": (0.30, 0.52, 0.99)}],
+            12: [{"NOSE": (0.30, 0.52, 0.99)}],
+        }
 
         def _fake_roi(video_path, fps, landmark_names, frame_idx, center_xy_norm, radius_x, radius_y, num_poses=2):
             if frame_idx == 11:
@@ -270,4 +372,6 @@ class TestRoiFallbackWiredIntoSkeletonRefinement:
             result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
 
         row11 = result[result["frame"] == 11].iloc[0]
-        assert row11["NOSE_x"] == 0.30  # unchanged -- rejected same as any other wrong candidate
+        assert pd.isna(row11["NOSE_x"])  # blanked -- rejected, never left confidently wrong
+        row10 = result[result["frame"] == 10].iloc[0]
+        assert row10["NOSE_x"] == 0.30  # neighbors untouched

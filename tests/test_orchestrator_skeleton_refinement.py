@@ -55,12 +55,23 @@ def _base_df(frames):
 
 
 class TestRefineSkeletonWindowRawIdentityConsistency:
+    """Every df below includes frame 9, one frame BEFORE the window
+    passed to _refine_skeleton_window_raw (start_frame=10) -- needed
+    since 2026-09-23 (see that function's own docstring on blanking the
+    whole window upfront): frames INSIDE the window are blanked before
+    processing begins, so frame 9 -- outside it, untouched -- is what
+    lets these tests validate a candidate at frame 11 against a real,
+    trustworthy reference, exactly like real run-up footage sitting just
+    before FFC in an actual clip. None of these tests supply a raw
+    candidate for frames 10/12 themselves, so those frames are expected
+    to end up correctly blanked too (no assertions are made about them)."""
+
     def test_a_different_person_far_away_is_not_patched_in(self):
         """The exact real bug: the raw re-extraction's only candidate is
         a bystander at a position wildly different from the seeded
         walk's own already-correct identity. Must keep the original
         (seeded) values, not silently swap in the wrong person."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         # Bystander at (0.70, 0.55) -- 0.45 away from the seeded NOSE
         # position (0.25, 0.55), far beyond IDENTITY_CONSISTENCY_MAX_DIST.
         raw = {
@@ -70,14 +81,19 @@ class TestRefineSkeletonWindowRawIdentityConsistency:
             result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 12)
 
         row11 = result[result["frame"] == 11].iloc[0]
-        assert row11["NOSE_x"] == 0.25  # unchanged -- the wrong-person patch was rejected
-        assert row11["NOSE_y"] == 0.55
+        # BEHAVIOR CHANGE (2026-09-23): a rejected frame is now blanked
+        # (NaN), not left at its stale original value -- see this
+        # window's own "blank upfront" fix for why (a not-yet-processed
+        # or rejected frame's original value can itself already be
+        # wrong, and must never survive as a false "trusted" reference
+        # for another frame's check).
+        assert pd.isna(row11["NOSE_x"])  # rejected -- the wrong-person patch was blanked, not applied
 
     def test_a_genuine_same_person_refinement_is_patched_in(self):
         """A real refinement (small correction, same person) must still
         be applied -- this check must not block the feature it's
         protecting from doing its actual job."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         # A small, real refinement -- 0.01 away from the seeded position,
         # comfortably within tolerance.
         raw = {
@@ -99,7 +115,7 @@ class TestRefineSkeletonWindowRawIdentityConsistency:
         frame, just ranked second. A single-candidate gate could only
         reject the frame outright; the real fix must find and use the
         correct candidate among several."""
-        df = _base_df([10, 11, 12])
+        df = _base_df([9, 10, 11, 12])
         raw = {
             11: [
                 {"NOSE": (0.70, 0.55, 1.0)},   # ranked first by MediaPipe -- the bystander
@@ -117,7 +133,7 @@ class TestRefineSkeletonWindowRawIdentityConsistency:
         """NOSE can genuinely be absent (occlusion, turned head) -- the
         check must still work using mid-hip instead of just skipping the
         safety check entirely."""
-        df = _base_df([10, 11])
+        df = _base_df([9, 10, 11])
         raw = {
             11: [{"LEFT_HIP": (0.68, 0.60, 1.0), "RIGHT_HIP": (0.72, 0.60, 1.0)}],  # far bystander, no NOSE key at all
         }
@@ -125,7 +141,7 @@ class TestRefineSkeletonWindowRawIdentityConsistency:
             result = o._refine_skeleton_window_raw("fake.mp4", 30.0, df, 10, 11)
 
         row11 = result[result["frame"] == 11].iloc[0]
-        assert row11["LEFT_HIP_x"] == 0.24  # unchanged -- rejected via the mid-hip fallback check
+        assert pd.isna(row11["LEFT_HIP_x"])  # rejected via the mid-hip fallback check, blanked not applied
 
     def test_a_frame_with_no_reference_anywhere_nearby_is_rejected(self):
         """REGRESSION (2026-09-15): the first version of this gate was
