@@ -575,8 +575,21 @@ def is_critical_and_eligible(metric_key: str, value, bowler_type: str = None,
     that file: a DESCRIPTIVE metric (e.g. hip_shoulder_separation, always
     descriptive) got 3 drills prescribed for it anyway, because that rule
     previously lived only in prompt text, not code.
+
+    EXCEPTION (2026-09-23, explicit coaching-staff decision): head_stability
+    is exempted from the recalibration_pending block. Its CRITICAL
+    threshold is still provisional (see kinematics.calculate_head_
+    stability's own docstring), but the coaching staff judged the
+    underlying signal directionally trustworthy enough to act on now
+    rather than wait for full multi-clip re-validation. Mirrors
+    coaching_agent.py's matching prompt-text exception for the drill
+    side of this same decision — this function is the single shared
+    source of truth for both the drill text and the freeze-frame
+    callout label, so they must move together.
     """
-    if recalibration_pending or tracking_uncertain:
+    if tracking_uncertain:
+        return False
+    if recalibration_pending and metric_key != "head_stability":
         return False
     return classify(metric_key, value, bowler_type) == "red"
 

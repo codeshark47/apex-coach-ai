@@ -291,6 +291,25 @@ class TestMetricsByFrame:
         assert entries[0][3] is False
 
     def test_recalibration_pending_red_metric_still_appears_but_not_eligible(self):
+        """release_height (unlike head_stability, see the next test) has
+        no recalibration_pending exception -- still blocked."""
+        per_frame = diag._metrics_by_frame(
+            diag._BOWLING_METRIC_FRAMES,
+            {"release_height": {"ratio": 0.5, "recalibration_pending": True}},
+            None, ["bfc", "ffc", "release"])
+        entries = [e for e in per_frame["release"] if e[0] == "release_height"]
+        assert len(entries) == 1
+        _, value, tier, eligible = entries[0]
+        assert tier == "red"
+        assert eligible is False
+
+    def test_head_stability_recalibration_pending_is_still_eligible(self):
+        """REGRESSION (2026-09-23, explicit coaching-staff decision): head_
+        stability is exempted from the recalibration_pending block, so its
+        freeze-frame callout must say "CRITICAL", not "(provisional)",
+        consistent with coaching_agent.py now allowed to prescribe a real
+        drill for it under the same exception -- these two must never
+        disagree (see is_critical_and_eligible's own docstring)."""
         per_frame = diag._metrics_by_frame(
             diag._BOWLING_METRIC_FRAMES,
             {"head_stability": {"value": 1.7, "recalibration_pending": True}},
@@ -299,7 +318,7 @@ class TestMetricsByFrame:
         assert len(entries) == 1
         _, value, tier, eligible = entries[0]
         assert tier == "red"
-        assert eligible is False
+        assert eligible is True
 
     def test_missing_metric_appears_as_unknown_not_omitted(self):
         per_frame = diag._metrics_by_frame(diag._BOWLING_METRIC_FRAMES, {}, None, ["bfc", "ffc", "release"])

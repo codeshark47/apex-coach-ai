@@ -498,3 +498,26 @@ class TestIsCriticalAndEligible:
 
     def test_unknown_value_is_never_eligible(self):
         assert mr.is_critical_and_eligible("batting_xfactor_separation", None) is False
+
+    def test_head_stability_recalibration_pending_exception(self):
+        """REGRESSION (2026-09-23, explicit coaching-staff decision): head_
+        stability is the ONE metric exempted from the recalibration_pending
+        block -- its threshold is still provisional, but the coaching staff
+        judged the underlying signal directionally trustworthy enough to
+        act on now. Every other metric must still be blocked exactly as
+        before (see test_recalibration_pending_overrides_red above)."""
+        assert mr.is_critical_and_eligible(
+            "head_stability", 0.5, recalibration_pending=True) is True
+
+    def test_head_stability_still_blocked_by_tracking_uncertain(self):
+        """The exception is scoped to recalibration_pending only -- a
+        head_stability reading still flagged tracking_uncertain (motion
+        blur, a genuine data-quality problem) must stay blocked."""
+        assert mr.is_critical_and_eligible(
+            "head_stability", 0.5, recalibration_pending=True, tracking_uncertain=True) is False
+
+    def test_head_stability_not_eligible_when_not_actually_red(self):
+        """The exception only removes the recalibration_pending block --
+        it must not make an amber/green head_stability reading eligible."""
+        assert mr.is_critical_and_eligible(
+            "head_stability", 0.05, recalibration_pending=True) is False  # green
