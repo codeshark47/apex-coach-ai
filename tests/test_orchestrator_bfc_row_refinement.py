@@ -126,6 +126,64 @@ class TestRefineBfcRowRaw:
         assert "RIGHT_SHOULDER" in captured["needed"]
 
 
+    def test_needed_includes_the_lead_side_hip_so_the_diagnostic_skeleton_can_render(self):
+        """REGRESSION (2026-09-23, real coach-reported failure): a coach
+        confirmed BFC=68 by hand and the numeric rear-leg metrics
+        recovered fine, but the BFC diagnostic freeze-frame still showed
+        "unavailable". Root cause: diagnostic_frames._torso_height (the
+        plausibility gate _draw_skeleton requires before drawing
+        anything) needs BOTH hips, but this function only ever requested
+        the TRAIL side's -- so a recovered row could never pass that
+        gate no matter how good the trail-leg recovery was. The LEAD
+        hip is requested purely for that visual; it must not appear in
+        the frame-mixing `consumed` check (see the next test)."""
+        df = _base_df([30])
+        captured = {}
+
+        def _capture_needed(video_path, fps, needed, start, end):
+            captured["needed"] = needed
+            return {}
+
+        with patch("orchestrator.extract_raw_landmarks_window", side_effect=_capture_needed):
+            o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "right", None)
+        assert "LEFT_HIP" in captured["needed"]  # lead side, trail_side="right"
+
+        captured.clear()
+        with patch("orchestrator.extract_raw_landmarks_window", side_effect=_capture_needed):
+            o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "left", None)
+        assert "RIGHT_HIP" in captured["needed"]  # lead side, trail_side="left"
+
+    def test_a_recovered_lead_hip_is_merged_into_the_row(self):
+        """The whole point of requesting it: once found, it must actually
+        land in the returned row so _torso_height can compute."""
+        df = _base_df([30])
+        fallback = df.iloc[0]
+        raw = {30: [{"NOSE": (0.25, 0.35, 1.0), "RIGHT_HIP": (0.261, 0.601, 1.0),
+                     "RIGHT_KNEE": (0.261, 0.751, 1.0), "RIGHT_ANKLE": (0.261, 0.901, 1.0),
+                     "LEFT_SHOULDER": (0.241, 0.401, 1.0), "RIGHT_SHOULDER": (0.281, 0.401, 1.0),
+                     "LEFT_HIP": (0.239, 0.601, 1.0)}]}
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "right", fallback)
+        assert result["LEFT_HIP_x"] == 0.239
+        assert result["LEFT_HIP_y"] == 0.601
+
+    def test_a_candidate_missing_only_the_lead_hip_is_still_complete_for_frame_mixing(self):
+        """The lead hip must NOT be part of the `consumed` frame-mixing
+        safety check -- calculate_rear_knee_angle/calculate_rear_hip_
+        flexion don't read it, so a candidate missing only the lead hip
+        is still one genuine same-instant reading and must still be
+        allowed to merge onto a different-frame fallback, exactly like
+        test_complete_candidate_with_different_frame_fallback_is_merged."""
+        df = _base_df([25, 30])
+        fallback = df.iloc[0]  # frame 25
+        raw = {30: [{"NOSE": (0.25, 0.35, 1.0), "RIGHT_HIP": (0.261, 0.601, 1.0),
+                     "RIGHT_KNEE": (0.261, 0.751, 1.0), "RIGHT_ANKLE": (0.261, 0.901, 1.0),
+                     "LEFT_SHOULDER": (0.241, 0.401, 1.0), "RIGHT_SHOULDER": (0.281, 0.401, 1.0)}]}
+        # no LEFT_HIP (lead side) in the candidate at all
+        with patch("orchestrator.extract_raw_landmarks_window", return_value=raw):
+            result = o._refine_bfc_row_raw("fake.mp4", 30.0, df, 30, "right", fallback)
+        assert result["RIGHT_HIP_x"] == 0.261  # merged despite the missing lead hip
+
     def test_partial_candidate_with_different_frame_fallback_is_not_merged(self):
         """REGRESSION (2026-09-15, found by an independent adversarial
         review): fallback_row from a DIFFERENT frame (here: frame 25, via

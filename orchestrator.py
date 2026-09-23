@@ -1613,6 +1613,7 @@ def _refine_bfc_row_raw(video_path: str, fps: float, df: pd.DataFrame,
     couldn't confirm.
     """
     trail_upper = "LEFT" if trail_side == "left" else "RIGHT"
+    lead_upper = "RIGHT" if trail_upper == "LEFT" else "LEFT"
     # NOSE included even though neither consuming function reads it — it's
     # the PRIMARY reference _raw_reference_point checks (see its
     # docstring), and this function only ever fetches ONE side's hip
@@ -1622,8 +1623,22 @@ def _refine_bfc_row_raw(video_path: str, fps: float, df: pd.DataFrame,
     # real bug caught by this function's own regression tests, not
     # footage — worth remembering for any future _refine_*_raw variant
     # that fetches only one side of a paired landmark.
+    #
+    # BUG FIX (2026-09-23, real coach-reported failure): the LEAD side's
+    # hip is now also requested, even though neither calculate_rear_knee_
+    # angle nor calculate_rear_hip_flexion reads it (see `consumed` below,
+    # unchanged). Without it, a recovered BFC row only ever had ONE hip —
+    # diagnostic_frames._torso_height (used by _draw_skeleton's
+    # plausibility gate for the BFC freeze-frame image) requires BOTH
+    # hips and returns 0.0 with just one, so the BFC diagnostic image
+    # permanently showed "unavailable" even on a run where the coach
+    # correctly confirmed the BFC frame and the NUMERIC rear-leg metrics
+    # recovered successfully — confirmed directly: _torso_height on a
+    # real recovered row with only RIGHT_HIP present returns 0.0, this
+    # image never generates. This request is purely for the picture to
+    # match the numbers; it changes no numeric metric's calculation.
     needed = ["NOSE", f"{trail_upper}_HIP", f"{trail_upper}_KNEE", f"{trail_upper}_ANKLE",
-              "LEFT_SHOULDER", "RIGHT_SHOULDER"]
+              "LEFT_SHOULDER", "RIGHT_SHOULDER", f"{lead_upper}_HIP"]
     try:
         raw = extract_raw_landmarks_window(video_path, fps, needed, int(bfc_frame), int(bfc_frame))
     except Exception as e:
