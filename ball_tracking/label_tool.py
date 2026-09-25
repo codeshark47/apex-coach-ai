@@ -135,7 +135,24 @@ TRACK_MAX_GAP_FRAMES = 30
 # _save_hard_negative below and prepare_dataset.py's background-image
 # handling). "No — just skip" must stay first (index 0) — code below
 # treats that as the disabled/default state.
-HARD_NEGATIVE_CATEGORIES = ["No — just skip", "Glove", "Pad/guard", "Helmet", "Other shiny/round object"]
+#
+# EXPANDED (2026-09-25, real coach request + real confirmed case): the
+# IMG_3755.MOV investigation found a confusable-object class not in the
+# original 4 (a non-striker's dark pad/ankle strap) — this list was
+# only ever grown reactively, one confirmed real confusion at a time.
+# Rather than wait for each new class to bite first, added every
+# plausible near-pitch lookalike a real match/net session can show: the
+# original 4 kept exactly as-is (never rename an existing category —
+# prepare_dataset.py's notes text and any coach's prior labeling history
+# reference these exact strings), plus shoes, nets/fencing, poles/posts,
+# a bare head, and an elbow/knee (skin-toned round joints at small scale
+# and low resolution are a real, plausible ball-lookalike, same
+# reasoning as the original glove/pad findings).
+HARD_NEGATIVE_CATEGORIES = [
+    "No — just skip",
+    "Glove", "Pad/guard", "Helmet", "Other shiny/round object",
+    "Shoe", "Net/fence", "Pole/post", "Head", "Elbow/knee",
+]
 
 
 @st.cache_resource(show_spinner="Loading AI ball detector (one-time)...")
@@ -301,6 +318,176 @@ def _save_hard_negative(client, video_name: str, frame_idx: int, category: str):
         "labeled_by": "direct_click_v1",
         "notes": f"HARD NEGATIVE: {category} visible here, coach confirmed no ball in frame.",
     }, on_conflict="source_video_filename,frame_index").execute()
+
+
+# PITCH CALIBRATION (2026-09-25, real coach request): captures the same
+# 4 ground-level stump corners pitch_calibration.build_ground_homography()
+# already knows how to turn into a real ground-plane mapping, right in
+# this tool instead of a separate manual grid-overlay measurement —
+# matches FullTrack AI's own documented calibration step ("line up both
+# sets of stumps"), see project memory. Stored per-clip on
+# ball_tracking_runs.pitch_calibration (nullable jsonb — see
+# add_pitch_calibration.sql, must be run once against the live Supabase
+# project before this reads/writes anything).
+PITCH_CALIBRATION_POINTS = [
+    ("near_left_px", "NEAR stumps — LEFT edge (base, where it meets the ground)"),
+    ("near_right_px", "NEAR stumps — RIGHT edge (base, where it meets the ground)"),
+    ("far_left_px", "FAR stumps — LEFT edge (base, where it meets the ground)"),
+    ("far_right_px", "FAR stumps — RIGHT edge (base, where it meets the ground)"),
+]
+
+
+def _load_pitch_calibration(client, video_name: str):
+    """Returns the saved {"near_left_px": [x,y], ...} dict for this clip,
+    or None if it has never been calibrated (or add_pitch_calibration.sql
+    hasn't been run yet against this Supabase project — a missing column
+    raises a real Postgres error rather than silently returning nothing,
+    so it doesn't look identical to a genuinely un-calibrated clip)."""
+    result = (
+        client.table("ball_tracking_runs")
+        .select("pitch_calibration")
+        .eq("source_video_filename", video_name)
+        .execute()
+    )
+    if result.data and result.data[0].get("pitch_calibration"):
+        return result.data[0]["pitch_calibration"]
+    return None
+
+
+def _save_pitch_calibration(client, video_name: str, fps: float, frame_w: int,
+                             frame_h: int, total_frames: int, calibration: dict):
+    """Same read-then-insert-or-update pattern as _upsert_run above (see
+    its docstring: ball_tracking_runs has no unique constraint on
+    source_video_filename alone, so a plain upsert on that column fails
+    outright) — a clip may already have a runs row from ball labeling, a
+    prior calibration, both, or neither."""
+    existing = (
+        client.table("ball_tracking_runs")
+        .select("id")
+        .eq("source_video_filename", video_name)
+        .execute()
+    )
+    if existing.data:
+        client.table("ball_tracking_runs").update({
+            "pitch_calibration": calibration,
+        }).eq("id", existing.data[0]["id"]).execute()
+    else:
+        client.table("ball_tracking_runs").insert({
+            "source_video_filename": video_name,
+            "camera_setup_label": "direct_click_v1",
+            "detector_name": "human_click",
+            "fps": fps,
+            "frame_width": frame_w,
+            "frame_height": frame_h,
+            "total_frames": total_frames,
+            "frames_with_candidates": 0,
+            "pitch_calibration": calibration,
+        }).execute()
+
+
+def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
+                                  fps: float, total_frames: int):
+    """
+    Self-contained 4-click flow: near-left, near-right, far-left,
+    far-right stump BASE (ground level, not the tips) — the exact same
+    4 points pitch_calibration.build_ground_homography() expects, in the
+    same order. Deliberately separate from the frame-by-frame ball-
+    labeling loop below (own frame picker, own click state) since
+    calibrating the camera position is a one-time-per-clip task, not
+    something that advances frame by frame.
+
+    Real-world reference distances are fixed constants (pitch_calibration.
+    PITCH_LENGTH_M / STUMP_LINE_WIDTH_M — standard cricket dimensions),
+    never asked from the coach here, so there's no way to enter a wrong
+    number by hand.
+    """
+    st.subheader("📐 Pitch calibration (stumps)")
+    st.caption(
+        "Click the base of each stump line (where the stumps meet the ground, not "
+        "their tips) — near set then far set, left edge then right edge on each. "
+        "Same idea as FullTrack AI's own setup step: line up both sets of stumps."
+    )
+
+    existing = _load_pitch_calibration(client, video_name)
+    if existing and not st.session_state.get("label_tool_calib_redo"):
+        st.success("✅ This clip already has a saved calibration.")
+        cols = st.columns(4)
+        for col, (key, label) in zip(cols, PITCH_CALIBRATION_POINTS):
+            pt = existing.get(key)
+            col.metric(label.split(" — ")[1].split(" (")[0], f"{pt}" if pt else "—")
+        if st.button("🔁 Redo this clip's calibration"):
+            st.session_state.label_tool_calib_redo = True
+            st.rerun()
+        return
+
+    calib_frame_key = f"label_tool_calib_frame_{video_name}"
+    calib_points_key = f"label_tool_calib_points_{video_name}"
+    if calib_points_key not in st.session_state:
+        st.session_state[calib_points_key] = {}
+    points = st.session_state[calib_points_key]
+
+    ref_frame_idx = st.number_input(
+        "Reference frame to calibrate from (pick one where both stump sets are "
+        "clearly visible and nobody is standing on them)",
+        min_value=0, max_value=max(0, total_frames - 1),
+        value=st.session_state.get(calib_frame_key, 0), key=calib_frame_key,
+    )
+    frame_rgb = _load_frame(video_path, ref_frame_idx)
+    if frame_rgb is None:
+        st.warning("Could not read that frame.")
+        return
+    orig_w = frame_rgb.shape[1]
+
+    next_idx = len(points)
+    if next_idx < len(PITCH_CALIBRATION_POINTS):
+        key, label = PITCH_CALIBRATION_POINTS[next_idx]
+        st.info(f"Click: **{label}**")
+    else:
+        st.success("All 4 points placed.")
+
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    img = Image.fromarray(frame_rgb)
+    scale = min(1.0, MAX_DISPLAY_WIDTH / orig_w)
+    disp_img = img.resize((int(orig_w * scale), int(frame_rgb.shape[0] * scale)))
+    draw = ImageDraw.Draw(disp_img)
+    point_colors = [(255, 60, 60), (60, 200, 60), (60, 140, 255), (255, 200, 0)]
+    for i, (key, _label) in enumerate(PITCH_CALIBRATION_POINTS):
+        if key in points:
+            px, py = points[key]
+            dx, dy = px * scale, py * scale
+            draw.ellipse([dx - 6, dy - 6, dx + 6, dy + 6], outline=point_colors[i], width=3)
+            draw.text((dx + 8, dy - 8), str(i + 1), fill=point_colors[i])
+
+    click = streamlit_image_coordinates(disp_img, key=f"label_tool_calib_click_{video_name}_{ref_frame_idx}_{next_idx}")
+    if click is not None and next_idx < len(PITCH_CALIBRATION_POINTS):
+        key, _label = PITCH_CALIBRATION_POINTS[next_idx]
+        points[key] = (click["x"] / scale, click["y"] / scale)
+        st.rerun()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("↩️ Undo last point", disabled=not points):
+            last_key = list(points.keys())[-1]
+            del points[last_key]
+            st.rerun()
+    with col2:
+        if st.button("🔄 Start over"):
+            st.session_state[calib_points_key] = {}
+            st.rerun()
+    with col3:
+        ready = len(points) == len(PITCH_CALIBRATION_POINTS)
+        if st.button("✅ Save calibration", disabled=not ready, use_container_width=True):
+            calibration = {
+                key: list(points[key]) for key, _label in PITCH_CALIBRATION_POINTS
+            }
+            calibration["reference_frame"] = int(ref_frame_idx)
+            _save_pitch_calibration(client, video_name, fps, orig_w, frame_rgb.shape[0],
+                                     total_frames, calibration)
+            st.session_state[calib_points_key] = {}
+            st.session_state.label_tool_calib_redo = False
+            st.success("Saved.")
+            st.rerun()
 
 
 def _load_frame(video_path: str, frame_idx: int):
@@ -498,6 +685,15 @@ def main():
                 st.error(f"Noted — pick a different video from the sidebar. ({video_name} skipped)")
         return
 
+    mode = st.sidebar.radio(
+        "Mode", ["Label ball positions", "📐 Calibrate pitch (stumps)"],
+        help="Pitch calibration is a one-time-per-clip step (both stump sets' ground "
+             "positions) — doesn't need to be redone per frame, unlike ball labeling.",
+    )
+    if mode == "📐 Calibrate pitch (stumps)":
+        _render_pitch_calibration_ui(client, video_name, video_path, fps, total_frames)
+        return
+
     sample_n = st.sidebar.number_input(
         "Label every Nth frame", min_value=1, max_value=10, value=SAMPLE_EVERY_N_FRAMES,
         help="Consecutive frames are highly redundant — every 2nd-3rd frame is usually enough.",
@@ -618,10 +814,27 @@ def main():
     pending_point = st.session_state.get(pending_point_key)
     pending_source = st.session_state.get(pending_source_key)
 
-    if st.session_state.label_tool_radius is not None:
-        radius = st.session_state.label_tool_radius
-    elif pending_source in ("ai", "tracked") and ai_radius_key in st.session_state:
+    # PER-FRAME ADJUSTABLE RADIUS (2026-09-25, real coach request): this
+    # used to be set ONCE on the clip's first click and then silently
+    # reused for every later frame, regardless of source. Real problem
+    # with that: a ball's TRUE apparent size shrinks as it travels away
+    # from a fixed camera (perspective), so a radius calibrated on a
+    # close, large first frame was systematically too big for a
+    # far-down-the-pitch frame later in the same clip — meaning every
+    # radius recorded after the first was honestly wrong, not just
+    # imprecise, and that wrong size feeds straight into training
+    # (prepare_dataset.py writes a YOLO box sized from this radius) and
+    # into track_ball_from_seed's own size-trend consistency check.
+    # Fix: no more one-time lock. `label_tool_radius` is now just the
+    # LAST radius actually used (a rolling default, not a hard clip
+    # value), and a per-frame AI/tracked size estimate — genuinely
+    # per-frame, not carried over — takes priority when one exists,
+    # since it reflects THIS frame's real apparent size. The coach can
+    # always nudge it with the slider below; nothing here removes that.
+    if pending_source in ("ai", "tracked") and ai_radius_key in st.session_state:
         radius = st.session_state[ai_radius_key]
+    elif st.session_state.label_tool_radius is not None:
+        radius = st.session_state.label_tool_radius
     else:
         radius = orig_w * DEFAULT_RADIUS_FRACTION
 
@@ -655,56 +868,28 @@ def main():
             st.session_state[pending_source_key] = "coach"
             st.rerun()
 
-    # FIRST clip's radius calibration — one-time per video, right after the
-    # first click, so the coach sets it by eye once instead of every frame.
-    #
-    # BUG FOUND (2026-08-02, real coach test): before AI pre-fill existed,
-    # reaching this screen always meant a coach had genuinely clicked the
-    # ball, so basing the whole clip's radius on that point was safe. Now
-    # the AI can land here too — a coach reported it landing on the
-    # BATSMAN'S HELMET on a run-up frame where the ball wasn't even in
-    # play yet, and got stuck: this screen only ever offered "confirm
-    # size," no way to say "there's no real ball here, skip it," and the
-    # early `return` below meant the actual skip button (further down)
-    # never even rendered. Re-clicking on the frame WOULD correct a wrong
-    # AI guess if the true ball were visible somewhere else — but on a
-    # frame where there genuinely is no ball yet, there's nothing to
-    # click. Added the same skip escape hatch this screen was missing.
-    if st.session_state.label_tool_radius is None and pending_point is not None:
-        st.info("First click on this clip — set the ball's approximate size, then confirm.")
+    # PER-FRAME RADIUS SLIDER (2026-09-25, replaces the old one-time
+    # "first click on this clip, confirm size forever" screen — see the
+    # radius-selection comment above for why locking it once was wrong).
+    # Shown for every frame that has a point, not gated to the first —
+    # the coach can leave it alone (it already carries a sensible
+    # default forward) or shrink it as the ball gets further from the
+    # camera. Key is unique per frame so each frame's slider genuinely
+    # starts from ITS OWN best estimate (AI/tracked size, or the last
+    # radius used) rather than reusing whatever the previous frame's
+    # widget happened to be left at.
+    if pending_point is not None:
         radius = st.slider(
-            "Ball radius (pixels, original resolution)", min_value=2.0,
-            max_value=orig_w * 0.1, value=float(radius), key="label_tool_radius_slider",
+            "Ball radius (pixels, original resolution) — shrink this as the ball "
+            "moves further from the camera",
+            min_value=2.0, max_value=orig_w * 0.1, value=float(radius),
+            key=f"label_tool_radius_slider_{video_name}_{frame_idx}",
         )
-        display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
-        st.image(display_img)
-        calib_col1, calib_col2 = st.columns(2)
-        with calib_col1:
-            if st.button("✅ Confirm size for this whole clip", use_container_width=True):
-                st.session_state.label_tool_radius = radius
-                st.rerun()
-        with calib_col2:
-            hard_neg_choice = st.selectbox(
-                "Lookalike here? (optional)", HARD_NEGATIVE_CATEGORIES,
-                key=f"label_tool_hardneg_calib_{video_name}_{frame_idx}",
-                help="If the AI (or a click) landed on a glove, pad, or helmet instead of the "
-                     "real ball, flag which one — that gets saved as a confirmed non-ball "
-                     "example so the model learns to tell them apart, instead of just being "
-                     "skipped past unrecorded.",
-            )
-            if st.button("🚫 Not the ball — no ball visible here, skip", use_container_width=True):
-                if hard_neg_choice != HARD_NEGATIVE_CATEGORIES[0]:
-                    _save_hard_negative(client, video_name, frame_idx, hard_neg_choice)
-                    st.session_state.label_tool_history.append(("skip_hardneg", frame_idx))
-                    st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
-                else:
-                    st.session_state.label_tool_history.append(("skip", 1))
-                del st.session_state[pending_point_key]
-                st.session_state.pop(pending_source_key, None)
-                st.session_state.pop(ai_radius_key, None)
-                st.session_state.label_tool_frame_ptr += 1
-                st.rerun()
-        return  # don't allow advancing until size is confirmed OR this frame is skipped
+        # Re-render below the clickable image above so the circle on
+        # screen actually reflects any adjustment just made — the
+        # clickable copy above was drawn before this slider could run.
+        preview_img, _ = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
+        st.image(preview_img, caption="Preview at the radius above")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -741,6 +926,12 @@ def main():
             # pre-fill block above. Diameter (2x radius) matches
             # track_ball_from_seed's own seed_size convention.
             st.session_state[last_confirmed_key] = (frame_idx, x, y, radius * 2)
+            # Rolling default for the NEXT frame's slider, in case that
+            # frame has no AI/tracked size estimate of its own to start
+            # from — this is just a starting point the coach can still
+            # adjust, never a re-imposed lock (see the radius-selection
+            # comment above).
+            st.session_state.label_tool_radius = radius
             st.session_state.label_tool_history.append(("confirm", frame_idx))
             st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             del st.session_state[pending_point_key]
