@@ -4664,6 +4664,8 @@ def render_ball_tracking_admin_panel():
         st.session_state["_bt_ref_path"] = ref_path
         st.session_state["_bt_seed_point"] = None
         st.session_state["_bt_seed_frame"] = 0
+        st.session_state["_bt_seed_point2"] = None
+        st.session_state["_bt_seed_frame2"] = None
         st.session_state["_bt_result"] = None
 
     ref_path = st.session_state["_bt_ref_path"]
@@ -4677,6 +4679,11 @@ def render_ball_tracking_admin_panel():
     if st.session_state.get("_bt_last_frame_idx") != frame_idx:
         st.session_state["_bt_seed_point"] = None
         st.session_state["_bt_last_frame_idx"] = frame_idx
+        # A second seed point (if any) is only valid AFTER this frame —
+        # moving the primary seed frame can invalidate it, so clear it
+        # rather than silently carrying over a now-inconsistent pair.
+        st.session_state["_bt_seed_point2"] = None
+        st.session_state["_bt_seed_frame2"] = None
 
     frame = cal.extract_reference_frame(ref_path, frame_index=frame_idx)
     if frame is None:
@@ -4699,11 +4706,65 @@ def render_ball_tracking_admin_panel():
 
     st.success(f"Seed set: frame {frame_idx}, ({point[0]:.0f}, {point[1]:.0f})")
 
+    # SECOND SEED POINT (2026-09-26, optional) — see
+    # track_ball_from_seed's own docstring for the full reasoning. Only
+    # useful once the ball has visibly separated from the bowler's body
+    # a few frames later; that near-body stretch is exactly where a
+    # fresh single-point seed is most likely to lock onto the wrong
+    # thing (a jersey number, wristband), so a second real click there
+    # lets the walk start past it with a genuine, human-confirmed
+    # velocity instead of the usual (0, 0).
+    use_second = st.checkbox(
+        "➕ Add a second point (a few frames later, once the ball has "
+        "separated from the hand) — helps the tracker through the "
+        "hardest, most cluttered stretch",
+        key="_bt_use_second_seed",
+    )
+    point2 = None
+    frame_idx2 = None
+    if use_second:
+        max_idx = max(total_frames - 1, frame_idx + 1)
+        frame_idx2 = st.slider(
+            "Second seed frame (must be after the first)",
+            min_value=frame_idx + 1, max_value=max_idx,
+            value=max(st.session_state.get("_bt_seed_frame2") or (frame_idx + 3), frame_idx + 1),
+            key="_bt_seed_slider2",
+        )
+        if st.session_state.get("_bt_last_frame_idx2") != frame_idx2:
+            st.session_state["_bt_seed_point2"] = None
+            st.session_state["_bt_last_frame_idx2"] = frame_idx2
+
+        frame2 = cal.extract_reference_frame(ref_path, frame_index=frame_idx2)
+        if frame2 is None:
+            st.warning("Could not read this frame.")
+        else:
+            pil_img2 = Image.fromarray(frame2)
+            point2 = st.session_state.get("_bt_seed_point2")
+            new_point2 = render_zoomable_click_image(
+                pil_img2, key_prefix="_bt_seed2", marker_point=point2,
+                extra_markers=[{"point": point, "color": "lime", "label": "1st"}],
+                enable_zoom=True,
+            )
+            if new_point2 is not None and st.session_state.get("_bt_seed_point2") != new_point2:
+                st.session_state["_bt_seed_point2"] = new_point2
+                st.session_state["_bt_seed_frame2"] = frame_idx2
+                st.session_state["_bt_result"] = None
+                st.rerun()
+            point2 = st.session_state.get("_bt_seed_point2")
+            if point2 is None:
+                st.info("Click the ball above to set the second seed point.")
+            else:
+                st.success(f"Second seed set: frame {frame_idx2}, ({point2[0]:.0f}, {point2[1]:.0f})")
+
     if st.button("▶ Run Ball Tracking", key="_bt_run"):
         with st.spinner("Tracking..."):
             model = _load_ball_tracking_model()
             from ball_tracking.track_ball_from_seed import track_ball_from_seed
-            result = track_ball_from_seed(ref_path, frame_idx, point, model, max_frames_forward=100)
+            kwargs = {}
+            if use_second and point2 is not None and frame_idx2 is not None:
+                kwargs["second_seed_frame"] = frame_idx2
+                kwargs["second_seed_xy"] = point2
+            result = track_ball_from_seed(ref_path, frame_idx, point, model, max_frames_forward=100, **kwargs)
             st.session_state["_bt_result"] = result
 
     result = st.session_state.get("_bt_result")
