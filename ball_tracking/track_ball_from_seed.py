@@ -53,6 +53,9 @@ def track_ball_from_seed(
     seed_xy: tuple,
     yolo_model,
     seed_size: float = None,
+    second_seed_frame: int = None,
+    second_seed_xy: tuple = None,
+    second_seed_size: float = None,
     max_frames_forward: int = 30,
     search_radius_start: float = 250.0,
     search_radius_growth: float = 60.0,
@@ -85,6 +88,41 @@ def track_ball_from_seed(
     position+confidence alone; the size check only engages from the
     SECOND tracked point onward, once there are two real size samples
     to compare.
+
+    second_seed_frame / second_seed_xy / second_seed_size (2026-09-26,
+    real coach request, relayed via Gemini — independently evaluated
+    and endorsed, not blindly implemented): an OPTIONAL second coach
+    click, a few frames after the first, once the ball has visibly
+    separated from the bowler's body. When given, BOTH points are
+    trusted as real ground truth and the walk starts from the SECOND
+    one with a genuine, human-confirmed velocity already established —
+    `(second_xy - seed_xy) / (second_frame - seed_frame)` — instead of
+    the usual (0, 0) that only becomes real once the tracker finds its
+    own first successful detection.
+
+    WHY THIS MATTERS, traced directly on a real failure (not assumed):
+    the single-seed walk's OWN first 1-2 tracked frames are exactly
+    where it's most likely to fail — no established velocity yet means
+    neither the speed-ratio reject nor the directional-consistency
+    score (see below) has anything to compare a candidate against, and
+    that high-clutter region right next to the bowler's body (where a
+    jersey number, wristband, or shirt logo can visually resemble a
+    motion-blurred ball) is precisely where confirmed on IMG_3755.MOV
+    that a fresh single-point seed can lock onto the wrong thing on the
+    very next tracked frame. A second REAL click bypasses that exact
+    gap — the coach places both endpoints of the hardest, most
+    cluttered stretch directly, the same "human click is ground truth,
+    never guessed" principle already used everywhere else in this app
+    (main.py's bowler seeding, BFC/FFC/BR confirmation, the release-
+    height wrist override), rather than asking the vision model to
+    survive the one region it's least reliable in.
+
+    NOT the same idea as extrapolating/curve-fitting through a gap
+    (rejected earlier in this project's history, see the module
+    docstring) — no position between the two clicks is ever guessed or
+    filled in; both points are exactly what the coach clicked, and
+    tracking only ever proceeds forward from the second one using real,
+    freshly-detected frames from there on.
 
     search_radius grows the longer the trail goes unconfirmed (same
     reasoning as every other growing-tolerance walk in this app) but is
@@ -306,6 +344,10 @@ def track_ball_from_seed(
         return {"status": "error", "message": f"Could not open video: {video_path}"}
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    use_two_point_seed = second_seed_frame is not None and second_seed_xy is not None
+    if use_two_point_seed and second_seed_frame <= seed_frame:
+        return {"status": "error", "message": "second_seed_frame must be AFTER seed_frame."}
+
     points = [(seed_frame, float(seed_xy[0]), float(seed_xy[1]), 1.0, seed_size)]
     # ANCHOR + PER-FRAME VELOCITY (2026-08-15, two real bugs found by
     # tracing an exact failure on the full-trajectory benchmark): anchor_xy/
@@ -329,6 +371,21 @@ def track_ball_from_seed(
     anchor_xy = (float(seed_xy[0]), float(seed_xy[1]))
     anchor_frame = seed_frame
     velocity = (0.0, 0.0)  # (dx, dy) per frame, updated once 2+ points are confirmed
+    # TWO-POINT SEED (2026-09-26) — see this function's docstring for the
+    # full reasoning. Both points are real coach clicks, so both go in
+    # `points` as-is; the walk itself starts from the SECOND one with a
+    # real, human-confirmed velocity already in hand, skipping past the
+    # cluttered stretch between them entirely rather than asking the
+    # detector to survive it.
+    if use_two_point_seed:
+        second_elapsed = second_seed_frame - seed_frame
+        velocity = (
+            (float(second_seed_xy[0]) - anchor_xy[0]) / second_elapsed,
+            (float(second_seed_xy[1]) - anchor_xy[1]) / second_elapsed,
+        )
+        points.append((second_seed_frame, float(second_seed_xy[0]), float(second_seed_xy[1]), 1.0, second_seed_size))
+        anchor_xy = (float(second_seed_xy[0]), float(second_seed_xy[1]))
+        anchor_frame = second_seed_frame
     # SAME ANCHOR PRINCIPLE AS POSITION, APPLIED TO SIZE (2026-08-16, real
     # bug found tracing why clip3 stops at frame 111 even with stagnation
     # disabled and max_gap raised): expected_size used to compound
@@ -346,12 +403,26 @@ def track_ball_from_seed(
     anchor_size = seed_size
     anchor_size_frame = seed_frame
     size_velocity = None  # per-frame size delta once 2+ real size samples exist
+    # Same two-point treatment for size as for position above, but only
+    # when BOTH real sizes are actually known — a size trend from one
+    # missing sample would just be a guess, so this silently falls back
+    # to the single-size (or no-size) behavior already handled elsewhere
+    # in this function, never fabricates a trend from partial data.
+    if use_two_point_seed and seed_size is not None and second_seed_size is not None:
+        size_velocity = (second_seed_size - seed_size) / second_elapsed
+        anchor_size = second_seed_size
+        anchor_size_frame = second_seed_frame
+    elif use_two_point_seed:
+        anchor_size = second_seed_size if second_seed_size is not None else seed_size
+        anchor_size_frame = second_seed_frame
     gap = 0
     radius = search_radius_start
-    recent_real_positions = [(seed_frame, float(seed_xy[0]), float(seed_xy[1]))]  # rolling window, see stagnation docstring
+    walk_start_frame = second_seed_frame if use_two_point_seed else seed_frame
+    walk_start_xy = (float(second_seed_xy[0]), float(second_seed_xy[1])) if use_two_point_seed else (float(seed_xy[0]), float(seed_xy[1]))
+    recent_real_positions = [(walk_start_frame, walk_start_xy[0], walk_start_xy[1])]  # rolling window, see stagnation docstring
 
-    end_frame = min(total_frames - 1, seed_frame + max_frames_forward)
-    for frame_idx in range(seed_frame + 1, end_frame + 1):
+    end_frame = min(total_frames - 1, walk_start_frame + max_frames_forward)
+    for frame_idx in range(walk_start_frame + 1, end_frame + 1):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame_bgr = cap.read()
         if not ok:
