@@ -539,10 +539,67 @@ def track_ball_from_seed(
                 # post-bounce candidates recovery mode exists to find.
                 # Confidence + the size-trend check (already applied
                 # above) are the only trustworthy signals here.
+                #
+                # DIRECTIONAL CONSISTENCY (2026-09-26, real coach request,
+                # independently evaluated per [[feedback-evaluate-external-
+                # ai-advice]] — relayed via Gemini after a real jersey-
+                # number false positive): a real ball's implied direction
+                # of travel from the anchor should agree with its OWN
+                # recently-established direction, the same relative-to-
+                # itself principle the speed-ratio reject already uses for
+                # MAGNITUDE — extended here to cover VECTOR direction too,
+                # not just speed. Deliberately a SOFT multiplicative score,
+                # not a hard reject: a rigid absolute directional rule
+                # ("ball must move down/forward") was already tried and
+                # reverted earlier in this project's history — real
+                # verified footage showed the ball genuinely moving UPWARD
+                # in image-space early in flight on a real camera angle,
+                # and a hard rule rejected that correct tracking. Scoring
+                # by cosine similarity to the ball's OWN established
+                # direction (not a fixed absolute one) avoids repeating
+                # that mistake: a real direction change (e.g. after a
+                # bounce) costs a candidate some score, never disqualifies
+                # it outright, so it can still win against a worse-placed
+                # or lower-confidence alternative. Mapped from [-1, 1] to
+                # [0.15, 1.0] (never fully zeroed) rather than [0, 1] for
+                # the same reason — a candidate moving in a genuinely new
+                # but real direction must still be able to outscore a
+                # confidently-wrong static object with no candidates
+                # nearby agreeing with the old direction either.
+                #
+                # Only active once a real velocity exists (same gating as
+                # the speed-ratio reject) — there is no established
+                # direction to compare against for the very first tracked
+                # point after a fresh seed, which is exactly where this
+                # does NOT help (see the real jersey-number failure this
+                # was built in response to: it happened on the first
+                # post-seed frame, before any real direction existed to
+                # check against — traced and confirmed directly, not
+                # assumed, before shipping this as a partial fix rather
+                # than overselling it as a full one).
+                def _direction_factor(cx, cy):
+                    if velocity[0] == 0.0 and velocity[1] == 0.0:
+                        return 1.0  # no established direction yet — neutral, don't penalize
+                    implied = (cx - anchor_xy[0], cy - anchor_xy[1])
+                    implied_mag = math.hypot(*implied)
+                    if implied_mag == 0.0:
+                        return 1.0  # candidate is exactly at the anchor — no direction to score
+                    vel_mag = math.hypot(*velocity)
+                    cos_sim = (implied[0] * velocity[0] + implied[1] * velocity[1]) / (implied_mag * vel_mag)
+                    return 0.15 + 0.85 * (cos_sim + 1.0) / 2.0
+
                 def _combined_score(c):
                     cx, cy, cconf, _ = c
+                    direction_factor = _direction_factor(cx, cy)
                     if in_recovery:
-                        return cconf
+                        # pred_x/pred_y isn't a real guess in recovery mode
+                        # (see above) so position-proximity is skipped, but
+                        # the pre-gap established direction is still real
+                        # evidence — exactly the kind of signal that would
+                        # have helped distinguish a recovering real ball
+                        # from a static false positive in this project's
+                        # own past frame-46/66 incident.
+                        return cconf * direction_factor
                     dist = math.hypot(cx - pred_x, cy - pred_y)
                     # QUADRATIC, TIGHTER-SCALE proximity (2026-08-16) —
                     # see proximity_scale in this function's docstring.
@@ -551,7 +608,7 @@ def track_ball_from_seed(
                     # smaller scale specifically for RANKING candidates
                     # that already passed that boundary.
                     proximity = max(0.05, 1.0 - dist / proximity_scale) ** 2
-                    return cconf * proximity
+                    return cconf * proximity * direction_factor
 
                 found = max(candidates, key=_combined_score)
 
