@@ -51,11 +51,14 @@ def _nearest_complete_row(df: pd.DataFrame, frame_idx: int, required_cols: list,
 def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm: str,
                                    max_search: int = 90):
     """
-    Searches outward from frame_idx (closest frame first) for the nearest
-    frame where the lead ankle is genuinely grounded — below both the
-    knee and hip in the frame, same plausibility check already used
-    inside calculate_release_height_ratio_safe — to use as the "body
-    height" reference for that function, instead of relying on a
+    Searches outward from frame_idx for every frame within range where
+    the lead ankle is genuinely grounded — below both the knee and hip
+    in the frame, same plausibility check already used inside
+    calculate_release_height_ratio_safe — and returns whichever
+    qualifying frame has the LARGEST head-ankle span (not simply the
+    CLOSEST one to frame_idx — see the 2026-09-25 update below for why
+    proximity to frame_idx is the wrong signal to prefer), to use as the
+    "body height" reference for that function, instead of relying on a
     separately-timed front-foot-plant detection.
 
     WHY THIS EXISTS: verified directly on real footage (a leaping
@@ -93,23 +96,58 @@ def _find_grounded_reference_near(df: pd.DataFrame, frame_idx: int, bowling_arm:
     lead_side = "LEFT" if bowling_arm == "right" else "RIGHT"
     required = ["NOSE_y", f"{lead_side}_ANKLE_y", f"{lead_side}_KNEE_y", f"{lead_side}_HIP_y"]
 
-    def _is_grounded(row) -> bool:
+    def _grounded_span(row):
+        """Returns the head-ankle span if this row passes the grounded
+        check, else None — used both as a pass/fail gate and as the
+        quality signal for picking the BEST candidate below."""
         if any(pd.isna(row.get(c)) for c in required):
-            return False
+            return None
         ankle_y = float(row[f"{lead_side}_ANKLE_y"])
         if ankle_y < float(row[f"{lead_side}_KNEE_y"]) or ankle_y < float(row[f"{lead_side}_HIP_y"]):
-            return False
-        return abs(ankle_y - float(row["NOSE_y"])) >= MIN_BODY_HEIGHT_SPAN
+            return None
+        span = abs(ankle_y - float(row["NOSE_y"]))
+        return span if span >= MIN_BODY_HEIGHT_SPAN else None
 
+    # PREFER THE LARGEST SPAN, not just the CLOSEST passing frame (2026-
+    # 09-25, real coach-reported failure, confirmed on the actual data):
+    # this used to return the very first frame that cleared the
+    # MIN_BODY_HEIGHT_SPAN floor, searching outward from frame_idx
+    # (== BR) one offset at a time — but a bowler's forward lean into
+    # the delivery stride compresses this same span continuously and
+    # monotonically as BR approaches, so the CLOSEST passing frame to
+    # BR is systematically the MOST compressed one that still clears
+    # the floor, not a genuinely upright one. Confirmed directly on a
+    # real clip: head-ankle span was 0.44 at frame 2 (early run-up,
+    # upright) and had shrunk to 0.28 by frame 22 (BR) — the search
+    # picked frame 22 itself (span 0.25 after raw re-extraction),
+    # giving release_height a denominator 43% smaller than an equally
+    # reachable, genuinely upright frame from the SAME clip. That
+    # single bad denominator, combined with a coach-confirmed wrist
+    # click (which — correctly — bypasses this function's OWN
+    # implausibility ceiling, since the click itself was accurate),
+    # produced a confident 189% "Optimal" reading with nothing to catch
+    # it; the true reference-quality issue was invisible because
+    # nothing here compared candidates against each other, only against
+    # a fixed low floor. Now scans the WHOLE search range and keeps
+    # whichever grounded candidate has the LARGEST span — closer-to-BR
+    # is no longer treated as inherently more trustworthy than further
+    # away, since proximity to a forward-leaning instant is exactly the
+    # wrong signal here.
+    best_row, best_span = None, None
     rows = df[df["frame"] == frame_idx]
-    if not rows.empty and _is_grounded(rows.iloc[0]):
-        return rows.iloc[0]
+    if not rows.empty:
+        span = _grounded_span(rows.iloc[0])
+        if span is not None:
+            best_row, best_span = rows.iloc[0], span
     for offset in range(1, max_search + 1):
         for candidate in (frame_idx - offset, frame_idx + offset):
             rows = df[df["frame"] == candidate]
-            if not rows.empty and _is_grounded(rows.iloc[0]):
-                return rows.iloc[0]
-    return None
+            if rows.empty:
+                continue
+            span = _grounded_span(rows.iloc[0])
+            if span is not None and (best_span is None or span > best_span):
+                best_row, best_span = rows.iloc[0], span
+    return best_row
 
 
 def _compute_segment_sum_body_height(df: pd.DataFrame, bowling_arm: str, search_end_frame: int = None,

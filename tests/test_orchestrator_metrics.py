@@ -686,6 +686,30 @@ class TestFindGroundedReferenceNear:
         ref = o._find_grounded_reference_near(df, frame_idx=10, bowling_arm="right", max_search=3)
         assert ref is None
 
+    def test_prefers_the_largest_span_over_the_closest_passing_frame(self):
+        """REGRESSION (2026-09-25, real coach-reported failure): a
+        bowler's forward lean into the delivery stride compresses the
+        head-ankle span continuously as BR approaches — confirmed
+        directly on a real clip, 0.44 early in the run-up down to 0.28
+        by the release frame itself. The OLD "closest passing frame"
+        search made this the WORST possible failure mode: searching
+        outward from BR, the CLOSEST frame that clears the plausibility
+        floor is systematically the MOST compressed one that still
+        clears it, not a genuinely upright one — even when a much
+        better (larger-span, more upright) frame sits a little further
+        away. Frame 21 (closer to frame_idx=22) has a real but
+        compressed 0.30 span; frame 15 (further away) has a genuinely
+        upright 0.60 span. Must return frame 15, not frame 21, even
+        though frame 21 is nearer and individually still "plausible" by
+        the floor alone."""
+        df = pd.DataFrame([
+            _tracking_row(frame=15, nose_y=0.20, ankle_y=0.80, knee_y=0.70, hip_y=0.55),  # span 0.60
+            _tracking_row(frame=21, nose_y=0.50, ankle_y=0.80, knee_y=0.75, hip_y=0.65),  # span 0.30
+        ])
+        ref = o._find_grounded_reference_near(df, frame_idx=22, bowling_arm="right", max_search=10)
+        assert ref is not None
+        assert ref["frame"] == 15
+
 
 class TestLandmarksCsvPath:
     """Regression test for a real bug found during a broader audit:
