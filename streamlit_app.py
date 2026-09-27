@@ -4821,6 +4821,107 @@ def render_ball_tracking_admin_panel():
     with col_video:
         st.video(web_safe_path)
 
+    _render_ball_speed_estimate(uploaded.name, ref_path, points)
+
+
+def _render_ball_speed_estimate(source_video_filename: str, ref_path: str, points: list):
+    """
+    Stage 3 of the coach's agreed speed/pitch-map roadmap (2026-09-27,
+    see project memory) — only shown when this EXACT clip (matched by
+    filename) has a real, 5-point pitch calibration saved via
+    label_tool.py's calibration flow. Deliberately shows nothing/an
+    explanation instead of a number when that's missing — never
+    fabricates a speed from an uncalibrated clip.
+
+    Deliberately kept in this admin-only panel, not the main coaching
+    report, until the underlying tracker is proven reliable across
+    multiple real clips (same standing gate as the trajectory overlay
+    itself) AND this speed math has been validated against a real,
+    independently-known reference delivery, not just synthetic data.
+    """
+    import cv2
+
+    st.divider()
+    st.subheader("🏏 Ball speed estimate (beta)")
+
+    calib_row = None
+    try:
+        result = (
+            store.get_client().table("ball_tracking_runs")
+            .select("pitch_calibration,frame_width,frame_height")
+            .eq("source_video_filename", source_video_filename)
+            .execute()
+        )
+        if result.data and result.data[0].get("pitch_calibration"):
+            calib_row = result.data[0]
+    except Exception:
+        # A network hiccup here just means "can't show speed right now"
+        # -- the trajectory tracking above already succeeded and stays
+        # visible regardless; this section degrades quietly.
+        st.info("Could not check for a saved calibration right now (connection issue).")
+        return
+
+    calib = calib_row["pitch_calibration"] if calib_row else None
+    if not calib or "near_left_top_px" not in calib:
+        st.info(
+            "No 5-point pitch calibration found for this exact clip yet — speed can't be "
+            "estimated without it. Calibrate this clip in the labeling tool "
+            "(`streamlit run ball_tracking/label_tool.py`, Pitch calibration mode) using "
+            "the SAME filename, then re-upload here."
+        )
+        return
+
+    cap = cv2.VideoCapture(ref_path)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    clip_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+
+    calib_w, calib_h = calib_row.get("frame_width"), calib_row.get("frame_height")
+    if calib_w and calib_h and (calib_w != actual_w or calib_h != actual_h):
+        # A calibration's pixel coordinates are only valid at the exact
+        # resolution they were clicked at -- rather than guess a
+        # rescale is safe (a resize could crop or change aspect ratio,
+        # not just uniformly scale), refuse and say why.
+        st.warning(
+            f"⚠️ This clip's current resolution ({actual_w}x{actual_h}) doesn't match "
+            f"what it was calibrated at ({calib_w}x{calib_h}) — recalibrate at this "
+            f"resolution before trusting a speed estimate here."
+        )
+        return
+
+    from ball_tracking.pitch_calibration import solve_camera_pose, estimate_release_speed_kmh
+    pose = solve_camera_pose(
+        calib["near_left_px"], calib["near_right_px"],
+        calib["far_left_px"], calib["far_right_px"],
+        calib["near_left_top_px"], actual_w, actual_h,
+    )
+    if pose["status"] != "success":
+        st.warning(f"⚠️ {pose['message']}")
+        return
+
+    tracked_points = [(p[0], p[1], p[2]) for p in points]
+    speed_result = estimate_release_speed_kmh(pose, tracked_points, clip_fps)
+    if speed_result["status"] != "success":
+        st.info(f"Could not estimate speed from this tracked run: {speed_result['message']}")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Estimated release speed", f"{speed_result['speed_kmh']:.1f} km/h")
+    col2.metric("Points used", speed_result["num_points"])
+    col3.metric("Fit error (max)", f"{speed_result['max_reprojection_error_px']:.1f}px")
+    if speed_result.get("bounce_frame"):
+        st.caption(f"Bounce detected at frame {speed_result['bounce_frame']} — "
+                   f"only the {speed_result['num_points']} pre-bounce points were used.")
+    st.warning(
+        "⚠️ BETA, not yet validated against a real independently-known reference "
+        "speed — treat as an estimate, not a certified reading. The physics model "
+        "assumes constant gravity-only motion (no swing/seam curvature) and a "
+        "correctly-calibrated camera pose. A high fit error above means the tracked "
+        "points and this physics model don't agree well — trust the number less "
+        "when that happens."
+    )
+
 
 @st.cache_resource
 def _load_ball_tracking_model():
