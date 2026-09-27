@@ -49,6 +49,7 @@ import os
 import sys
 
 import cv2
+import httpx
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw
@@ -61,6 +62,43 @@ def _log(msg: str):
     the coach sees no page reload when it happens. Timestamped so it can be
     correlated against Supabase's created_at on the labels that did save."""
     print(f"[label_tool {datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _run_query(query, action: str):
+    """Executes a Supabase query, catching ONLY a network-layer failure
+    (no internet, DNS lookup failed, connection refused/timed out) —
+    real crash traced directly, 2026-09-27: `httpx.ConnectError:
+    [Errno 11001] getaddrinfo failed` took down the whole label_tool.py
+    process (and whatever unsaved progress was in the current session)
+    while the coach was mid-upload of 47 new clips — bandwidth/DNS
+    contention from that transfer is the likely cause, not a real data
+    problem, and every single Supabase call in this file had zero
+    handling for it before this fix.
+
+    Deliberately narrow: catches httpx.HTTPError (ConnectError,
+    ReadTimeout, etc. all derive from it) and NOTHING else. A genuine
+    Postgres-level error response (missing column, RLS violation, bad
+    payload) is a completely separate exception hierarchy
+    (postgrest.exceptions.APIError) and must keep raising unchanged —
+    see _load_pitch_calibration's own docstring for why a missing-column
+    error deliberately stays loud (so "migration not run yet" is never
+    silently confused with "this clip has no calibration").
+
+    Returns None on a caught network failure. Every call site MUST
+    treat None as "this did not happen" — for a write, that means NOT
+    advancing frame/session state as if the save succeeded, the same
+    "never fabricate success" principle used everywhere else in this
+    project."""
+    try:
+        return query.execute()
+    except httpx.HTTPError as e:
+        st.error(
+            f"⚠️ Lost connection to the database while {action} — nothing was "
+            "saved/changed just now. Check your internet connection and try "
+            "again; everything confirmed before this is safe."
+        )
+        _log(f"NETWORK ERROR while {action}: {e}")
+        return None
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import profile_store as store
@@ -213,16 +251,20 @@ def _discover_videos() -> list:
 def _already_labeled_counts(client) -> dict:
     """How many frames are already stored per clip — lets the picker
     show progress instead of the coach having to remember what they've
-    already done."""
+    already done. A network failure mid-page just stops early and
+    returns whatever was already fetched (degrades to under-counting,
+    never crashes the picker — the coach can just reopen to refresh)."""
     rows = []
     start, page_size = 0, 1000
     while True:
-        result = (
+        result = _run_query(
             client.table("ball_tracking_labels")
             .select("source_video_filename")
-            .range(start, start + page_size - 1)
-            .execute()
+            .range(start, start + page_size - 1),
+            action="loading labeled-clip counts",
         )
+        if result is None:
+            break
         page = result.data or []
         rows.extend(page)
         if len(page) < page_size:
@@ -237,16 +279,19 @@ def _already_labeled_counts(client) -> dict:
 def _last_labeled_frame_index(client, video_name: str):
     """Highest frame_index already saved for this clip, or None. Used to
     resume past work instead of restarting at frame 0 — see the resume
-    logic in main() for why this matters."""
-    result = (
+    logic in main() for why this matters. A network failure also
+    returns None, which the caller already treats as "start from frame
+    0" — the safe, existing fallback, not silent data loss (nothing was
+    actually written here)."""
+    result = _run_query(
         client.table("ball_tracking_labels")
         .select("frame_index")
         .eq("source_video_filename", video_name)
         .order("frame_index", desc=True)
-        .limit(1)
-        .execute()
+        .limit(1),
+        action=f"loading resume position for {video_name}",
     )
-    return result.data[0]["frame_index"] if result.data else None
+    return result.data[0]["frame_index"] if result and result.data else None
 
 
 def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
@@ -266,37 +311,51 @@ def _upsert_run(client, video_name: str, fps: float, frame_w: int, frame_h: int,
     single coach clicking through frames one at a time has no real
     concurrent-write risk here.
     """
-    existing = (
+    # NETWORK FAILURE HANDLING: this is secondary tracking metadata, not
+    # the ground-truth label itself (that already saved successfully in
+    # ball_tracking_labels before this is ever called) — a failure here
+    # degrades to "this run's candidate summary is momentarily behind,"
+    # never lost label data, so it's safe to just warn and return rather
+    # than stop the whole labeling flow.
+    existing = _run_query(
         client.table("ball_tracking_runs")
         .select("id,raw_candidates,frames_with_candidates")
-        .eq("source_video_filename", video_name)
-        .execute()
+        .eq("source_video_filename", video_name),
+        action=f"updating run summary for {video_name}",
     )
+    if existing is None:
+        return
     candidate = {"x_px": x, "y_px": y, "radius_px": radius}
 
     if existing.data:
         row = existing.data[0]
         raw_candidates = row.get("raw_candidates") or {}
         raw_candidates[str(frame_idx)] = candidate
-        client.table("ball_tracking_runs").update({
-            "raw_candidates": raw_candidates,
-            "frames_with_candidates": len(raw_candidates),
-        }).eq("id", row["id"]).execute()
+        _run_query(
+            client.table("ball_tracking_runs").update({
+                "raw_candidates": raw_candidates,
+                "frames_with_candidates": len(raw_candidates),
+            }).eq("id", row["id"]),
+            action=f"updating run summary for {video_name}",
+        )
     else:
-        client.table("ball_tracking_runs").insert({
-            "source_video_filename": video_name,
-            "camera_setup_label": "direct_click_v1",
-            "detector_name": "human_click",
-            "fps": fps,
-            "frame_width": frame_w,
-            "frame_height": frame_h,
-            "total_frames": total_frames,
-            "frames_with_candidates": 1,
-            "raw_candidates": {str(frame_idx): candidate},
-        }).execute()
+        _run_query(
+            client.table("ball_tracking_runs").insert({
+                "source_video_filename": video_name,
+                "camera_setup_label": "direct_click_v1",
+                "detector_name": "human_click",
+                "fps": fps,
+                "frame_width": frame_w,
+                "frame_height": frame_h,
+                "total_frames": total_frames,
+                "frames_with_candidates": 1,
+                "raw_candidates": {str(frame_idx): candidate},
+            }),
+            action=f"creating run summary for {video_name}",
+        )
 
 
-def _save_hard_negative(client, video_name: str, frame_idx: int, category: str):
+def _save_hard_negative(client, video_name: str, frame_idx: int, category: str) -> bool:
     """
     Confirmed hard-negative example: the coach has determined there is NO
     ball in this frame, but a specific lookalike (glove/pad/helmet/other)
@@ -309,15 +368,23 @@ def _save_hard_negative(client, video_name: str, frame_idx: int, category: str):
     image (no matching .txt label) — valid YOLO for "zero objects here,"
     which teaches the model this object is a confirmed non-ball rather
     than simply unseen/unlabeled.
+
+    Returns True on a real save, False on a network failure — this is
+    ground-truth data same as a positive click, so the caller must NOT
+    advance/count a frame this returns False for.
     """
-    client.table("ball_tracking_labels").upsert({
-        "source_video_filename": video_name,
-        "frame_index": frame_idx,
-        "ball_x_px": None,
-        "ball_y_px": None,
-        "labeled_by": "direct_click_v1",
-        "notes": f"HARD NEGATIVE: {category} visible here, coach confirmed no ball in frame.",
-    }, on_conflict="source_video_filename,frame_index").execute()
+    result = _run_query(
+        client.table("ball_tracking_labels").upsert({
+            "source_video_filename": video_name,
+            "frame_index": frame_idx,
+            "ball_x_px": None,
+            "ball_y_px": None,
+            "labeled_by": "direct_click_v1",
+            "notes": f"HARD NEGATIVE: {category} visible here, coach confirmed no ball in frame.",
+        }, on_conflict="source_video_filename,frame_index"),
+        action=f"saving hard-negative frame {frame_idx}",
+    )
+    return result is not None
 
 
 # PITCH CALIBRATION (2026-09-25, real coach request): captures the same
@@ -342,47 +409,65 @@ def _load_pitch_calibration(client, video_name: str):
     or None if it has never been calibrated (or add_pitch_calibration.sql
     hasn't been run yet against this Supabase project — a missing column
     raises a real Postgres error rather than silently returning nothing,
-    so it doesn't look identical to a genuinely un-calibrated clip)."""
-    result = (
+    so it doesn't look identical to a genuinely un-calibrated clip).
+
+    A NETWORK failure (no internet/DNS lookup failed — real crash traced
+    2026-09-27, see _run_query's own docstring) also returns None here,
+    same as "not calibrated yet" — an acceptable degradation since this
+    is read-only display state, not data loss; the coach just sees the
+    calibration UI as if starting fresh and can retry once reconnected."""
+    result = _run_query(
         client.table("ball_tracking_runs")
         .select("pitch_calibration")
-        .eq("source_video_filename", video_name)
-        .execute()
+        .eq("source_video_filename", video_name),
+        action=f"loading calibration for {video_name}",
     )
-    if result.data and result.data[0].get("pitch_calibration"):
+    if result and result.data and result.data[0].get("pitch_calibration"):
         return result.data[0]["pitch_calibration"]
     return None
 
 
 def _save_pitch_calibration(client, video_name: str, fps: float, frame_w: int,
-                             frame_h: int, total_frames: int, calibration: dict):
+                             frame_h: int, total_frames: int, calibration: dict) -> bool:
     """Same read-then-insert-or-update pattern as _upsert_run above (see
     its docstring: ball_tracking_runs has no unique constraint on
     source_video_filename alone, so a plain upsert on that column fails
     outright) — a clip may already have a runs row from ball labeling, a
-    prior calibration, both, or neither."""
-    existing = (
+    prior calibration, both, or neither.
+
+    Returns True on a real save, False on a network failure — the
+    caller must not claim "Saved." when this is False."""
+    existing = _run_query(
         client.table("ball_tracking_runs")
         .select("id")
-        .eq("source_video_filename", video_name)
-        .execute()
+        .eq("source_video_filename", video_name),
+        action=f"saving calibration for {video_name}",
     )
+    if existing is None:
+        return False
     if existing.data:
-        client.table("ball_tracking_runs").update({
-            "pitch_calibration": calibration,
-        }).eq("id", existing.data[0]["id"]).execute()
+        result = _run_query(
+            client.table("ball_tracking_runs").update({
+                "pitch_calibration": calibration,
+            }).eq("id", existing.data[0]["id"]),
+            action=f"saving calibration for {video_name}",
+        )
     else:
-        client.table("ball_tracking_runs").insert({
-            "source_video_filename": video_name,
-            "camera_setup_label": "direct_click_v1",
-            "detector_name": "human_click",
-            "fps": fps,
-            "frame_width": frame_w,
-            "frame_height": frame_h,
-            "total_frames": total_frames,
-            "frames_with_candidates": 0,
-            "pitch_calibration": calibration,
-        }).execute()
+        result = _run_query(
+            client.table("ball_tracking_runs").insert({
+                "source_video_filename": video_name,
+                "camera_setup_label": "direct_click_v1",
+                "detector_name": "human_click",
+                "fps": fps,
+                "frame_width": frame_w,
+                "frame_height": frame_h,
+                "total_frames": total_frames,
+                "frames_with_candidates": 0,
+                "pitch_calibration": calibration,
+            }),
+            action=f"saving calibration for {video_name}",
+        )
+    return result is not None
 
 
 def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
@@ -482,12 +567,15 @@ def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
                 key: list(points[key]) for key, _label in PITCH_CALIBRATION_POINTS
             }
             calibration["reference_frame"] = int(ref_frame_idx)
-            _save_pitch_calibration(client, video_name, fps, orig_w, frame_rgb.shape[0],
-                                     total_frames, calibration)
-            st.session_state[calib_points_key] = {}
-            st.session_state.label_tool_calib_redo = False
-            st.success("Saved.")
-            st.rerun()
+            if _save_pitch_calibration(client, video_name, fps, orig_w, frame_rgb.shape[0],
+                                        total_frames, calibration):
+                st.session_state[calib_points_key] = {}
+                st.session_state.label_tool_calib_redo = False
+                st.success("Saved.")
+                st.rerun()
+            # else: _run_query already showed the network-error message;
+            # the 4 clicked points stay in session_state so "Save
+            # calibration" can just be pressed again once reconnected.
 
 
 def _load_frame(video_path: str, frame_idx: int):
@@ -912,14 +1000,26 @@ def main():
             else:
                 notes = ("Directly clicked by the coach on the original, unmarked frame — "
                          "no drawn marker ever existed on this video's pixels.")
-            client.table("ball_tracking_labels").upsert({
-                "source_video_filename": video_name,
-                "frame_index": frame_idx,
-                "ball_x_px": x,
-                "ball_y_px": y,
-                "labeled_by": "direct_click_v1",
-                "notes": notes,
-            }, on_conflict="source_video_filename,frame_index").execute()
+            saved = _run_query(
+                client.table("ball_tracking_labels").upsert({
+                    "source_video_filename": video_name,
+                    "frame_index": frame_idx,
+                    "ball_x_px": x,
+                    "ball_y_px": y,
+                    "labeled_by": "direct_click_v1",
+                    "notes": notes,
+                }, on_conflict="source_video_filename,frame_index"),
+                action=f"saving frame {frame_idx}",
+            )
+            if saved is None:
+                # NETWORK FAILURE: the click was NOT saved. Stop here —
+                # do not advance the frame pointer, count it, or clear
+                # the pending point, or the coach would silently lose
+                # this frame's label with no visible sign anything went
+                # wrong (the exact "fabricate success" pattern this
+                # project always avoids). The error is already shown by
+                # _run_query; the coach just re-clicks Confirm to retry.
+                st.stop()
             _upsert_run(client, video_name, fps, orig_w, frame_rgb.shape[0], total_frames, frame_idx, x, y, radius)
             # Remembered so the NEXT frame's pre-fill can follow forward
             # from here instead of scanning blind — see the tracked
@@ -948,9 +1048,19 @@ def main():
                 # Both wrote a real ball_tracking_labels row (positive or
                 # hard-negative) for exactly one frame — same undo: delete
                 # that row, un-count it, step back one frame.
-                client.table("ball_tracking_labels").delete().eq(
-                    "source_video_filename", video_name
-                ).eq("frame_index", data).execute()
+                deleted = _run_query(
+                    client.table("ball_tracking_labels").delete().eq(
+                        "source_video_filename", video_name
+                    ).eq("frame_index", data),
+                    action=f"undoing frame {data}",
+                )
+                if deleted is None:
+                    # NETWORK FAILURE: the row is still saved in Supabase.
+                    # Put the history entry back so "Undo last" can be
+                    # retried, and don't touch counts/frame_ptr — they'd
+                    # otherwise drift out of sync with what's actually saved.
+                    st.session_state.label_tool_history.append((action, data))
+                    st.stop()
                 st.session_state.label_tool_counts[video_name] = max(
                     0, st.session_state.label_tool_counts.get(video_name, 1) - 1
                 )
@@ -990,7 +1100,12 @@ def main():
         if st.button("⏭️ No ball visible — skip", use_container_width=True):
             actual_skip = min(skip_n, len(sampled_indices) - ptr)
             if skip_n == 1 and hard_neg_choice != HARD_NEGATIVE_CATEGORIES[0]:
-                _save_hard_negative(client, video_name, frame_idx, hard_neg_choice)
+                if not _save_hard_negative(client, video_name, frame_idx, hard_neg_choice):
+                    # NETWORK FAILURE: nothing was saved — stop here rather
+                    # than advancing past this frame as if it were recorded
+                    # (same "never fabricate success" rule as the main
+                    # confirm button). _run_query already showed the error.
+                    st.stop()
                 st.session_state.label_tool_history.append(("skip_hardneg", frame_idx))
                 st.session_state.label_tool_counts[video_name] = st.session_state.label_tool_counts.get(video_name, 0) + 1
             else:
