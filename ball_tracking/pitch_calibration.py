@@ -349,6 +349,15 @@ def fit_gravity_trajectory(pose: dict, points: list, fps: float) -> dict:
     unknowns): requires at least 8 points, so the fit is genuinely
     overdetermined and residuals mean something.
     """
+    if pose.get("status") != "success":
+        # Real gap found on the first genuine real-clip test (2026-09-27,
+        # IMG_3796.MOV): a failed solve_camera_pose call was being passed
+        # straight through with no check, crashing on pose["focal_length_px"]
+        # (a KeyError, not a helpful message) the first time a real
+        # coach's calibration didn't converge cleanly.
+        return {"status": "error",
+                "message": "Cannot fit a trajectory without a valid camera pose "
+                           "(solve_camera_pose did not succeed)."}
     if len(points) < 8:
         return {"status": "error",
                 "message": f"Need at least 8 real tracked points for a trustworthy fit "
@@ -414,7 +423,27 @@ def fit_gravity_trajectory(pose: dict, points: list, fps: float) -> dict:
 
     result = best_result
     residual_norms = np.sqrt(np.sum(result.fun.reshape(-1, 2) ** 2, axis=1))
+    max_error = float(residual_norms.max())
     x0, y0, z0, vx, vy, vz = result.x
+
+    # SAME GATE AS solve_camera_pose, needed for the identical reason
+    # (2026-09-27, first real-clip test, IMG_3796.MOV): fed the WHOLE
+    # 44-point labeled sequence (including what looks like pre-release
+    # arm-swing motion, not real ball flight) through this fit and it
+    # returned a confident 123 km/h with a mean reprojection error of
+    # 278px, max 396px -- a physically absurd fit result, presented with
+    # the exact same "status": "success" as a genuinely clean one until
+    # this check existed. A trajectory that doesn't actually follow
+    # gravity-only motion (arm swing, or points spanning across an
+    # undetected phase change) shows up as a huge reprojection error,
+    # the same signal solve_camera_pose already uses to catch a bad
+    # calibration click -- this closes the same gap one level up.
+    if max_error > 20.0:
+        return {"status": "error",
+                "message": f"These points don't fit a single, real flight phase well "
+                           f"(worst point off by {max_error:.0f}px) -- likely includes "
+                           f"pre-release motion, a missed bounce, or a tracking error, "
+                           f"not a real gravity-only arc."}
 
     return {
         "status": "success",
@@ -422,7 +451,7 @@ def fit_gravity_trajectory(pose: dict, points: list, fps: float) -> dict:
         "velocity_ms": (float(vx), float(vy), float(vz)),
         "speed_kmh": float(np.hypot(np.hypot(vx, vy), vz) * 3.6),
         "mean_reprojection_error_px": float(residual_norms.mean()),
-        "max_reprojection_error_px": float(residual_norms.max()),
+        "max_reprojection_error_px": max_error,
         "num_points": len(points),
     }
 

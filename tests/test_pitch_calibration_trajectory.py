@@ -117,6 +117,26 @@ def test_fit_gravity_trajectory_is_robust_to_realistic_click_noise():
     assert result["speed_kmh"] == pytest.approx(true_speed_kmh, rel=0.08)
 
 
+def test_fit_gravity_trajectory_rejects_points_that_are_not_one_real_flight_phase():
+    """Real regression test (2026-09-27, IMG_3796.MOV): feeding points
+    that DON'T follow one continuous gravity-only arc (e.g. circular
+    arm-swing motion before release, mixed in with real flight) must be
+    refused, not confidently returned as a physically absurd speed --
+    this is exactly what happened on the first real-clip test, at 278px
+    mean / 396px max reprojection error, before this gate existed."""
+    pose = _synthetic_pose()
+    # Genuine projectile points...
+    points = _projectile_points(pose, 0.0, 0.5, 2.0, 0.5, 35.0, 2.0, 100, FPS, n_frames=8)
+    # ...contaminated with a few points from a completely different,
+    # non-ballistic (circular) motion pattern, mimicking arm-swing noise.
+    contaminated = list(points) + [
+        (116, 500.0, 1200.0), (118, 700.0, 1000.0), (120, 900.0, 1250.0),
+    ]
+    contaminated.sort(key=lambda p: p[0])
+    result = fit_gravity_trajectory(pose, contaminated, FPS)
+    assert result["status"] == "error"
+
+
 def test_fit_gravity_trajectory_requires_minimum_points():
     pose = _synthetic_pose()
     points = _projectile_points(pose, 0.0, 0.5, 2.0, 0.5, 35.0, 2.0, 100, FPS, n_frames=5)
