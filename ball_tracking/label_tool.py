@@ -401,6 +401,15 @@ PITCH_CALIBRATION_POINTS = [
     ("near_right_px", "NEAR stumps — RIGHT edge (base, where it meets the ground)"),
     ("far_left_px", "FAR stumps — LEFT edge (base, where it meets the ground)"),
     ("far_right_px", "FAR stumps — RIGHT edge (base, where it meets the ground)"),
+    # 5th point (2026-09-27, real fix for a real traced bug): a flat
+    # ground-plane homography built from only the 4 base points above
+    # has no way to represent HEIGHT — a ball at head height and one
+    # resting on the pitch project to the same place. This one point,
+    # at a known height above its own base (STUMP_HEIGHT_M), is what
+    # lets pitch_calibration.solve_camera_pose recover a real 3D camera
+    # pose instead — see that function's own docstring, and project
+    # memory, for the IMG_4060.MOV case this was traced from.
+    ("near_left_top_px", "NEAR stumps — LEFT stump TOP (where the wood ends, not the ground)"),
 ]
 
 
@@ -489,17 +498,30 @@ def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
     st.subheader("📐 Pitch calibration (stumps)")
     st.caption(
         "Click the base of each stump line (where the stumps meet the ground, not "
-        "their tips) — near set then far set, left edge then right edge on each. "
-        "Same idea as FullTrack AI's own setup step: line up both sets of stumps."
+        "their tips) — near set then far set, left edge then right edge on each — "
+        "then ONE more click on top of the near-left stump. Same idea as FullTrack "
+        "AI's own setup step (line up both sets of stumps), plus the one extra "
+        "point this app needs to tell a ball in the air apart from one on the ground."
     )
 
     existing = _load_pitch_calibration(client, video_name)
     if existing and not st.session_state.get("label_tool_calib_redo"):
         st.success("✅ This clip already has a saved calibration.")
-        cols = st.columns(4)
+        cols = st.columns(len(PITCH_CALIBRATION_POINTS))
         for col, (key, label) in zip(cols, PITCH_CALIBRATION_POINTS):
             pt = existing.get(key)
             col.metric(label.split(" — ")[1].split(" (")[0], f"{pt}" if pt else "—")
+        if "near_left_top_px" not in existing:
+            # Saved before the stump-top point was added (2026-09-27) —
+            # only has the 4 flat ground points, so it can't feed
+            # pitch_calibration.solve_camera_pose yet (no real 3D pose,
+            # only the old flat/height-blind homography). Flagged here
+            # rather than silently left looking "done."
+            st.warning(
+                "⚠️ This is an older calibration (4 points only) — it can't tell a "
+                "ball in the air from one on the ground yet. Redo it to add the "
+                "5th (stump-top) point."
+            )
         if st.button("🔁 Redo this clip's calibration"):
             st.session_state.label_tool_calib_redo = True
             st.rerun()
@@ -536,7 +558,7 @@ def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
     scale = min(1.0, MAX_DISPLAY_WIDTH / orig_w)
     disp_img = img.resize((int(orig_w * scale), int(frame_rgb.shape[0] * scale)))
     draw = ImageDraw.Draw(disp_img)
-    point_colors = [(255, 60, 60), (60, 200, 60), (60, 140, 255), (255, 200, 0)]
+    point_colors = [(255, 60, 60), (60, 200, 60), (60, 140, 255), (255, 200, 0), (220, 60, 220)]
     for i, (key, _label) in enumerate(PITCH_CALIBRATION_POINTS):
         if key in points:
             px, py = points[key]
@@ -550,6 +572,30 @@ def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
         points[key] = (click["x"] / scale, click["y"] / scale)
         st.rerun()
 
+    ready = len(points) == len(PITCH_CALIBRATION_POINTS)
+    if ready:
+        # Real feedback BEFORE saving, not after — a bad click (most
+        # likely the stump-top point, the hardest to place precisely)
+        # should be caught here, not silently saved and only discovered
+        # later when a speed/pitch-map number comes out wrong.
+        from ball_tracking.pitch_calibration import solve_camera_pose
+        pose_check = solve_camera_pose(
+            points["near_left_px"], points["near_right_px"],
+            points["far_left_px"], points["far_right_px"],
+            points["near_left_top_px"], orig_w, frame_rgb.shape[0],
+        )
+        if pose_check["status"] == "success":
+            st.success(
+                f"✅ Camera pose looks consistent (max point error "
+                f"{pose_check['max_reprojection_error_px']:.1f}px, focal "
+                f"length ~{pose_check['focal_length_px']:.0f}px)."
+            )
+        else:
+            st.warning(
+                f"⚠️ {pose_check['message']} You can still save, but consider "
+                "redoing the stump-top point first."
+            )
+
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("↩️ Undo last point", disabled=not points):
@@ -561,7 +607,6 @@ def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
             st.session_state[calib_points_key] = {}
             st.rerun()
     with col3:
-        ready = len(points) == len(PITCH_CALIBRATION_POINTS)
         if st.button("✅ Save calibration", disabled=not ready, use_container_width=True):
             calibration = {
                 key: list(points[key]) for key, _label in PITCH_CALIBRATION_POINTS
