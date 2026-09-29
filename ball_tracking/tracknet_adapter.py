@@ -38,12 +38,25 @@ def _latest_checkpoint():
 
 
 class _FakeBoxes:
-    """Duck-types ultralytics' Boxes object for exactly the 3 things
-    every call site reads: .xyxy[i], .conf[i], len(boxes)."""
+    """
+    Duck-types ultralytics' real Boxes object -- REAL stacked tensors,
+    not Python lists of tensors. Found and fixed directly (2026-09-29):
+    label_tool.py's whole-frame AI-fallback path calls
+    `boxes.conf.tolist()` on the WHOLE collection (not per-item), which
+    only works if .conf itself is a tensor/array -- a plain Python list
+    has no .tolist() method. Using real tensors here matches ultralytics'
+    actual behavior exactly, including `boxes.conf[i].item()` and
+    `boxes.xyxy[i].tolist()` (indexing a tensor still returns a tensor
+    slice supporting both).
+    """
 
     def __init__(self, xyxy_list, conf_list):
-        self.xyxy = [torch.tensor(b, dtype=torch.float32) for b in xyxy_list]
-        self.conf = [torch.tensor(c, dtype=torch.float32) for c in conf_list]
+        if xyxy_list:
+            self.xyxy = torch.tensor(xyxy_list, dtype=torch.float32)
+            self.conf = torch.tensor(conf_list, dtype=torch.float32)
+        else:
+            self.xyxy = torch.zeros((0, 4), dtype=torch.float32)
+            self.conf = torch.zeros((0,), dtype=torch.float32)
 
     def __len__(self):
         return len(self.xyxy)

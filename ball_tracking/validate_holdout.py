@@ -18,9 +18,21 @@ tracking project memory).
 
 Usage:
     python ball_tracking/validate_holdout.py <video_path> [--model PATH] [--threshold PX]
+        [--architecture {yolo,tracknet}]
 
-If --model is omitted, auto-picks the newest training/runs/*/weights/best.pt
-by modification time (same convention as label_tool.py's AI pre-fill).
+If --model is omitted, auto-picks the newest checkpoint for whichever
+--architecture is selected (default yolo): training/runs/*/weights/best.pt
+for yolo, training/runs_tracknet/*/best.pt for tracknet — same "newest
+by modification time" convention as label_tool.py's AI pre-fill.
+
+ARCHITECTURE-AGNOSTIC COMPARISON (2026-09-29, motion-aware detector
+plan): _load_model() returns either a real ultralytics YOLO object or
+a BallTrackNetAdapter — track_ball_from_seed doesn't need to know or
+care which, since both expose the identical `.predict()` surface. This
+is what makes a fair, apples-to-apples comparison possible: run this
+SAME script, same thresholds, same held-out clips, against both
+checkpoints, and report the real numbers for each — including when the
+new architecture loses (see plan's Success Criteria).
 
 The seed point is the FIRST real ground-truth frame found for this video
 (by filename) rather than something hand-picked, so this script can be
@@ -41,16 +53,24 @@ import profile_store
 from ball_tracking.track_ball_from_seed import track_ball_from_seed
 
 
-def _latest_checkpoint() -> str:
-    candidates = glob.glob(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "training", "runs", "*", "weights", "best.pt")
-    )
+def _latest_checkpoint(architecture: str = "yolo") -> str:
+    training_dir = os.path.dirname(os.path.abspath(__file__))
+    if architecture == "tracknet":
+        pattern = os.path.join(training_dir, "training", "runs_tracknet", "*", "best.pt")
+    else:
+        pattern = os.path.join(training_dir, "training", "runs", "*", "weights", "best.pt")
+    candidates = glob.glob(pattern)
     if not candidates:
-        raise SystemExit(
-            "No trained checkpoint found under ball_tracking/training/runs/*/weights/best.pt "
-            "— pass --model explicitly."
-        )
+        raise SystemExit(f"No trained {architecture} checkpoint found matching {pattern} — pass --model explicitly.")
     return max(candidates, key=os.path.getmtime)
+
+
+def _load_model(model_path: str, architecture: str = "yolo"):
+    if architecture == "tracknet":
+        from ball_tracking.tracknet_adapter import BallTrackNetAdapter
+        return BallTrackNetAdapter(model_path)
+    from ultralytics import YOLO
+    return YOLO(model_path)
 
 
 def _fetch_ground_truth(source_video_filename: str) -> dict:
@@ -80,7 +100,7 @@ def _fetch_ground_truth(source_video_filename: str) -> dict:
 
 
 def validate(video_path: str, model_path: str = None, threshold_px: float = 20.0,
-             max_gap_frames: int = 40, seed_frame: int = None) -> dict:
+             max_gap_frames: int = 40, seed_frame: int = None, architecture: str = "yolo") -> dict:
     """
     Seeds from the first real ground-truth frame for this video's filename
     (or a specific one, via seed_frame, when a recording contains more
@@ -118,9 +138,8 @@ def validate(video_path: str, model_path: str = None, threshold_px: float = 20.0
         cluster_end = f
     max_frames_forward = (cluster_end - seed_frame) + 10
 
-    model_path = model_path or _latest_checkpoint()
-    from ultralytics import YOLO
-    model = YOLO(model_path)
+    model_path = model_path or _latest_checkpoint(architecture)
+    model = _load_model(model_path, architecture)
 
     result = track_ball_from_seed(video_path, seed_frame, seed_xy, model,
                                    max_frames_forward=max_frames_forward)
@@ -150,6 +169,7 @@ def validate(video_path: str, model_path: str = None, threshold_px: float = 20.0
     return {
         "video": filename,
         "model": model_path,
+        "architecture": architecture,
         "seed_frame": seed_frame,
         "seed_xy": seed_xy,
         "cluster_end": cluster_end,
@@ -166,15 +186,20 @@ def validate(video_path: str, model_path: str = None, threshold_px: float = 20.0
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("video_path")
-    parser.add_argument("--model", default=None, help="Path to a YOLO checkpoint; defaults to the newest trained run.")
+    parser.add_argument("--model", default=None, help="Path to a checkpoint; defaults to the newest trained run for --architecture.")
+    parser.add_argument("--architecture", choices=["yolo", "tracknet"], default="yolo",
+                         help="Which detector architecture to load (default yolo). Both satisfy the same "
+                              "track_ball_from_seed interface -- see module docstring.")
     parser.add_argument("--threshold", type=float, default=20.0, help="Pixel distance counted as a hit (default 20).")
     parser.add_argument("--seed-frame", type=int, default=None,
                          help="Use a specific labeled frame as the seed, for recordings with more than one "
                               "labeled delivery (default: the first labeled frame found).")
     args = parser.parse_args()
 
-    r = validate(args.video_path, model_path=args.model, threshold_px=args.threshold, seed_frame=args.seed_frame)
+    r = validate(args.video_path, model_path=args.model, threshold_px=args.threshold,
+                 seed_frame=args.seed_frame, architecture=args.architecture)
     print(f"video: {r['video']}")
+    print(f"architecture: {r['architecture']}")
     print(f"model: {r['model']}")
     print(f"seed: frame={r['seed_frame']} xy={r['seed_xy']}")
     print(f"labeled cluster spans up to frame {r['cluster_end']}")

@@ -197,26 +197,41 @@ HARD_NEGATIVE_CATEGORIES = [
 @st.cache_resource(show_spinner="Loading AI ball detector (one-time)...")
 def _load_yolo_model():
     """
-    Loads the most recently trained YOLO checkpoint to pre-fill the ball
+    Loads the most recently trained checkpoint to pre-fill the ball
     position guess on each frame — the coach reviews/confirms instead of
-    clicking from a blank frame every time. Auto-picks the newest
-    training/runs/*/weights/best.pt by modification time so this never
-    needs updating by hand after a retrain (see training/train_yolo.py).
+    clicking from a blank frame every time.
 
-    Returns None if no trained checkpoint exists yet (e.g. a fresh
-    checkout before the first training run) — the rest of this file
-    treats that as "no pre-fill available," falling back to the
-    original click-from-scratch flow with no error. A pre-fill is a
-    nice-to-have speedup, never a requirement for the tool to work.
+    ARCHITECTURE PREFERENCE (2026-09-29, motion-aware detector plan):
+    prefers a BallTrackNetMini checkpoint (training/runs_tracknet/*/best.pt)
+    if one exists, since it's the real motion-aware upgrade this pre-fill
+    is meant to benefit from; falls back to the existing YOLO checkpoint
+    (training/runs/*/weights/best.pt) otherwise. Both satisfy the exact
+    same `.predict(crop, conf=..., verbose=...)` -> `.boxes.xyxy/.conf`
+    surface (see tracknet_adapter.py), so every call site below this
+    function needs zero changes regardless of which one loads.
+
+    Returns None if NEITHER checkpoint exists yet (e.g. a fresh checkout
+    before any training run) — the rest of this file treats that as "no
+    pre-fill available," falling back to the original click-from-scratch
+    flow with no error. A pre-fill is a nice-to-have speedup, never a
+    requirement for the tool to work.
     """
-    candidates = glob.glob(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "training", "runs", "*", "weights", "best.pt")
-    )
-    if not candidates:
-        _log("No trained checkpoint found under training/runs/*/weights/best.pt — "
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    tracknet_candidates = glob.glob(os.path.join(base_dir, "training", "runs_tracknet", "*", "best.pt"))
+    if tracknet_candidates:
+        latest = max(tracknet_candidates, key=os.path.getmtime)
+        from ball_tracking.tracknet_adapter import BallTrackNetAdapter
+        model = BallTrackNetAdapter(latest)
+        model.predict(np.zeros((640, 640, 3), dtype=np.uint8), conf=0.99, verbose=False)
+        _log(f"AI pre-fill model loaded (tracknet): {latest}")
+        return model
+
+    yolo_candidates = glob.glob(os.path.join(base_dir, "training", "runs", "*", "weights", "best.pt"))
+    if not yolo_candidates:
+        _log("No trained checkpoint found (neither runs_tracknet/ nor training/runs/) — "
              "AI pre-fill disabled, falling back to click-from-scratch.")
         return None
-    latest = max(candidates, key=os.path.getmtime)
+    latest = max(yolo_candidates, key=os.path.getmtime)
 
     from ultralytics import YOLO
     model = YOLO(latest)
@@ -226,7 +241,7 @@ def _load_yolo_model():
     # here at load time (cached for the whole session by st.cache_resource),
     # not on whatever frame the coach happens to land on first.
     model.predict(np.zeros((640, 640, 3), dtype=np.uint8), conf=0.99, verbose=False)
-    _log(f"AI pre-fill model loaded: {latest}")
+    _log(f"AI pre-fill model loaded (yolo): {latest}")
     return model
 
 
