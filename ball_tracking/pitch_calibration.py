@@ -311,6 +311,23 @@ def solve_camera_pose(near_left_px, near_right_px, far_left_px, far_right_px,
                                  method="bounded", options={"xatol": 0.002})
     best_k1 = float(k1_search.x)
 
+    # DISTORTION RELIABILITY CHECK (2026-09-29, real second-clip test,
+    # IMG_3797.MOV): k1 landed at 0.999 -- pinned right at the bound,
+    # not a converged interior value. Traced directly by extending the
+    # search well past the bound: the error kept falling all the way to
+    # k1~5-8 before turning back up -- a "best fit" more than 5x any
+    # physically real phone lens's distortion, the signature of the
+    # extra parameter absorbing measurement noise across just 6 points,
+    # not capturing genuine lens characteristics (the earlier synthetic
+    # test recovers a real k1=-0.12 to a sharp, INTERIOR minimum, unlike
+    # this). A parameter sitting exactly on its search bound is the same
+    # untrustworthy signal already used for a fitted trajectory
+    # parameter (see fit_gravity_trajectory's z0-at-bound finding on
+    # IMG_4060.MOV) -- refuse it here the same way: fall back to k1=0
+    # (pure pinhole) rather than trust a boundary-pinned value.
+    if abs(best_k1) > 0.95:
+        best_k1 = 0.0
+
     def _f_error_at_best_k1(f):
         result = _solve_for_f(float(f), best_k1)
         return result[2] if result is not None else 1e9
@@ -347,6 +364,11 @@ def solve_camera_pose(near_left_px, near_right_px, far_left_px, far_right_px,
         "rvec": rvec, "tvec": tvec, "focal_length_px": best_f, "dist_coeffs": dist,
         "principal_point_px": (cx, cy), "reprojection_error_px": float(per_point_error.mean()),
         "max_reprojection_error_px": max_error,
+        # False when the joint search wanted to pin k1 at its bound and
+        # was overridden back to 0 -- visible to a caller/log rather
+        # than silently swapped, so this specific clip's calibration
+        # can be flagged for a careful redo rather than trusted blind.
+        "distortion_reliable": bool(best_k1 != 0.0 or abs(k1_search.x) <= 0.95),
     }
 
 

@@ -491,6 +491,107 @@ def _save_pitch_calibration(client, video_name: str, fps: float, frame_w: int,
     return result is not None
 
 
+def _zoomable_calib_click(frame_rgb: np.ndarray, points: dict, key_prefix: str):
+    """
+    Zoomable click widget scoped to the calibration flow's own needs (a
+    handful of numbered reference points shown at once). A local,
+    purpose-built port of streamlit_app.py's render_zoomable_click_image
+    -- NOT imported directly, since that module calls
+    st.set_page_config() at import time, which would conflict with this
+    tool's own call (see this file's top-of-module docstring on
+    deliberate isolation from streamlit_app.py). click_widget_state IS
+    safely shared: it was already extracted into its own module with no
+    Streamlit UI code, specifically so logic like this could be tested
+    and reused without importing the whole app.
+
+    ZOOM NOW ENABLED for calibration (2026-09-29, real coach data):
+    render_zoomable_click_image's own docstring records an earlier,
+    deliberate decision to leave calibration at 1x always ("usually a
+    stump, a large target"). That held for the old 4-point flat-
+    homography flow. It stopped holding once solve_camera_pose started
+    needing genuine sub-15px precision across 6 points, including the
+    stump-TOP points -- traced directly on a real clip (IMG_3797.MOV):
+    both near-stump top clicks were off by ~22px, while the far points
+    (a smaller but easier, unambiguous target) were under 1px. That
+    pattern points at click precision on a thin, hard-to-pinpoint edge,
+    not geometry -- exactly the problem zoom solves.
+
+    Returns a click position in ORIGINAL frame_rgb pixel coordinates,
+    or None if nothing was clicked this render.
+    """
+    import click_widget_state
+    from streamlit_image_coordinates import streamlit_image_coordinates
+
+    orig_h, orig_w = frame_rgb.shape[:2]
+    point_colors = [(255, 60, 60), (60, 200, 60), (60, 140, 255), (255, 200, 0),
+                    (220, 60, 220), (60, 220, 220)]
+    extra_markers = [
+        {"point": points[key], "color": point_colors[i], "label": str(i + 1)}
+        for i, (key, _label) in enumerate(PITCH_CALIBRATION_POINTS)
+        if key in points
+    ]
+
+    zoom_options = {"1x (no zoom)": 1.0, "2x": 2.0, "3x": 3.0, "4x": 4.0}
+    zoom_label = st.select_slider(
+        "Zoom", options=list(zoom_options.keys()), value="1x (no zoom)",
+        key=f"{key_prefix}_zoom_level",
+        help="Zoom in for precise clicking — especially the stump-TOP points, "
+             "the hardest to place exactly.",
+    )
+    zoom = zoom_options[zoom_label]
+
+    crop_w = max(1, int(orig_w / zoom))
+    crop_h = max(1, int(orig_h / zoom))
+    if extra_markers:
+        center_x, center_y = extra_markers[-1]["point"]
+    else:
+        center_x, center_y = orig_w // 2, orig_h // 2
+    crop_x0 = max(0, min(orig_w - crop_w, int(center_x - crop_w // 2)))
+    crop_y0 = max(0, min(orig_h - crop_h, int(center_y - crop_h // 2)))
+
+    display_img = Image.fromarray(frame_rgb)
+    draw = ImageDraw.Draw(display_img)
+    r = max(4, orig_w // 150)
+    for m in extra_markers:
+        px, py = m["point"]
+        draw.ellipse((px - r, py - r, px + r, py + r), outline=m["color"], width=3)
+        draw.text((px + r + 4, py - r - 4), m["label"], fill=m["color"])
+
+    if zoom > 1.0:
+        display_img = display_img.crop((crop_x0, crop_y0, crop_x0 + crop_w, crop_y0 + crop_h))
+        st.caption(f"🔍 Zoomed {zoom_label} — click anywhere in this cropped view.")
+
+    crop_disp_w, crop_disp_h = display_img.size
+    max_display_dim = 960
+    downscale = min(1.0, max_display_dim / max(crop_disp_w, crop_disp_h))
+    if downscale < 1.0:
+        display_img = display_img.resize(
+            (max(1, round(crop_disp_w * downscale)), max(1, round(crop_disp_h * downscale))),
+            Image.LANCZOS,
+        )
+
+    # Same stale-click-replay fix as render_zoomable_click_image (see
+    # click_widget_state's own docstring): the widget key must change
+    # whenever the tracked point set changes, even at 1x zoom where the
+    # crop region alone never varies.
+    click_gen = click_widget_state.next_click_generation(st.session_state, key_prefix, None, extra_markers)
+    click_widget_key = f"{key_prefix}_zoomclick_{crop_x0}_{crop_y0}_{crop_w}_{crop_h}_{click_gen}"
+    click = streamlit_image_coordinates(
+        display_img, key=click_widget_key,
+        use_column_width="always", image_format="JPEG", jpeg_quality=80,
+    )
+    if click is None:
+        return None
+
+    rendered_w = click.get("width") or crop_disp_w
+    rendered_h = click.get("height") or crop_disp_h
+    scale_x = crop_disp_w / rendered_w
+    scale_y = crop_disp_h / rendered_h
+    click_x_in_crop = click["x"] * scale_x
+    click_y_in_crop = click["y"] * scale_y
+    return (round(crop_x0 + click_x_in_crop), round(crop_y0 + click_y_in_crop))
+
+
 def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
                                   fps: float, total_frames: int):
     """
@@ -565,27 +666,12 @@ def _render_pitch_calibration_ui(client, video_name: str, video_path: str,
         key, label = PITCH_CALIBRATION_POINTS[next_idx]
         st.info(f"Click: **{label}**")
     else:
-        st.success("All 4 points placed.")
+        st.success("All 6 points placed.")
 
-    from streamlit_image_coordinates import streamlit_image_coordinates
-
-    img = Image.fromarray(frame_rgb)
-    scale = min(1.0, MAX_DISPLAY_WIDTH / orig_w)
-    disp_img = img.resize((int(orig_w * scale), int(frame_rgb.shape[0] * scale)))
-    draw = ImageDraw.Draw(disp_img)
-    point_colors = [(255, 60, 60), (60, 200, 60), (60, 140, 255), (255, 200, 0),
-                    (220, 60, 220), (60, 220, 220)]
-    for i, (key, _label) in enumerate(PITCH_CALIBRATION_POINTS):
-        if key in points:
-            px, py = points[key]
-            dx, dy = px * scale, py * scale
-            draw.ellipse([dx - 6, dy - 6, dx + 6, dy + 6], outline=point_colors[i], width=3)
-            draw.text((dx + 8, dy - 8), str(i + 1), fill=point_colors[i])
-
-    click = streamlit_image_coordinates(disp_img, key=f"label_tool_calib_click_{video_name}_{ref_frame_idx}_{next_idx}")
+    click = _zoomable_calib_click(frame_rgb, points, key_prefix=f"label_tool_calib_{video_name}_{ref_frame_idx}")
     if click is not None and next_idx < len(PITCH_CALIBRATION_POINTS):
         key, _label = PITCH_CALIBRATION_POINTS[next_idx]
-        points[key] = (click["x"] / scale, click["y"] / scale)
+        points[key] = (float(click[0]), float(click[1]))
         st.rerun()
 
     ready = len(points) == len(PITCH_CALIBRATION_POINTS)

@@ -145,6 +145,35 @@ def test_solve_camera_pose_recovers_pose_despite_real_lens_distortion():
     assert result["status"] == "success"
     assert result["max_reprojection_error_px"] < 1.0
     assert result["dist_coeffs"][0] == pytest.approx(true_k1, abs=0.02)
+    assert result["distortion_reliable"] is True
+
+
+def test_solve_camera_pose_rejects_a_boundary_pinned_k1():
+    """Real regression test (2026-09-29, IMG_3797.MOV): the coach's
+    second real calibration solved to k1=0.999 -- pinned right at the
+    search bound, not a converged interior value. Traced directly by
+    extending the search past the bound: error kept improving all the
+    way to k1~5-8, more than 5x any real phone lens's distortion --
+    the model was absorbing ordinary measurement noise across just 6
+    points, not capturing genuine lens characteristics (contrast the
+    OTHER distortion test above, which recovers a real k1=-0.12 to a
+    sharp INTERIOR minimum). A small, non-radial per-side pixel
+    perturbation (mimicking realistic click noise, not a left/right
+    mix-up -- kept below the top/base consistency check's own
+    threshold) reproduces the same boundary-pinning here. Confirms the
+    fix: k1 gets overridden back to 0 rather than trusted, and
+    distortion_reliable reports False so this can be flagged."""
+    true_pose, K = _synthetic_pose()
+    px = _stump_pixels(true_pose, K)
+    px["near_left_px"] = (px["near_left_px"][0] + 2.5, px["near_left_px"][1] - 2.0)
+    px["near_left_top_px"] = (px["near_left_top_px"][0] + 2.5, px["near_left_top_px"][1] - 2.0)
+    px["near_right_px"] = (px["near_right_px"][0] - 2.2, px["near_right_px"][1] + 2.3)
+    px["near_right_top_px"] = (px["near_right_top_px"][0] - 2.2, px["near_right_top_px"][1] + 2.3)
+
+    result = _solve(px)
+    assert result["status"] == "success"
+    assert result["dist_coeffs"][0] == 0.0
+    assert result["distortion_reliable"] is False
 
 
 def test_solve_camera_pose_reports_error_on_inconsistent_points():
