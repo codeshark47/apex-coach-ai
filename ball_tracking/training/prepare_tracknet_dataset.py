@@ -156,6 +156,23 @@ def main():
 
         normalized_path = normalized_video_path(video_path, filename)
         cap = cv2.VideoCapture(normalized_path)
+        # REAL BUG FOUND AND FIXED HERE (2026-09-29, first real dataset-
+        # build run): label positions are stored in the ORIGINAL video's
+        # pixel space (label_tool.py reads native frames, no compression
+        # step -- same fact prepare_dataset.py's own box-label fractions
+        # already account for). This script crops from the COMPRESSED
+        # frames instead, which are usually a DIFFERENT (smaller) size --
+        # using the original dimensions to compute crop boxes against the
+        # compressed frame array produced out-of-bounds boxes that numpy
+        # silently truncated to EMPTY slices, crashing cv2.cvtColor on
+        # the very next call. Fix: rescale every position by the real
+        # compressed/original ratio before any crop math, and clamp
+        # against the COMPRESSED frame's own real dimensions, not the
+        # original's.
+        comp_frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        comp_frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        scale_to_comp_x = comp_frame_w / orig_frame_w
+        scale_to_comp_y = comp_frame_h / orig_frame_h
 
         rows_by_frame = {r["frame_index"]: r for r in rows}
         # Real anchor for hard-negative crops (see _random_crop_box's
@@ -188,7 +205,6 @@ def main():
         prev1, prev2 = None, None  # prev1 = frame N-1, prev2 = frame N-2
         idx = 0
         written_this_clip = 0
-        scale_x = INPUT_SIZE  # placeholder, real scale computed per-crop below
 
         while True:
             ok, frame = cap.read()
@@ -205,14 +221,23 @@ def main():
                 if row["ball_x_px"] is None:
                     anchor = _nearest_real_position(idx)
                     if anchor is not None:
-                        box = _jittered_crop_box(anchor[0], anchor[1], orig_frame_w, orig_frame_h)
+                        # Anchor is in ORIGINAL pixel space -- rescale to
+                        # the compressed frame's own space before any
+                        # crop math (see the scale_to_comp comment above).
+                        ax = anchor[0] * scale_to_comp_x
+                        ay = anchor[1] * scale_to_comp_y
+                        box = _jittered_crop_box(ax, ay, comp_frame_w, comp_frame_h)
                     else:
-                        box = _random_crop_box(orig_frame_w, orig_frame_h)
+                        box = _random_crop_box(comp_frame_w, comp_frame_h)
                     heatmap = np.zeros((INPUT_SIZE, INPUT_SIZE), dtype=np.float32)
                     total_hard_neg += 1
                 else:
-                    x, y = row["ball_x_px"], row["ball_y_px"]
-                    box = _jittered_crop_box(x, y, orig_frame_w, orig_frame_h)
+                    # Rescale from ORIGINAL to COMPRESSED pixel space --
+                    # the actual fix for the crash found on this run's
+                    # first real attempt (see comment above).
+                    x = row["ball_x_px"] * scale_to_comp_x
+                    y = row["ball_y_px"] * scale_to_comp_y
+                    box = _jittered_crop_box(x, y, comp_frame_w, comp_frame_h)
                     x1, y1, x2, y2 = box
                     # Map the true position into the RESIZED output
                     # space for the heatmap target -- must use the same
@@ -224,6 +249,17 @@ def main():
                     out_x = (x - x1) * INPUT_SIZE / (x2 - x1)
                     out_y = (y - y1) * INPUT_SIZE / (y2 - y1)
                     heatmap = _make_heatmap(INPUT_SIZE, out_x, out_y, HEATMAP_SIGMA)
+
+                # Defensive: skip rather than crash on a genuinely
+                # degenerate crop (e.g. a label sitting exactly on a
+                # compressed frame's edge after rescaling) -- one bad
+                # frame should never take down the whole dataset build.
+                bx1, by1, bx2, by2 = box
+                if bx2 <= bx1 or by2 <= by1:
+                    print(f"  SKIP frame {idx} of {safe_filename[:40]}: degenerate crop box {box}")
+                    idx += 1
+                    prev2, prev1 = prev1, frame
+                    continue
 
                 stack = np.stack([
                     _crop_gray_resized(frame, box, INPUT_SIZE),

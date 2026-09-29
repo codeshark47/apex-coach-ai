@@ -57,6 +57,11 @@ ball_tracking/training/dataset/
 ball_tracking/training/runs/
 ball_tracking/training/*.pt
 
+# Same reasoning, for BallTrackNet-mini's multi-frame/heatmap dataset
+# and its own training runs directory (see project plan)
+ball_tracking/training/tracknet_dataset/
+ball_tracking/training/runs_tracknet/
+
 # Pretrained COCO checkpoint — auto-downloaded by ultralytics on first
 # YOLO('yolov8n.pt') call into whatever the cwd happened to be; same
 # reasoning as models/ above, doesn't need to live in git

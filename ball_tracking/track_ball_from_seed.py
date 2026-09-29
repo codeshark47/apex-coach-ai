@@ -421,6 +421,23 @@ def track_ball_from_seed(
     walk_start_xy = (float(second_seed_xy[0]), float(second_seed_xy[1])) if use_two_point_seed else (float(seed_xy[0]), float(seed_xy[1]))
     recent_real_positions = [(walk_start_frame, walk_start_xy[0], walk_start_xy[1])]  # rolling window, see stagnation docstring
 
+    # TEMPORAL CONTEXT (2026-09-29, motion-aware detector plan): retained
+    # so a detector that opts in (BallTrackNetAdapter.USES_TEMPORAL_CONTEXT)
+    # can see the ball's own motion trail across frames, which a
+    # single-frame detector structurally cannot. Primed with real frames
+    # from BEFORE the walk starts (not padded) so temporal context is
+    # genuine from the very first tracked frame, matching
+    # prepare_tracknet_dataset.py's own "pad only at genuine clip start"
+    # rule. Purely additive: an ordinary ultralytics YOLO object has no
+    # USES_TEMPORAL_CONTEXT attribute, so this changes nothing for it.
+    def _read_frame_at(idx):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, f = cap.read()
+        return f if ok else None
+
+    prev_frame_1 = _read_frame_at(walk_start_frame) if walk_start_frame >= 0 else None
+    prev_frame_2 = _read_frame_at(walk_start_frame - 1) if walk_start_frame - 1 >= 0 else prev_frame_1
+
     end_frame = min(total_frames - 1, walk_start_frame + max_frames_forward)
     for frame_idx in range(walk_start_frame + 1, end_frame + 1):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -504,7 +521,18 @@ def track_ball_from_seed(
             # feeding it an RGB-converted frame by mistake, silently
             # swapping red/blue for every prediction. Reading directly
             # via cv2 above already keeps this in BGR, unchanged.
-            results = yolo_model.predict(crop, conf=conf_threshold, verbose=False)
+            predict_kwargs = {"conf": conf_threshold, "verbose": False}
+            if getattr(yolo_model, "USES_TEMPORAL_CONTEXT", False):
+                # SAME crop box as the current frame, sliced from the
+                # retained PREVIOUS real frames — same field of view,
+                # different points in time, exactly what a motion-aware
+                # detector needs (see prepare_tracknet_dataset.py's
+                # identical "same box, different time" design).
+                predict_kwargs["prev_crops"] = [
+                    prev_frame_1[y1:y2, x1:x2] if prev_frame_1 is not None else None,
+                    prev_frame_2[y1:y2, x1:x2] if prev_frame_2 is not None else None,
+                ]
+            results = yolo_model.predict(crop, **predict_kwargs)
             boxes = results[0].boxes
             candidates = []
             for i in range(len(boxes)):
@@ -722,6 +750,13 @@ def track_ball_from_seed(
             # iteration's pred_x/pred_y and expected_size both extrapolate
             # fresh from their fixed anchors over the growing elapsed
             # count, see above (same principle applied to both now).
+
+        # Rotate the temporal-context buffer regardless of hit/miss —
+        # see the priming comment above this loop. Every frame actually
+        # decoded becomes "the previous frame" for the next iteration,
+        # independent of whether the ball was found in it.
+        prev_frame_2 = prev_frame_1
+        prev_frame_1 = frame_bgr
 
     cap.release()
     return {"status": "success", "points": points}
