@@ -191,6 +191,15 @@ HARD_NEGATIVE_CATEGORIES = [
     "No — just skip",
     "Glove", "Pad/guard", "Helmet", "Other shiny/round object",
     "Shoe", "Net/fence", "Pole/post", "Head", "Elbow/knee",
+    # ADDED 2026-09-29, real coach-named gap (BallTrackNet-mini plan):
+    # 136 of 162 existing hard negatives fell into the generic "Other"
+    # bucket, with NO category specifically covering fingers/hand, pitch
+    # surface texture, or a spectator/fan — the coach's own named list of
+    # what still fools the model. Real labeled examples of exactly these,
+    # going forward, is what actually teaches the model to reject them
+    # (per this whole file's established history — a generic bucket
+    # doesn't give the model anything specific to learn against).
+    "Hand/finger", "Pitch/ground texture", "Spectator/fan",
 ]
 
 
