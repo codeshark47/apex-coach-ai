@@ -102,6 +102,7 @@ def _run_query(query, action: str):
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import profile_store as store
+import click_widget_state
 from ball_tracking.track_ball_from_seed import track_ball_from_seed
 
 st.set_page_config(page_title="Ball Labeling Tool", layout="wide")
@@ -519,7 +520,6 @@ def _zoomable_calib_click(frame_rgb: np.ndarray, points: dict, key_prefix: str):
     Returns a click position in ORIGINAL frame_rgb pixel coordinates,
     or None if nothing was clicked this render.
     """
-    import click_widget_state
     from streamlit_image_coordinates import streamlit_image_coordinates
 
     orig_h, orig_w = frame_rgb.shape[:2]
@@ -1095,7 +1095,24 @@ def main():
         st.rerun()
 
     display_img, scale = _display_image_with_marker(frame_rgb, pending_point, radius, marker_color)
-    click = streamlit_image_coordinates(display_img, key=f"label_tool_click_{video_name}_{frame_idx}")
+    # STALE-CLICK-REPLAY FIX (2026-09-29, real coach report: clicking the
+    # real ball kept "going back" to a wrong AI pre-fill on the bowler's
+    # head, with no way to make a correction stick) -- this widget's key
+    # never changed for a given frame regardless of how many times the
+    # marker moved (AI pre-fill -> coach correction -> another
+    # correction), so Streamlit could replay an earlier click's stale
+    # value instead of registering a new one. Exact same bug class
+    # already found and fixed today for the calibration click widget
+    # (see click_widget_state's own docstring) -- same fix here: fold a
+    # generation counter into the key so it changes every time the
+    # tracked point actually changes, forcing a genuinely fresh widget
+    # instance each time.
+    click_gen = click_widget_state.next_click_generation(
+        st.session_state, f"label_tool_click_{video_name}_{frame_idx}", pending_point, []
+    )
+    click = streamlit_image_coordinates(
+        display_img, key=f"label_tool_click_{video_name}_{frame_idx}_{click_gen}"
+    )
 
     if click is not None:
         new_point = (click["x"] / scale, click["y"] / scale)
