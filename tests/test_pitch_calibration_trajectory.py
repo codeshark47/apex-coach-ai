@@ -57,7 +57,8 @@ def _synthetic_pose():
     solved = solve_camera_pose(
         proj(-half_w, 0, 0), proj(half_w, 0, 0),
         proj(-half_w, PITCH_LENGTH_M, 0), proj(half_w, PITCH_LENGTH_M, 0),
-        proj(-half_w, 0, STUMP_HEIGHT_M), IMAGE_W, IMAGE_H,
+        proj(-half_w, 0, STUMP_HEIGHT_M), proj(half_w, 0, STUMP_HEIGHT_M),
+        IMAGE_W, IMAGE_H,
     )
     assert solved["status"] == "success"
     return solved

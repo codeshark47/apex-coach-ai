@@ -4862,9 +4862,9 @@ def _render_ball_speed_estimate(source_video_filename: str, ref_path: str, point
         return
 
     calib = calib_row["pitch_calibration"] if calib_row else None
-    if not calib or "near_left_top_px" not in calib:
+    if not calib or "near_left_top_px" not in calib or "near_right_top_px" not in calib:
         st.info(
-            "No 5-point pitch calibration found for this exact clip yet — speed can't be "
+            "No 6-point pitch calibration found for this exact clip yet — speed can't be "
             "estimated without it. Calibrate this clip in the labeling tool "
             "(`streamlit run ball_tracking/label_tool.py`, Pitch calibration mode) using "
             "the SAME filename, then re-upload here."
@@ -4894,7 +4894,7 @@ def _render_ball_speed_estimate(source_video_filename: str, ref_path: str, point
     pose = solve_camera_pose(
         calib["near_left_px"], calib["near_right_px"],
         calib["far_left_px"], calib["far_right_px"],
-        calib["near_left_top_px"], actual_w, actual_h,
+        calib["near_left_top_px"], calib["near_right_top_px"], actual_w, actual_h,
     )
     if pose["status"] != "success":
         st.warning(f"⚠️ {pose['message']}")

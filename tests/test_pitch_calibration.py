@@ -47,30 +47,35 @@ def _synthetic_pose(true_f=1600.0, camera_height=1.5, camera_back=4.0):
             "focal_length_px": true_f, "principal_point_px": (cx, cy)}, K
 
 
-def _project(true_pose, K, x_m, y_m, z_m):
+def _project(true_pose, K, x_m, y_m, z_m, dist=None):
     pt = np.array([[[x_m, y_m, z_m]]], dtype=np.float64)
-    proj, _ = cv2.projectPoints(pt, true_pose["rvec"], true_pose["tvec"], K, None)
+    proj, _ = cv2.projectPoints(pt, true_pose["rvec"], true_pose["tvec"], K, dist)
     return float(proj[0, 0, 0]), float(proj[0, 0, 1])
 
 
-def _stump_pixels(true_pose, K):
+def _stump_pixels(true_pose, K, dist=None):
     half_w = STUMP_LINE_WIDTH_M / 2
     return {
-        "near_left_px": _project(true_pose, K, -half_w, 0.0, 0.0),
-        "near_right_px": _project(true_pose, K, half_w, 0.0, 0.0),
-        "far_left_px": _project(true_pose, K, -half_w, PITCH_LENGTH_M, 0.0),
-        "far_right_px": _project(true_pose, K, half_w, PITCH_LENGTH_M, 0.0),
-        "near_left_top_px": _project(true_pose, K, -half_w, 0.0, STUMP_HEIGHT_M),
+        "near_left_px": _project(true_pose, K, -half_w, 0.0, 0.0, dist),
+        "near_right_px": _project(true_pose, K, half_w, 0.0, 0.0, dist),
+        "far_left_px": _project(true_pose, K, -half_w, PITCH_LENGTH_M, 0.0, dist),
+        "far_right_px": _project(true_pose, K, half_w, PITCH_LENGTH_M, 0.0, dist),
+        "near_left_top_px": _project(true_pose, K, -half_w, 0.0, STUMP_HEIGHT_M, dist),
+        "near_right_top_px": _project(true_pose, K, half_w, 0.0, STUMP_HEIGHT_M, dist),
     }
+
+
+def _solve(px, image_w=IMAGE_W, image_h=IMAGE_H):
+    return solve_camera_pose(
+        px["near_left_px"], px["near_right_px"], px["far_left_px"], px["far_right_px"],
+        px["near_left_top_px"], px["near_right_top_px"], image_w, image_h,
+    )
 
 
 def test_solve_camera_pose_recovers_a_consistent_pose_from_synthetic_stumps():
     true_pose, K = _synthetic_pose()
     px = _stump_pixels(true_pose, K)
-    result = solve_camera_pose(
-        px["near_left_px"], px["near_right_px"], px["far_left_px"], px["far_right_px"],
-        px["near_left_top_px"], IMAGE_W, IMAGE_H,
-    )
+    result = _solve(px)
     assert result["status"] == "success"
     assert result["reprojection_error_px"] < 1.0
     # Focal length should be recovered close to the true synthetic value.
@@ -83,10 +88,7 @@ def test_solved_pose_correctly_distinguishes_ground_from_elevated_points():
     pixel — a solved 3D pose must not do that."""
     true_pose, K = _synthetic_pose()
     px = _stump_pixels(true_pose, K)
-    pose = solve_camera_pose(
-        px["near_left_px"], px["near_right_px"], px["far_left_px"], px["far_right_px"],
-        px["near_left_top_px"], IMAGE_W, IMAGE_H,
-    )
+    pose = _solve(px)
     assert pose["status"] == "success"
 
     # A ball at real-world (0m sideways, 10m down the pitch), at two
@@ -99,10 +101,7 @@ def test_solved_pose_correctly_distinguishes_ground_from_elevated_points():
 def test_pixel_to_ground_at_height_recovers_the_true_3d_point():
     true_pose, K = _synthetic_pose()
     px = _stump_pixels(true_pose, K)
-    pose = solve_camera_pose(
-        px["near_left_px"], px["near_right_px"], px["far_left_px"], px["far_right_px"],
-        px["near_left_top_px"], IMAGE_W, IMAGE_H,
-    )
+    pose = _solve(px)
     assert pose["status"] == "success"
 
     true_x, true_y, true_z = 0.05, 12.3, 0.8
@@ -118,10 +117,7 @@ def test_pixel_to_ground_at_height_agrees_with_flat_homography_at_ground_level()
     strict generalization, not a different method."""
     true_pose, K = _synthetic_pose()
     px = _stump_pixels(true_pose, K)
-    pose = solve_camera_pose(
-        px["near_left_px"], px["near_right_px"], px["far_left_px"], px["far_right_px"],
-        px["near_left_top_px"], IMAGE_W, IMAGE_H,
-    )
+    pose = _solve(px)
     assert pose["status"] == "success"
 
     H = build_ground_homography(px["near_left_px"], px["near_right_px"],
@@ -136,14 +132,48 @@ def test_pixel_to_ground_at_height_agrees_with_flat_homography_at_ground_level()
     assert y_3d == pytest.approx(y_flat, abs=0.05)
 
 
+def test_solve_camera_pose_recovers_pose_despite_real_lens_distortion():
+    """A real, moderate lens-distortion magnitude, baked into the
+    synthetic points the same way a real lens would, must still be
+    recovered accurately by the joint (focal length, k1) search."""
+    true_pose, K = _synthetic_pose()
+    true_k1 = -0.12  # a real, moderate barrel-distortion magnitude
+    true_dist = np.array([true_k1, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    px = _stump_pixels(true_pose, K, dist=true_dist)
+
+    result = _solve(px)
+    assert result["status"] == "success"
+    assert result["max_reprojection_error_px"] < 1.0
+    assert result["dist_coeffs"][0] == pytest.approx(true_k1, abs=0.02)
+
+
 def test_solve_camera_pose_reports_error_on_inconsistent_points():
     true_pose, K = _synthetic_pose()
     px = _stump_pixels(true_pose, K)
     # Corrupt the stump-top click badly (as if mis-clicked far from the
     # real stump top) -- no focal length should reproject this well.
-    bad_top = (px["near_left_top_px"][0] + 400, px["near_left_top_px"][1] + 400)
-    result = solve_camera_pose(
-        px["near_left_px"], px["near_right_px"], px["far_left_px"], px["far_right_px"],
-        bad_top, IMAGE_W, IMAGE_H,
-    )
+    px["near_left_top_px"] = (px["near_left_top_px"][0] + 400, px["near_left_top_px"][1] + 400)
+    result = _solve(px)
     assert result["status"] == "error"
+
+
+def test_solve_camera_pose_catches_a_real_left_right_mixup():
+    """Real regression test (2026-09-27, IMG_3796.MOV): the coach
+    mislabeled which near stump was "left" vs "right" -- an easy,
+    understandable mistake, not carelessness. With only one top point
+    (the original design), this was invisible to the reprojection
+    check: it silently paired the surviving top click with the WRONG
+    base, still reprojected well enough to look fixed, then produced a
+    physically absurd downstream speed (~16 km/h, moving almost
+    straight up/down). Requiring both stumps' tops catches this
+    directly and explainably, rather than a mysterious high error."""
+    true_pose, K = _synthetic_pose()
+    px = _stump_pixels(true_pose, K)
+    # Swap only the BASE points -- exactly the coach's real mistake --
+    # while both top points stay correctly paired with their real base.
+    swapped = dict(px)
+    swapped["near_left_px"], swapped["near_right_px"] = px["near_right_px"], px["near_left_px"]
+
+    result = _solve(swapped)
+    assert result["status"] == "error"
+    assert "left/right" in result["message"].lower()

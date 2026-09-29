@@ -132,117 +132,219 @@ def estimate_speed_kmh(homography, points, fps):
 # ---------------------------------------------------------------------------
 
 def _stump_object_points(half_w: float) -> np.ndarray:
-    """The 5 known real-world points (meters), same axes as
+    """The 6 known real-world points (meters), same axes as
     build_ground_homography (X sideways from centerline, Y down-pitch
     from the near stumps, Z height above ground) — 4 at ground level
-    plus the near-left stump's TOP, the one point that isn't."""
+    plus BOTH near stumps' TOPs (2026-09-27: originally just the
+    near-left top; upgraded to both after a real coach mistake on
+    IMG_3796.MOV showed why one alone isn't enough — see
+    _check_top_point_assignment's docstring)."""
     return np.array([
         [-half_w, 0.0, 0.0],
         [half_w, 0.0, 0.0],
         [-half_w, PITCH_LENGTH_M, 0.0],
         [half_w, PITCH_LENGTH_M, 0.0],
         [-half_w, 0.0, STUMP_HEIGHT_M],
+        [half_w, 0.0, STUMP_HEIGHT_M],
     ], dtype=np.float64)
+
+
+def _check_top_point_assignment(near_left_px, near_right_px, near_left_top_px, near_right_top_px):
+    """
+    Real bug this catches (2026-09-27, IMG_3796.MOV): the coach's near-
+    stump BASE clicks were mislabeled left/right (an easy, understandable
+    mistake — camera-left vs. screen-left is genuinely ambiguous). This
+    was NOT caught by the reprojection-error gate alone: swapping just
+    the two base pixel VALUES while leaving the single top point
+    attached to whichever argument slot it was in silently created a
+    NEW, physically inconsistent correspondence (a "top" click paired
+    with a base click from a DIFFERENT physical stump) that still
+    numerically reprojected well enough to pass — then produced a
+    physically absurd trajectory fit downstream (a delivery moving
+    almost straight up/down, ~16 km/h) once applied to real tracked ball
+    points far from the calibration region. A single top point has no
+    way to catch this; it can only ever be paired one way.
+
+    Real fix: require BOTH near stumps' tops (this function), and check
+    the one thing that's true regardless of any left/right labeling
+    mistake — each top point must be closer to its OWN base than to the
+    other stump's base (a stump doesn't lean sideways by more than its
+    own base-to-base separation). Returns an error message if not, or
+    None if consistent. This makes the whole calibration self-checking
+    instead of trusting the coach's semantic "which one is left"
+    judgment at all.
+    """
+    def _dist(a, b):
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+    left_top_to_left = _dist(near_left_top_px, near_left_px)
+    left_top_to_right = _dist(near_left_top_px, near_right_px)
+    right_top_to_right = _dist(near_right_top_px, near_right_px)
+    right_top_to_left = _dist(near_right_top_px, near_left_px)
+
+    problems = []
+    if left_top_to_right < left_top_to_left:
+        problems.append("the near-LEFT stump-top click is closer to the near-RIGHT base than its own base")
+    if right_top_to_left < right_top_to_right:
+        problems.append("the near-RIGHT stump-top click is closer to the near-LEFT base than its own base")
+    if problems:
+        return ("Likely left/right mix-up on the near stumps: " + "; ".join(problems) +
+                ". Redo the near stump clicks (base AND top), making sure each top is "
+                "directly above its own base.")
+    return None
 
 
 def solve_camera_pose(near_left_px, near_right_px, far_left_px, far_right_px,
-                       near_left_top_px, image_width: int, image_height: int) -> dict:
+                       near_left_top_px, near_right_top_px,
+                       image_width: int, image_height: int) -> dict:
     """
     Solves the camera's real 3D position and angle from the same 4
-    stump-base points build_ground_homography uses, PLUS the top of the
-    near-left stump — the one piece of information a flat ground-plane
+    stump-base points build_ground_homography uses, PLUS the tops of
+    BOTH near stumps — the height information a flat ground-plane
     homography structurally cannot have (see this module's own
-    "HONEST LIMITATION" docstring at the top of the file). With a real
-    point at a second, known height, the pose is no longer ambiguous,
+    "HONEST LIMITATION" docstring at the top of the file). With real
+    points at a second, known height, the pose is no longer ambiguous,
     and a real ball position ABOVE the ground can finally be told apart
     from one resting on it.
 
-    Assumes a standard pinhole camera with square pixels and the
-    principal point at the image center — a reasonable approximation
-    for an uncalibrated phone camera (a full checkerboard calibration
-    would be more precise but needs physical equipment this app's
-    filming setup doesn't use). Focal length is NOT assumed or
-    hand-measured: it's solved directly, via a 1D search for whichever
-    focal length makes cv2.solvePnP's recovered rotation/translation
-    reproject all 5 real points back onto where they were actually
-    clicked with the least error. This is the same self-consistent-
-    solve principle already validated by hand in the project's
-    2026-08-15 calibration-precision investigation (see project
-    memory) — automated here, and extended from one depth number to a
-    full camera pose.
+    UPGRADED FROM ONE TOP POINT TO TWO (2026-09-27, real coach mistake,
+    IMG_3796.MOV): the coach's near-stump BASE clicks were mislabeled
+    left/right — an easy, understandable mistake (camera-left vs.
+    screen-left is genuinely ambiguous), not carelessness. With only
+    ONE top point, this was invisible to the reprojection-error check:
+    swapping which base pixel occupied the "near_left"/"near_right"
+    argument slots, while the single top point stayed fixed in its
+    slot, silently created a NEW correspondence pairing that top with a
+    DIFFERENT physical stump than it was actually clicked on — still
+    numerically reprojected well enough to look "fixed" (17.5px -> 8px),
+    then produced a physically absurd trajectory fit downstream (a
+    delivery reading ~16 km/h, moving almost straight up/down) once
+    applied to real tracked ball points far from the calibration
+    region. (An earlier version of this function also chased a lens-
+    distortion explanation for the original error pattern — direct
+    testing showed error barely changing across the whole plausible
+    k1 range, meaning distortion was NOT the real cause; the left/right
+    mix-up was. That distortion term is kept — see below — because
+    it's real and free, not because it explains this specific incident.)
+
+    Requiring BOTH tops removes the ambiguity structurally: each top
+    point must be closer to ITS OWN base than to the other stump's base
+    (checked directly, see _check_top_point_assignment) — a hard,
+    explainable, unmissable check that doesn't depend on trusting
+    anyone's left/right semantic judgment at all.
+
+    Assumes square pixels and the principal point at the image center —
+    a reasonable approximation for an uncalibrated phone camera (a full
+    checkerboard calibration would be more precise but needs physical
+    equipment this app's filming setup doesn't use). Focal length and
+    ONE radial lens-distortion term (k1) are NOT assumed or hand-
+    measured: both are solved via a nested search for whichever (focal
+    length, k1) pair makes cv2.solvePnP's recovered rotation/translation
+    reproject all 6 real points back onto where they were actually
+    clicked with the least error — the same self-consistent-solve
+    principle already validated by hand in the project's 2026-08-15
+    calibration-precision investigation (see project memory).
 
     Returns {"status": "success", "rvec", "tvec", "focal_length_px",
-    "principal_point_px", "reprojection_error_px" (mean), and
-    "max_reprojection_error_px"}, or {"status": "error", "message":
-    ...} if any single one of the 5 points can't be reprojected within
-    15px. MAX, not mean, gates acceptance — confirmed directly that a
-    single badly mis-clicked point (e.g. the stump-top, off by 400px)
-    barely moves the mean across all 5 points, since the 4 coplanar
-    ground points alone can still fit almost any focal length; only
-    the max reliably catches it.
+    "dist_coeffs" (shape (5,), only k1 nonzero), "principal_point_px",
+    "reprojection_error_px" (mean), "max_reprojection_error_px"}, or
+    {"status": "error", "message": ...} if the top-point consistency
+    check fails, or any single one of the 6 points still can't be
+    reprojected within 15px even with distortion allowed for. MAX, not
+    mean, gates the reprojection check — confirmed directly that a
+    single badly mis-clicked point barely moves the mean across 6
+    points (the 4 coplanar ground points alone can still fit almost any
+    focal length/distortion), but always dominates the max.
     """
+    consistency_problem = _check_top_point_assignment(
+        near_left_px, near_right_px, near_left_top_px, near_right_top_px)
+    if consistency_problem:
+        return {"status": "error", "message": consistency_problem}
+
     half_w = STUMP_LINE_WIDTH_M / 2
     object_points = _stump_object_points(half_w)
     image_points = np.array([
-        near_left_px, near_right_px, far_left_px, far_right_px, near_left_top_px,
+        near_left_px, near_right_px, far_left_px, far_right_px,
+        near_left_top_px, near_right_top_px,
     ], dtype=np.float64)
     cx, cy = image_width / 2.0, image_height / 2.0
 
-    def _reprojection_error(f):
-        f = float(f)
+    def _solve_for_f(f, k1):
         if f <= 0:
-            return 1e9
+            return None
         K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
-        # EPNP, not the (default) ITERATIVE flag: this project's 5-point
-        # set mixes 4 coplanar (ground) points with 1 non-coplanar
-        # (stump-top) point, and OpenCV's ITERATIVE solver's own DLT
-        # initial-guess step refuses anything under 6 points for that
-        # mixed case (confirmed directly — it raises, not a tuning
-        # choice). EPNP handles any n>=4 point configuration, planar or
-        # not, which is exactly this case.
-        ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, None,
+        dist = np.array([k1, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        # EPNP, not the (default) ITERATIVE flag: this project's 6-point
+        # set mixes 4 coplanar (ground) points with 2 non-coplanar
+        # (stump-top) points. EPNP handles any n>=4 point configuration,
+        # planar or not, without the ITERATIVE flag's own DLT initial-
+        # guess restrictions on mixed coplanar/non-coplanar sets.
+        ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist,
                                        flags=cv2.SOLVEPNP_EPNP)
         if not ok:
-            return 1e9
-        projected, _ = cv2.projectPoints(object_points, rvec, tvec, K, None)
-        return float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2) - image_points) ** 2, axis=1))))
+            return None
+        projected, _ = cv2.projectPoints(object_points, rvec, tvec, K, dist)
+        error = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2) - image_points) ** 2, axis=1))))
+        return rvec, tvec, error
 
-    # A broad, physically plausible search range rather than assuming a
-    # focal length — real phone lenses at typical resolutions land well
-    # inside [0.3x, 4x] image width for any normal (non-fisheye,
-    # non-telephoto) lens.
-    search = minimize_scalar(
-        _reprojection_error, bounds=(0.3 * image_width, 4.0 * image_width),
-        method="bounded", options={"xatol": 1.0},
-    )
-    best_f, best_rms_error = float(search.x), float(search.fun)
+    def _best_error_for_k1(k1):
+        def _f_error(f):
+            result = _solve_for_f(float(f), k1)
+            return result[2] if result is not None else 1e9
+        # A broad, physically plausible search range rather than
+        # assuming a focal length — real phone lenses at typical
+        # resolutions land well inside [0.3x, 4x] image width for any
+        # normal (non-fisheye, non-telephoto) lens.
+        search = minimize_scalar(_f_error, bounds=(0.3 * image_width, 4.0 * image_width),
+                                  method="bounded", options={"xatol": 1.0})
+        return search.fun
 
+    # NESTED search: for every candidate k1 tried by the outer search,
+    # the inner search (_best_error_for_k1 -> _f_error) already finds
+    # the genuinely best focal length for THAT k1 — so the outer search
+    # is optimizing a well-defined 1D function of k1 alone, a valid way
+    # to jointly solve two variables via two nested 1D searches instead
+    # of one 2D one. |k1| > 1 would be an extreme, physically implausible
+    # lens distortion for a normal (non-fisheye) phone camera -- bounding
+    # it keeps the search from chasing an overfit on just 6 points.
+    k1_search = minimize_scalar(_best_error_for_k1, bounds=(-1.0, 1.0),
+                                 method="bounded", options={"xatol": 0.002})
+    best_k1 = float(k1_search.x)
+
+    def _f_error_at_best_k1(f):
+        result = _solve_for_f(float(f), best_k1)
+        return result[2] if result is not None else 1e9
+    f_search = minimize_scalar(_f_error_at_best_k1, bounds=(0.3 * image_width, 4.0 * image_width),
+                                method="bounded", options={"xatol": 1.0})
+    best_f = float(f_search.x)
+
+    dist = np.array([best_k1, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
     K = np.array([[best_f, 0, cx], [0, best_f, cy], [0, 0, 1]], dtype=np.float64)
-    ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, None,
+    ok, rvec, tvec = cv2.solvePnP(object_points, image_points, K, dist,
                                    flags=cv2.SOLVEPNP_EPNP)
     # LM refinement: EPNP's closed-form solve is a fast approximation;
     # this squeezes out the remaining reprojection error against the
-    # now-fixed best focal length, same as the 1D search above already
-    # did per-candidate.
-    rvec, tvec = cv2.solvePnPRefineLM(object_points, image_points, K, None, rvec, tvec)
+    # now-fixed best focal length + k1, same as the searches above
+    # already did per-candidate.
+    rvec, tvec = cv2.solvePnPRefineLM(object_points, image_points, K, dist, rvec, tvec)
 
-    projected, _ = cv2.projectPoints(object_points, rvec, tvec, K, None)
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, K, dist)
     per_point_error = np.sqrt(np.sum((projected.reshape(-1, 2) - image_points) ** 2, axis=1))
     max_error = float(per_point_error.max())
     # MAX, not RMS, gates acceptance: a single genuinely mis-clicked
     # point (confirmed directly — a 400px-off stump-top click) barely
-    # moves the RMS across all 5 points (the 4 coplanar ground points
+    # moves the RMS across all 6 points (the 4 coplanar ground points
     # can still fit almost any focal length, diluting one bad point's
     # contribution to the average), but it always dominates the MAX.
     if max_error > 15.0:
         return {"status": "error",
                 "message": f"Could not find a consistent camera pose (worst single-point "
-                           f"reprojection error {max_error:.1f}px) — check the 5 clicked "
-                           f"points, especially the stump-top point."}
+                           f"reprojection error {max_error:.1f}px, even allowing for lens "
+                           f"distortion) — check the 6 clicked points."}
 
     return {
         "status": "success",
-        "rvec": rvec, "tvec": tvec, "focal_length_px": best_f,
+        "rvec": rvec, "tvec": tvec, "focal_length_px": best_f, "dist_coeffs": dist,
         "principal_point_px": (cx, cy), "reprojection_error_px": float(per_point_error.mean()),
         "max_reprojection_error_px": max_error,
     }
@@ -253,12 +355,15 @@ def project_3d_to_pixel(pose: dict, x_m: float, y_m: float, z_m: float):
     build_ground_homography; Z = height above ground in meters) to a
     pixel position, using a solved pose from solve_camera_pose. Used to
     check a candidate trajectory (e.g. a physics/gravity fit) against
-    real tracked pixels."""
+    real tracked pixels. Applies the pose's own solved lens-distortion
+    term (dist_coeffs) if present -- `.get(...)` so an older/hand-built
+    pose dict without one (e.g. in tests) still works, as pure pinhole."""
     f = pose["focal_length_px"]
     cx, cy = pose["principal_point_px"]
     K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
+    dist = pose.get("dist_coeffs")
     point = np.array([[[x_m, y_m, z_m]]], dtype=np.float64)
-    projected, _ = cv2.projectPoints(point, pose["rvec"], pose["tvec"], K, None)
+    projected, _ = cv2.projectPoints(point, pose["rvec"], pose["tvec"], K, dist)
     return float(projected[0, 0, 0]), float(projected[0, 0, 1])
 
 
@@ -278,6 +383,13 @@ def pixel_to_ground_at_height(pose: dict, x_px: float, y_px: float, z_m: float):
     pixel_to_ground's own flat-homography answer (checked directly in
     tests/test_pitch_calibration.py) — it's a strict generalization,
     not a different method.
+
+    Applies the pose's own solved lens-distortion term first, if
+    present, via cv2.undistortPoints (2026-09-27 — a distorted pixel's
+    ray direction isn't simply K^-1 @ [u,v,1] once distortion is real;
+    undistortPoints removes it and, with no P/R given, returns exactly
+    the normalized ideal-pinhole camera-ray direction this function
+    already needs).
     """
     f = pose["focal_length_px"]
     cx, cy = pose["principal_point_px"]
@@ -286,8 +398,14 @@ def pixel_to_ground_at_height(pose: dict, x_px: float, y_px: float, z_m: float):
     tvec = pose["tvec"].reshape(3)
     camera_pos = -R.T @ tvec  # world-space camera center
 
-    pixel_h = np.array([x_px, y_px, 1.0], dtype=np.float64)
-    dir_cam = np.linalg.inv(K) @ pixel_h
+    dist = pose.get("dist_coeffs")
+    if dist is not None and np.any(dist):
+        pixel = np.array([[[x_px, y_px]]], dtype=np.float64)
+        undistorted = cv2.undistortPoints(pixel, K, dist)
+        dir_cam = np.array([undistorted[0, 0, 0], undistorted[0, 0, 1], 1.0])
+    else:
+        pixel_h = np.array([x_px, y_px, 1.0], dtype=np.float64)
+        dir_cam = np.linalg.inv(K) @ pixel_h
     dir_world = R.T @ dir_cam  # world-space ray direction (unnormalized)
 
     if abs(dir_world[2]) < 1e-9:
