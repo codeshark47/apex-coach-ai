@@ -4899,6 +4899,12 @@ def _render_ball_speed_estimate(source_video_filename: str, ref_path: str, point
     if pose["status"] != "success":
         st.warning(f"⚠️ {pose['message']}")
         return
+    if pose.get("distortion_reliable") is False:
+        st.info(
+            "ℹ️ This calibration's lens-distortion correction looked unstable and was "
+            "disabled (pure pinhole used instead) — the pose may be less precise than "
+            "usual. Consider redoing the calibration, zooming in on the stump-top points."
+        )
 
     tracked_points = [(p[0], p[1], p[2]) for p in points]
     speed_result = estimate_release_speed_kmh(pose, tracked_points, clip_fps)
@@ -4909,7 +4915,13 @@ def _render_ball_speed_estimate(source_video_filename: str, ref_path: str, point
     col1, col2, col3 = st.columns(3)
     col1.metric("Estimated release speed", f"{speed_result['speed_kmh']:.1f} km/h")
     col2.metric("Points used", speed_result["num_points"])
-    col3.metric("Fit error (max)", f"{speed_result['max_reprojection_error_px']:.1f}px")
+    col3.metric("Fit error (mean)", f"{speed_result['mean_reprojection_error_px']:.1f}px")
+    if speed_result.get("skipped_leading_points"):
+        st.caption(
+            f"Skipped the first {speed_result['skipped_leading_points']} tracked point(s) "
+            f"— they didn't fit a real flight path (likely pre-release motion or a "
+            f"tracking wobble near the bowler)."
+        )
     if speed_result.get("bounce_frame"):
         st.caption(f"Bounce detected at frame {speed_result['bounce_frame']} — "
                    f"only the {speed_result['num_points']} pre-bounce points were used.")

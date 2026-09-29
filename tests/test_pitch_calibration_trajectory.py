@@ -195,3 +195,31 @@ def test_estimate_release_speed_kmh_uses_only_the_prebounce_phase():
     # Must recover the PRE-bounce speed, not something blended with the
     # much slower/different post-bounce phase.
     assert result["speed_kmh"] == pytest.approx(true_release_speed_kmh, rel=0.05)
+
+
+def test_estimate_release_speed_kmh_skips_leading_non_ballistic_noise():
+    """Real finding (2026-09-29, 5 real clips from the same camera
+    setup): a raw tracked sequence often starts with a few frames of
+    pre-release arm-swing or near-body noise before the real flight
+    begins, which detect_bounce_frame's simple peak-finder can mistake
+    for the bounce -- every one of those 5 real clips failed outright
+    this way. Prepends synthetic non-ballistic (circular-motion-style)
+    noise points before a real, clean projectile arc and confirms the
+    search finds and uses the real arc anyway, reporting how many
+    leading points it had to skip."""
+    pose = _synthetic_pose()
+    true_vx, true_vy, true_vz = 0.3, 36.0, 1.0
+    true_speed_kmh = np.hypot(np.hypot(true_vx, true_vy), true_vz) * 3.6
+
+    noise = [
+        (90, 500.0, 1200.0), (92, 700.0, 1000.0), (94, 900.0, 1250.0),
+        (96, 650.0, 1400.0),
+    ]
+    real_flight = _projectile_points(pose, 0.0, 0.5, 2.0, true_vx, true_vy, true_vz,
+                                      frame0=100, fps=FPS, n_frames=12, frame_step=2)
+    all_points = noise + real_flight
+
+    result = estimate_release_speed_kmh(pose, all_points, FPS)
+    assert result["status"] == "success"
+    assert result["speed_kmh"] == pytest.approx(true_speed_kmh, rel=0.02)
+    assert result["skipped_leading_points"] == len(noise)

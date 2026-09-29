@@ -547,19 +547,40 @@ def fit_gravity_trajectory(pose: dict, points: list, fps: float) -> dict:
     # physically-plausible velocity/height candidates and keep whichever
     # one the optimizer converges to with the LOWEST final reprojection
     # error -- sidesteps needing the guess itself to already be close.
+    # PERFORMANCE (2026-09-29, real finding: estimate_release_speed_kmh's
+    # own skip-search below calls this function up to ~70 times for one
+    # real clip, and the original 4x3x3=36-candidate grid at
+    # max_nfev=2000 measured ~2.6s per call alone -- over 3 minutes for
+    # one clip, unusable in a live UI). Cut to a smaller 3x2x2=12-point
+    # grid and a much lower max_nfev (this is only a 6-parameter
+    # problem on <=~80 points; it converges fast once in the right
+    # basin, per the existing noise-robustness test, which still passes
+    # at this size) — verified this doesn't change any existing test's
+    # result. EARLY EXIT once a candidate's cost is already
+    # near-machine-precision: no later grid point can meaningfully beat
+    # an already-near-perfect fit, so trying the rest just burns time
+    # for no possible benefit.
     x0_guess, y0_guess = pixel_to_ground_at_height(pose, points[0][1], points[0][2], 0.0)
     best_result, best_cost = None, np.inf
-    for z0_guess in (0.5, 1.0, 1.8, 2.5):
-        for vy_guess in (15.0, 30.0, 45.0):
-            for vz_guess in (-5.0, 0.0, 5.0):
+    for z0_guess in (0.5, 1.5, 2.5):
+        for vy_guess in (20.0, 45.0):
+            for vz_guess in (-4.0, 4.0):
                 initial = np.clip(
                     [x0_guess, y0_guess, z0_guess, 0.0, vy_guess, vz_guess],
                     bounds[0], bounds[1],
                 )
                 candidate = least_squares(_residuals, initial, method="trf",
-                                           bounds=bounds, max_nfev=2000)
+                                           bounds=bounds, max_nfev=300)
                 if candidate.cost < best_cost:
                     best_cost, best_result = candidate.cost, candidate
+                if best_cost < 1e-6:
+                    break
+            else:
+                continue
+            break
+        else:
+            continue
+        break
 
     result = best_result
     residual_norms = np.sqrt(np.sum(result.fun.reshape(-1, 2) ** 2, axis=1))
@@ -623,6 +644,20 @@ def detect_bounce_frame(points: list):
     return points[peak_idx][0]
 
 
+def _prebounce_phase_points(points: list):
+    """Splits off the pre-bounce phase from a real tracked/labeled
+    sequence via detect_bounce_frame, STRICTLY before the bounce frame
+    itself -- that pixel-space peak is the moment of impact, the least
+    certain point in the whole sequence (the ball is at/against the
+    pitch, likely partly obscured or deformed in a real frame).
+    Confirmed directly with synthetic data that including it as
+    "pre-bounce" can inject a real outlier into the fit."""
+    bounce_frame = detect_bounce_frame(points)
+    if bounce_frame is not None:
+        return [p for p in points if p[0] < bounce_frame], bounce_frame
+    return points, None
+
+
 def estimate_release_speed_kmh(pose: dict, points: list, fps: float) -> dict:
     """
     The actual answer to "how fast was that ball": detects a bounce (if
@@ -634,22 +669,89 @@ def estimate_release_speed_kmh(pose: dict, points: list, fps: float) -> dict:
     track spanning release through (optionally) the bounce and beyond.
     If no bounce is found in the given points, fits the whole sequence
     (assumes it's all pre-bounce).
-    """
-    bounce_frame = detect_bounce_frame(points)
-    if bounce_frame is not None:
-        # STRICTLY before, not <= : bounce_frame is the pixel-space peak
-        # itself -- the moment of impact, the single least certain point
-        # in the whole sequence (the ball is at/against the pitch,
-        # likely partly obscured or deformed in a real frame). Confirmed
-        # directly with synthetic data that including it as "pre-bounce"
-        # can inject a real outlier into the fit -- excluding it is
-        # strictly safer, and never costs more than one frame.
-        phase_points = [p for p in points if p[0] < bounce_frame]
-    else:
-        phase_points = points
 
-    result = fit_gravity_trajectory(pose, phase_points, fps)
-    if result["status"] == "success":
-        result["bounce_frame"] = bounce_frame
-        result["phase"] = "pre-bounce (release speed)"
-    return result
+    ROBUST TO LEADING NOISE (2026-09-29, real finding across 5 clips
+    from the same camera setup, IMG_3797/3755/3796/4060/3798): a raw
+    tracked sequence often starts with a few frames of pre-release
+    arm-swing or near-body tracking noise BEFORE the genuine flight
+    begins -- confirmed by eye on IMG_3796.MOV (a small elliptical loop
+    in pixel space, frames 84-104, well before the real trajectory
+    starts). detect_bounce_frame's peak-finder can mistake a pixel
+    excursion IN that noisy region for the real bounce, and every one
+    of those 5 clips failed outright this way -- correctly, per the
+    fit-quality gate, but that would mean a coach manually hunting for
+    the clean starting frame by hand on every single clip, which
+    doesn't scale to "how much work left" being genuinely open-ended
+    (see project memory).
+
+    Instead: try increasingly later starting points (skip the first 0,
+    then 1, then 2 real points, ...) until a fit actually PASSES the
+    gate.
+
+    SELECTION RULE, two real bugs found and fixed in this order (both
+    2026-09-29, against real clips from the same camera setup):
+    1. "Longest passing segment wins" — WRONG: a synthetic test showed a
+       segment contaminated with just one leftover noise point can
+       still scrape under the 20px gate while fitting visibly worse
+       (~5px) than the same segment with that point excluded (~0px),
+       and being one point longer, would win a pure length comparison
+       despite being the wrong answer.
+    2. "Lowest error wins" (the first fix) — ALSO WRONG, a DIFFERENT
+       way: traced on 5 real clips and found the search kept picking
+       the bare-minimum 8 points, sometimes reaching implausible
+       results (26 km/h, walking pace) — a 6-parameter model fit to
+       only 8 points has almost no redundancy, so it can fit a short,
+       coincidental subsequence very well by chance, the classic
+       overfit-with-too-few-points failure. Confirmed directly on
+       IMG_3796.MOV/IMG_3797.MOV: within the SAME real bounce-verified
+       cluster of candidates, error kept improving as points were
+       dropped (2.95px at 10 points -> 0.93px at 8), while the speed
+       drifted noticeably (76.1 -> 80.7 km/h) — dropping real, valid
+       points to shave off error is cherry-picking, not more accuracy.
+
+    REAL FIX: among candidates whose error is already comfortably
+    trustworthy (<= TRUSTWORTHY_REPROJECTION_ERROR_PX), prefer the
+    SMALLEST skip — i.e. the EARLIEST, MOST DATA-RICH passing segment,
+    not whichever is individually lowest-error. More real data used is
+    a better answer than less, as long as the fit is already genuinely
+    good; squeezing out the last fraction of a pixel by discarding real
+    points is not. Only falls back to "lowest error, most points" (the
+    prior rule) when NO candidate clears the trustworthy bar — a purely
+    marginal case, still fails honestly if NO starting point produces a
+    real, physically consistent flight phase at all.
+    """
+    TRUSTWORTHY_REPROJECTION_ERROR_PX = 5.0
+    best = None
+    best_key = None
+    max_skip = max(0, len(points) - 8)
+    for skip in range(0, max_skip + 1):
+        phase_points, bounce_frame = _prebounce_phase_points(points[skip:])
+        if len(phase_points) < 8:
+            continue
+        result = fit_gravity_trajectory(pose, phase_points, fps)
+        if result["status"] != "success":
+            continue
+        mean_err = result["mean_reprojection_error_px"]
+        if mean_err <= TRUSTWORTHY_REPROJECTION_ERROR_PX:
+            key = (0, skip)
+        else:
+            key = (1, round(mean_err, 1), -result["num_points"])
+        if best_key is None or key < best_key:
+            result["bounce_frame"] = bounce_frame
+            result["phase"] = "pre-bounce (release speed)"
+            result["skipped_leading_points"] = skip
+            best, best_key = result, key
+            # EARLY EXIT: skip only increases from here, so no later
+            # iteration can ever beat an already-trustworthy candidate
+            # (key=(0, skip) with a smaller skip always wins) -- once
+            # found, searching further can only waste time, never
+            # improve the answer.
+            if key[0] == 0:
+                break
+
+    if best is not None:
+        return best
+    return {"status": "error",
+            "message": "No starting point in this sequence produced a real, physically "
+                       "consistent pre-bounce flight phase -- likely all noise, or a "
+                       "genuine track too short/broken to trust."}
