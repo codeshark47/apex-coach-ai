@@ -86,20 +86,17 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import profile_store as store
-from orchestrator import compress_video_file
+# EXTRACTED 2026-09-29 into dataset_common.py, so prepare_tracknet_dataset.py
+# (a new, second dataset format for a motion-aware detector — see project
+# memory) is built from IDENTICAL clips/splits, not a silently-diverged
+# copy. Pure extraction, no behavior change — verified by confirming
+# identical total_written/total_val_written counts before and after.
+from ball_tracking.training.dataset_common import (
+    VALID_LABELED_BY, VAL_CLIPS, SEARCH_DIRS,
+    fetch_all as _fetch_all, find_video as _find_video,
+    normalized_video_path as _normalized_video_path,
+)
 
-VALID_LABELED_BY = "direct_click_v1"
-
-# Where normalized copies of source videos are cached — see the module
-# docstring's TRAIN/INFERENCE CONSISTENCY section. Keyed by filename;
-# reused across runs since a source video's own content never changes
-# once shot, so re-compressing it every single time this script runs
-# would just be wasted ffmpeg time.
-COMPRESSED_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_compressed_cache")
-
-# Set once a clip (ideally a different scene) has been labeled with the
-# new tool — see module docstring.
-#
 # ADDED IMG_3082.MOV (2026-08-14): the previous single-clip, 12-image
 # validation set was too small to trust a metric swing of even one
 # frame (each miss/hit moved recall by 8+ points) — v1-7's own log
@@ -107,63 +104,11 @@ COMPRESSED_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 # samples. IMG_3082.MOV is a genuinely different device (iPhone .MOV vs
 # the Pixel PXL_ clip already here), giving 46 total val images instead
 # of 12 — same "different conditions" reasoning as the original pick.
-VAL_CLIPS = {"PXL_20260801_040327130.mp4", "IMG_3082.MOV"}
-
-SEARCH_DIRS = [
-    "C:/Users/Shoaib/Downloads",
-    "C:/Users/Shoaib/Downloads/for phase two",
-]
+# (VAL_CLIPS itself now lives in dataset_common.py — this comment stays
+# here since it's the reasoning behind the actual clip choice, not the
+# mechanics of the split.)
 
 OUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset")
-
-
-def _fetch_all(client, table, columns, filters=None):
-    rows = []
-    start = 0
-    page_size = 1000
-    while True:
-        query = client.table(table).select(columns)
-        for col, val in (filters or {}).items():
-            query = query.eq(col, val)
-        result = query.range(start, start + page_size - 1).execute()
-        page = result.data or []
-        rows.extend(page)
-        if len(page) < page_size:
-            break
-        start += page_size
-    return rows
-
-
-def _find_video(filename):
-    for d in SEARCH_DIRS:
-        candidate = os.path.join(d, filename)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-
-def _normalized_video_path(original_path: str, filename: str) -> str:
-    """
-    Returns a path to a compressed, cached copy of original_path — see
-    the module docstring's TRAIN/INFERENCE CONSISTENCY section for why
-    training images must go through the SAME compressor real coach
-    uploads do. Reuses an existing cached copy rather than
-    re-compressing every run; only re-encodes if this exact source
-    video hasn't been normalized before.
-    """
-    os.makedirs(COMPRESSED_CACHE_DIR, exist_ok=True)
-    clip_slug = "".join(c if c.isalnum() else "_" for c in filename.rsplit(".", 1)[0])
-    cached_path = os.path.join(COMPRESSED_CACHE_DIR, f"{clip_slug}.mp4")
-    if not os.path.exists(cached_path):
-        print(f"  Compressing (first time only, cached for future runs): {filename}")
-        # max_fps=None: stored labels' frame_index values were captured
-        # against the ORIGINAL video's own frame numbering (label_tool.py
-        # reads native frame rate, no compression step). Resampling fps
-        # here would shift which frame lands at which index — confirmed a
-        # real risk, not theoretical: at least one currently-labeled clip
-        # (Rauf Khan.mp4) is a genuine ~120fps recording.
-        compress_video_file(original_path, cached_path, max_fps=None)
-    return cached_path
 
 
 def main():
@@ -192,10 +137,14 @@ def main():
     total_val_written = 0
     total_hard_neg = 0
     for filename, rows in by_clip.items():
+        # Windows console can't print some real filenames (emoji, etc.)
+        # -- see dataset_common.normalized_video_path's own comment on
+        # this exact crash, found 2026-09-29.
+        safe_filename = filename.encode("ascii", "replace").decode("ascii")
         split = "val" if filename in VAL_CLIPS else "train"
         video_path = _find_video(filename)
         if video_path is None:
-            print(f"SKIP (video file not found): {filename}")
+            print(f"SKIP (video file not found): {safe_filename}")
             continue
 
         # Label coordinates were captured against THIS (original) video's
@@ -264,7 +213,7 @@ def main():
                             total_val_written += 1
             idx += 1
         cap.release()
-        print(f"{filename[:50]:50} -> {split:5} | {written_this_clip} frames written")
+        print(f"{safe_filename[:50]:50} -> {split:5} | {written_this_clip} frames written")
 
     yaml_path = os.path.join(OUT_ROOT, "dataset.yaml")
     with open(yaml_path, "w") as f:

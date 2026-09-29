@@ -16,6 +16,7 @@ import os
 import pytest
 
 from ball_tracking.training import prepare_dataset as pd
+from ball_tracking.training import dataset_common
 
 
 class TestNormalizedVideoPath:
@@ -27,8 +28,15 @@ class TestNormalizedVideoPath:
         lands at which index, silently misaligning a label with the
         wrong image — confirmed a real risk, not theoretical (at least
         one currently-labeled clip is a genuine ~120fps recording).
-        max_fps must always be passed as None here, never the default."""
-        monkeypatch.setattr(pd, "COMPRESSED_CACHE_DIR", str(tmp_path))
+        max_fps must always be passed as None here, never the default.
+
+        Patches dataset_common (2026-09-29 refactor moved this constant
+        and function there, shared with prepare_tracknet_dataset.py) —
+        patching prepare_dataset's own namespace would silently do
+        nothing, since pd._normalized_video_path is just an import
+        alias for dataset_common.normalized_video_path, which reads its
+        globals from dataset_common's own module scope."""
+        monkeypatch.setattr(dataset_common, "COMPRESSED_CACHE_DIR", str(tmp_path))
         captured = {}
 
         def _fake_compress(src, dest, **kwargs):
@@ -38,7 +46,7 @@ class TestNormalizedVideoPath:
             with open(dest, "wb") as f:
                 f.write(b"fake compressed video")
 
-        monkeypatch.setattr(pd, "compress_video_file", _fake_compress)
+        monkeypatch.setattr(dataset_common, "compress_video_file", _fake_compress)
 
         result = pd._normalized_video_path("C:/source/clip one.mp4", "clip one.mp4")
 
@@ -50,7 +58,7 @@ class TestNormalizedVideoPath:
         """A source video's own content never changes once shot —
         re-compressing it on every single prepare_dataset.py run would
         be pure wasted ffmpeg time across dozens of clips."""
-        monkeypatch.setattr(pd, "COMPRESSED_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(dataset_common, "COMPRESSED_CACHE_DIR", str(tmp_path))
         cached_path = os.path.join(str(tmp_path), "clip_one.mp4")
         os.makedirs(str(tmp_path), exist_ok=True)
         with open(cached_path, "wb") as f:
@@ -59,7 +67,7 @@ class TestNormalizedVideoPath:
         def _explode(*a, **k):
             raise AssertionError("compress_video_file should not be called when already cached")
 
-        monkeypatch.setattr(pd, "compress_video_file", _explode)
+        monkeypatch.setattr(dataset_common, "compress_video_file", _explode)
 
         result = pd._normalized_video_path("C:/source/clip one.mp4", "clip one.mp4")
 
